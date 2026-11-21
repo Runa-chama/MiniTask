@@ -172,6 +172,29 @@ pub struct ProcCollector {
     npu_recheck: u32,
 }
 
+/// グラフ描画用の軽量メトリック (高速ティック用)。
+/// 履歴サンプルの連続取得に使う。
+#[derive(Clone, Debug, Default)]
+pub struct FastMetrics {
+    pub cpu: f32,
+    pub core_usage: Vec<f32>,
+    pub mem_pct: f32,
+    /// (ディスク ID, アクティブ%, 読取 B/s, 書込 B/s)
+    pub disks: Vec<(String, f32, f64, f64)>,
+    /// (GPU ID, 使用率)
+    pub gpus: Vec<(String, f32)>,
+    /// (NPU ID, 使用率)
+    pub npus: Vec<(String, f32)>,
+    /// GPU エンジン種別ごとの使用率
+    pub gpu_engines: Vec<(String, f32)>,
+    /// NPU デバイス (LUID) ごとのエンジン別使用率
+    pub npu_by_luid: Vec<(String, Vec<(String, f32)>)>,
+    /// (アダプター ID, 受信 B/s, 送信 B/s)
+    pub adapters: Vec<(String, f64, f64)>,
+    pub gpu_dedicated: u64,
+    pub npu_dedicated: u64,
+}
+
 impl ProcCollector {
     pub fn new() -> Result<Self, String> {
         let mut sys = System::new().map_err(|e| format!("システム情報の初期化に失敗: {e}"))?;
@@ -204,6 +227,69 @@ impl ProcCollector {
             npu_device_present: crate::perf::npu_device_present(),
             npu_recheck: 0,
         })
+    }
+
+    /// グラフ描画用の軽量メトリック (高速ティック用)。
+    /// プロセステーブル等の重い処理を含まないため高頻度で呼べる。
+    pub fn refresh_fast(&mut self) -> FastMetrics {
+        // CPU 使用率 (前回呼び出しからの差分で算出される)
+        self.sys
+            .refresh_cpu_specifics(CpuRefreshKind::nothing().with_usage());
+        self.sys.refresh_memory();
+        let cpu = self.sys.global_cpu_usage();
+        let core_usage: Vec<f32> = self.sys.cpus().iter().map(|c| c.usage()).collect();
+        let mem_pct = if self.sys.total_memory() > 0 {
+            self.sys.used_memory() as f32 / self.sys.total_memory() as f32 * 100.0
+        } else {
+            0.0
+        };
+
+        let disks: Vec<(String, f32, f64, f64)> = self
+            .disk_meter
+            .read()
+            .into_iter()
+            .map(|s| (s.id, s.active_pct, s.read_bps, s.write_bps))
+            .collect();
+
+        let adapters: Vec<(String, f64, f64)> = self
+            .net_meter
+            .read()
+            .into_iter()
+            .map(|a| (a.id, a.recv_bps as f64, a.sent_bps as f64))
+            .collect();
+
+        self.gpus.refresh(false);
+        let gpus: Vec<(String, f32)> = self
+            .gpus
+            .iter()
+            .enumerate()
+            .map(|(i, g)| (i.to_string(), g.usage().unwrap_or(0.0).clamp(0.0, 100.0)))
+            .collect();
+
+        let snapshot = self.gpu_engine_meter.read_split().unwrap_or_default();
+        let npus: Vec<(String, f32)> = snapshot
+            .npu_by_luid
+            .iter()
+            .map(|(luid, engines)| {
+                let usage = engines.iter().map(|(_, v)| *v).sum::<f32>().clamp(0.0, 100.0);
+                (luid.clone(), usage)
+            })
+            .collect();
+        let gpu_mem = self.gpu_memory_meter.read(&snapshot.gpu_luids);
+
+        FastMetrics {
+            cpu,
+            core_usage,
+            mem_pct,
+            disks,
+            gpus,
+            npus,
+            gpu_engines: snapshot.gpu_engines,
+            npu_by_luid: snapshot.npu_by_luid,
+            adapters,
+            gpu_dedicated: gpu_mem.gpu_dedicated,
+            npu_dedicated: gpu_mem.npu_dedicated,
+        }
     }
 
     /// 全プロセスを再取得し、前回からの差分で速度系を計算する。
