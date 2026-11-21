@@ -158,6 +158,97 @@ fn paint_curve(
     painter.add(egui::Shape::line(pts, egui::Stroke::new(stroke_width, color)));
 }
 
+/// 2 本の折れ線を同じスケールで重ねて描く (ディスクの読み取り/書き込み)。
+pub fn paint_dual_curve(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    read: &VecDeque<f32>,
+    write: &VecDeque<f32>,
+    max: f32,
+    read_color: Color32,
+    write_color: Color32,
+) {
+    paint_curve(painter, rect, read, max, read_color, 1.6);
+    paint_curve(painter, rect, write, max, write_color, 1.6);
+}
+
+/// 既に確保済みの矩形内に読み取り/書き込みグラフを描く。
+pub fn paint_mini_dual_graph(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    read: &VecDeque<f32>,
+    write: &VecDeque<f32>,
+    max: f32,
+    read_color: Color32,
+    write_color: Color32,
+) {
+    paint_dual_curve(painter, rect, read, write, max, read_color, write_color);
+}
+
+/// 2 本線の大きなグラフ。25/50/75% のグリッド線付き。
+pub fn perf_dual_chart(
+    ui: &mut egui::Ui,
+    read: &VecDeque<f32>,
+    write: &VecDeque<f32>,
+    max: f32,
+    read_color: Color32,
+    write_color: Color32,
+    size: Vec2,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        painter.rect_filled(rect, 6.0, ui.visuals().extreme_bg_color);
+        let grid = Color32::from_gray(45);
+        for f in [0.25, 0.5, 0.75] {
+            let y = rect.bottom() - 2.0 - f * (rect.height() - 4.0);
+            painter.line_segment(
+                [Pos2::new(rect.left() + 2.0, y), Pos2::new(rect.right() - 2.0, y)],
+                egui::Stroke::new(1.0, grid),
+            );
+        }
+        paint_curve(painter, rect, read, max, read_color, 2.0);
+        paint_curve(painter, rect, write, max, write_color, 2.0);
+        let stamp = Color32::from_gray(110);
+        let font = egui::FontId::proportional(10.0);
+        painter.text(
+            egui::pos2(rect.left() + 4.0, rect.bottom() - 2.0),
+            egui::Align2::LEFT_BOTTOM,
+            "30 秒",
+            font.clone(),
+            stamp,
+        );
+        painter.text(
+            egui::pos2(rect.right() - 4.0, rect.bottom() - 2.0),
+            egui::Align2::RIGHT_BOTTOM,
+            "0",
+            font,
+            stamp,
+        );
+    }
+    resp
+}
+
+/// 履歴のピークから読みやすい上限値 (1/2/5 × 10^n) を決める。
+pub fn nice_max(a: &VecDeque<f32>, b: &VecDeque<f32>) -> f32 {
+    let peak = a.iter().chain(b.iter()).copied().fold(0.0_f32, f32::max);
+    if peak <= 0.0 {
+        return 1024.0;
+    }
+    let base = 10f32.powf(peak.log10().floor());
+    let m = peak / base;
+    let step = if m <= 1.0 {
+        1.0
+    } else if m <= 2.0 {
+        2.0
+    } else if m <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    (step * base).max(1024.0)
+}
+
 /// 小さな折れ線グラフ (CPU / メモリ履歴用)。値は 0..max の百分率。
 pub fn sparkline(
     ui: &mut egui::Ui,
@@ -209,6 +300,23 @@ pub fn perf_chart(
             );
         }
         paint_curve(painter, rect, values, max, color, 2.0);
+        // 本家と同じ時間目盛り (左 = 30 秒前、右 = 現在)
+        let stamp = Color32::from_gray(110);
+        let font = egui::FontId::proportional(10.0);
+        painter.text(
+            egui::pos2(rect.left() + 4.0, rect.bottom() - 2.0),
+            egui::Align2::LEFT_BOTTOM,
+            "30 秒",
+            font.clone(),
+            stamp,
+        );
+        painter.text(
+            egui::pos2(rect.right() - 4.0, rect.bottom() - 2.0),
+            egui::Align2::RIGHT_BOTTOM,
+            "0",
+            font,
+            stamp,
+        );
     }
     resp
 }

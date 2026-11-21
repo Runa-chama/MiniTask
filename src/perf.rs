@@ -21,6 +21,196 @@ pub const NPU_ENGINE_COUNTER: &str = r"\NPU Engine(*)\Utilization Percentage";
 /// GPU エンジンのカウンタパス。
 pub const GPU_ENGINE_COUNTER: &str = r"\GPU Engine(*)\Utilization Percentage";
 
+/// 物理ディスク 1 台分の PDH サンプル。
+#[derive(Clone, Debug)]
+pub struct DiskSample {
+    /// 物理ディスク番号 (PDH インスタンス名の先頭数字)
+    pub id: String,
+    /// 表示名 (例: "ディスク 2 (D: E:)")
+    pub label: String,
+    /// ドライブレター一覧
+    pub letters: Vec<String>,
+    pub read_bps: f64,
+    pub write_bps: f64,
+    /// アクティブな時間 (%) — 本家のメイン グラフ
+    pub active_pct: f32,
+    /// 平均応答時間 (ミリ秒)
+    pub response_ms: f32,
+}
+
+/// `\PhysicalDisk(*)` から物理ディスクごとの使用率・転送速度を取得する。
+/// インスタンス名は `1 c:` / `2 d: e:` のように物理ディスク番号と
+/// ドライブレターが含まれ、同じ物理ディスクの複数パーティションは
+/// 1 インスタンスにまとまる (本家タスクマネージャーと同じ区分)。
+pub struct DiskMeter {
+    query: PDH_HQUERY,
+    counters: Vec<PDH_HCOUNTER>,
+    pub available: bool,
+}
+
+impl DiskMeter {
+    pub fn new() -> Self {
+        unsafe {
+            let mut query: PDH_HQUERY = std::ptr::null_mut();
+            if PdhOpenQueryW(std::ptr::null(), 0, &mut query) != ERROR_SUCCESS {
+                return Self::unavailable();
+            }
+            let mut counters = Vec::new();
+            for name in [
+                r"\PhysicalDisk(*)\Disk Read Bytes/sec",
+                r"\PhysicalDisk(*)\Disk Write Bytes/sec",
+                r"\PhysicalDisk(*)\% Disk Time",
+                r"\PhysicalDisk(*)\Avg. Disk sec/Transfer",
+            ] {
+                let path: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+                let mut counter: PDH_HCOUNTER = std::ptr::null_mut();
+                if PdhAddEnglishCounterW(query, path.as_ptr(), 0, &mut counter) != ERROR_SUCCESS {
+                    PdhCloseQuery(query);
+                    return Self::unavailable();
+                }
+                counters.push(counter);
+            }
+            PdhCollectQueryData(query);
+            Self {
+                query,
+                counters,
+                available: true,
+            }
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            query: std::ptr::null_mut(),
+            counters: Vec::new(),
+            available: false,
+        }
+    }
+
+    /// 物理ディスクごとの使用率・転送速度・応答時間を返す。
+    pub fn read(&mut self) -> Vec<DiskSample> {
+        if !self.available {
+            return Vec::new();
+        }
+        unsafe {
+            PdhCollectQueryData(self.query);
+            let reads = collect_counter_array(self.counters[0]).unwrap_or_default();
+            let writes = collect_counter_array(self.counters[1]).unwrap_or_default();
+            let active = collect_counter_array(self.counters[2]).unwrap_or_default();
+            let response = collect_counter_array(self.counters[3]).unwrap_or_default();
+            let map_of = |v: Vec<(String, f64)>| -> HashMap<String, f64> { v.into_iter().collect() };
+            let write_map = map_of(writes);
+            let active_map = map_of(active);
+            let response_map = map_of(response);
+            let mut samples: Vec<DiskSample> = reads
+                .into_iter()
+                .filter(|(name, _)| name != "_total")
+                .filter_map(|(name, read_bps)| {
+                    // インスタンス名: "1 c:" / "2 d: e:"
+                    let mut parts = name.split_whitespace();
+                    let id = parts.next()?.to_owned();
+                    if !id.chars().all(|c| c.is_ascii_digit()) {
+                        return None;
+                    }
+                    let letters_raw: Vec<String> =
+                        parts.map(|p| p.to_uppercase()).collect::<Vec<_>>();
+                    let letters: Vec<String> = letters_raw
+                        .iter()
+                        .map(|p| p.trim_end_matches(':').to_owned())
+                        .filter(|p| p.len() == 1 && p.chars().all(|c| c.is_ascii_uppercase()))
+                        .collect();
+                    let label = if letters_raw.is_empty() {
+                        format!("ディスク {id}")
+                    } else {
+                        format!("ディスク {} ({})", id, letters_raw.join(" "))
+                    };
+                    let write_bps = write_map.get(&name).copied().unwrap_or(0.0);
+                    let active_pct = active_map.get(&name).copied().unwrap_or(0.0) as f32;
+                    let response_ms =
+                        response_map.get(&name).copied().unwrap_or(0.0) as f32 * 1000.0;
+                    Some(DiskSample {
+                        id,
+                        label,
+                        letters,
+                        read_bps,
+                        write_bps,
+                        active_pct: active_pct.clamp(0.0, 100.0),
+                        response_ms: response_ms.max(0.0),
+                    })
+                })
+                .collect();
+            samples.sort_by(|a, b| a.id.cmp(&b.id));
+            samples
+        }
+    }
+}
+
+impl Drop for DiskMeter {
+    fn drop(&mut self) {
+        if !self.query.is_null() {
+            unsafe {
+                PdhCloseQuery(self.query);
+            }
+        }
+    }
+}
+
+/// カウンタの全インスタンスを (インスタンス名, 値) で取得する。
+fn collect_counter_array(counter: PDH_HCOUNTER) -> Option<Vec<(String, f64)>> {
+    unsafe {
+        let mut size = 0u32;
+        let mut count = 0u32;
+        PdhGetFormattedCounterArrayW(
+            counter,
+            PDH_FMT_DOUBLE,
+            &mut size,
+            &mut count,
+            std::ptr::null_mut(),
+        );
+        if size == 0 || count == 0 {
+            return Some(Vec::new());
+        }
+        let mut buffer = vec![0u8; size as usize];
+        let status = PdhGetFormattedCounterArrayW(
+            counter,
+            PDH_FMT_DOUBLE,
+            &mut size,
+            &mut count,
+            buffer.as_mut_ptr().cast(),
+        );
+        if status != ERROR_SUCCESS {
+            return None;
+        }
+        let items = std::slice::from_raw_parts(
+            buffer.as_ptr().cast::<PDH_FMT_COUNTERVALUE_ITEM_W>(),
+            count as usize,
+        );
+        Some(
+            items
+                .iter()
+                .filter_map(|item| {
+                    let value = item.FmtValue.Anonymous.doubleValue;
+                    if !value.is_finite() || value < 0.0 {
+                        return None;
+                    }
+                    Some((wide_ptr_to_string(item.szName), value))
+                })
+                .collect(),
+        )
+    }
+}
+
+/// 1 回の収集結果: GPU / NPU のエンジン別使用率。
+#[derive(Default)]
+pub struct EngineSnapshot {
+    /// 全 GPU LUID を合計したエンジン別使用率
+    pub gpu_engines: Vec<(String, f32)>,
+    /// 全 NPU LUID を合計したエンジン別使用率
+    pub npu_engines: Vec<(String, f32)>,
+    /// NPU デバイス (LUID) ごとのエンジン別使用率
+    pub npu_by_luid: Vec<(String, Vec<(String, f32)>)>,
+}
+
 /// エンジン種別ごとの使用率を集計する PDH メータ。
 pub struct EngineMeter {
     query: PDH_HQUERY,
@@ -155,8 +345,8 @@ impl EngineMeter {
     }
 
     /// 1 回の収集で GPU 用と NPU 用のエンジン別使用率を返す。
-    /// `(GPU エンジン一覧, NPU エンジン一覧)`。
-    pub fn read_split(&mut self) -> Option<(Vec<(String, f32)>, Vec<(String, f32)>)> {
+    /// NPU は LUID (デバイス) ごとにも返す。
+    pub fn read_split(&mut self) -> Option<EngineSnapshot> {
         let samples = self.collect()?;
         let gpu_luids: HashSet<String> = samples
             .iter()
@@ -165,15 +355,29 @@ impl EngineMeter {
             .collect();
         let mut gpu: HashMap<String, f32> = HashMap::new();
         let mut npu: HashMap<String, f32> = HashMap::new();
+        let mut by_luid: HashMap<String, HashMap<String, f32>> = HashMap::new();
         for (luid, engtype, value) in samples {
-            let map = if gpu_luids.contains(&luid) {
-                &mut gpu
+            if gpu_luids.contains(&luid) {
+                *gpu.entry(engtype).or_insert(0.0) += value as f32;
             } else {
-                &mut npu
-            };
-            *map.entry(engtype).or_insert(0.0) += value as f32;
+                *npu.entry(engtype.clone()).or_insert(0.0) += value as f32;
+                *by_luid
+                    .entry(luid)
+                    .or_default()
+                    .entry(engtype)
+                    .or_insert(0.0) += value as f32;
+            }
         }
-        Some((Self::sorted_usage(gpu), Self::sorted_usage(npu)))
+        let mut npu_by_luid: Vec<(String, Vec<(String, f32)>)> = by_luid
+            .into_iter()
+            .map(|(luid, map)| (luid, Self::sorted_usage(map)))
+            .collect();
+        npu_by_luid.sort_by(|a, b| a.0.cmp(&b.0));
+        Some(EngineSnapshot {
+            gpu_engines: Self::sorted_usage(gpu),
+            npu_engines: Self::sorted_usage(npu),
+            npu_by_luid,
+        })
     }
 }
 
@@ -200,6 +404,69 @@ unsafe fn wide_ptr_to_string(p: windows_sys::core::PWSTR) -> String {
     }
     let slice = unsafe { std::slice::from_raw_parts(p, len) };
     String::from_utf16_lossy(slice)
+}
+
+/// ドライブレターからストレージの種類を取得する。
+/// IOCTL_STORAGE_QUERY_PROPERTY でバス種別とリムーバブルMediaを判定し、
+/// 本家タスクマネージャーの「種類」列 (SSD (NVMe) / リムーバブル (USB) 等) に合わせる。
+pub fn disk_type_label(letter: &str) -> String {
+    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, BusTypeNvme, BusTypeUsb, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Ioctl::{
+        IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery, StorageDeviceProperty,
+        STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_QUERY,
+    };
+    unsafe {
+        let path: Vec<u16> = format!("\\\\.\\{letter}:")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let handle = CreateFileW(
+            path.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        );
+        if handle == INVALID_HANDLE_VALUE {
+            return "固定ディスク".to_owned();
+        }
+        let query = STORAGE_PROPERTY_QUERY {
+            PropertyId: StorageDeviceProperty,
+            QueryType: PropertyStandardQuery,
+            AdditionalParameters: [0],
+        };
+        let mut buffer = [0u8; 1024];
+        let mut bytes = 0u32;
+        let ok = DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            &query as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+            &mut bytes,
+            std::ptr::null_mut(),
+        );
+        CloseHandle(handle);
+        if ok == 0 || (bytes as usize) < std::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>() {
+            return "固定ディスク".to_owned();
+        }
+        let desc = &*buffer.as_ptr().cast::<STORAGE_DEVICE_DESCRIPTOR>();
+        if desc.RemovableMedia || desc.BusType == BusTypeUsb {
+            return "リムーバブル (USB)".to_owned();
+        }
+        if desc.BusType == BusTypeNvme {
+            return "SSD (NVMe)".to_owned();
+        }
+        "固定ディスク".to_owned()
+    }
 }
 
 /// NPU デバイス (ComputeAccelerator クラス) が搭載されているかどうか。

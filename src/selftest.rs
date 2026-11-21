@@ -52,6 +52,45 @@ pub fn run() -> i32 {
             load.cpu, load.rom, load.gpu, load.npu, load.core_usage.len(), load.gpu_engines.len(), load.npu_available, load.npu_device_present
         ),
     );
+    check(
+        "device enumeration",
+        !load.disks.is_empty()
+            && load.disks.iter().all(|d| !d.id.is_empty())
+            && load
+                .gpus
+                .iter()
+                .all(|g| !g.id.is_empty() && (0.0..=100.0).contains(&g.usage))
+            && load
+                .npus
+                .iter()
+                .all(|n| !n.id.is_empty() && (0.0..=100.0).contains(&n.usage)),
+        format!(
+            "disks=[{}] gpus=[{}] npus=[{}]",
+            load.disks
+                .iter()
+                .map(|d| d.label.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            load.gpus
+                .iter()
+                .map(|g| g.label.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            load.npus
+                .iter()
+                .map(|n| n.label.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    );
+    for d in &load.disks {
+        println!(
+            "  Disk {}: read={}/s write={}/s",
+            d.label,
+            crate::util::fmt_rate(d.read_bps),
+            crate::util::fmt_rate(d.write_bps)
+        );
+    }
     for (key, val) in load.gpu_engines.iter().take(8) {
         println!("  GPU engine: {} = {:.1}%", crate::perf::engine_display_name(key), val);
     }

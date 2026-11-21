@@ -1,6 +1,6 @@
 //! アプリ本体: 状態管理と UI 描画。
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText, Vec2};
@@ -22,13 +22,15 @@ enum Tab {
 }
 
 /// パフォーマンスタブで選択中のメトリクス。
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// ディスク / GPU / NPU はデバイス ID を持ち、切断時は自動的に別の項目へ切り替わる。
+#[derive(Clone, PartialEq, Eq)]
 enum PerfSel {
     Cpu,
     Ram,
-    Rom,
-    Gpu,
-    Npu,
+    /// 空 ID は「最初のディスク」を表す (起動時フック用)
+    Disk(String),
+    Gpu(String),
+    Npu(String),
 }
 
 /// CPU グラフの表示モード (タスクマネージャーの「グラフの変更」)。
@@ -36,6 +38,34 @@ enum PerfSel {
 enum CpuGraphMode {
     Overall,
     PerCore,
+}
+
+/// デバイス (ディスク/GPU/NPU) ごとの履歴に 1 サンプル追加。
+fn push_device_hist(hists: &mut Vec<(String, VecDeque<f32>)>, id: &str, value: f32) {
+    let hist = match hists.iter_mut().find(|(k, _)| k == id) {
+        Some((_, h)) => h,
+        None => {
+            hists.push((id.to_owned(), VecDeque::new()));
+            &mut hists.last_mut().unwrap().1
+        }
+    };
+    hist.push_back(value);
+    while hist.len() > HISTORY_LEN {
+        hist.pop_front();
+    }
+}
+
+/// デバイス履歴を検索 (見つからなければ空の履歴)。
+fn find_hist<'a>(
+    hists: &'a [(String, VecDeque<f32>)],
+    id: &str,
+    empty: &'a VecDeque<f32>,
+) -> &'a VecDeque<f32> {
+    hists
+        .iter()
+        .find(|(k, _)| k == id)
+        .map(|(_, h)| h)
+        .unwrap_or(empty)
 }
 
 /// プロセス一覧の列。タブの右クリックメニューで表示/非表示を切り替える。
@@ -172,9 +202,12 @@ pub struct MiniTaskApp {
     load: SysLoad,
     cpu_hist: VecDeque<f32>,
     mem_hist: VecDeque<f32>,
-    rom_hist: VecDeque<f32>,
-    gpu_hist: VecDeque<f32>,
-    npu_hist: VecDeque<f32>,
+    /// 物理ディスクごとの読み取り/書き込み履歴 (切断時に自動で破棄)
+    disk_active_hist: Vec<(String, VecDeque<f32>)>,
+    disk_read_hist: Vec<(String, VecDeque<f32>)>,
+    disk_write_hist: Vec<(String, VecDeque<f32>)>,
+    gpu_hist: Vec<(String, VecDeque<f32>)>,
+    npu_hist: Vec<(String, VecDeque<f32>)>,
     net: Option<NetSession>,
     net_err: Option<String>,
 
@@ -223,9 +256,11 @@ impl MiniTaskApp {
             load: SysLoad::default(),
             cpu_hist: VecDeque::new(),
             mem_hist: VecDeque::new(),
-            rom_hist: VecDeque::new(),
-            gpu_hist: VecDeque::new(),
-            npu_hist: VecDeque::new(),
+            disk_active_hist: Vec::new(),
+            disk_read_hist: Vec::new(),
+            disk_write_hist: Vec::new(),
+            gpu_hist: Vec::new(),
+            npu_hist: Vec::new(),
             net,
             net_err,
             // MINITASK_TAB: processes / performance / cpu / ram / rom / gpu / npu
@@ -235,9 +270,9 @@ impl MiniTaskApp {
             },
             perf_sel: match std::env::var("MINITASK_TAB").as_deref() {
                 Ok("ram") | Ok("memory") => PerfSel::Ram,
-                Ok("rom") | Ok("disk") => PerfSel::Rom,
-                Ok("gpu") => PerfSel::Gpu,
-                Ok("npu") => PerfSel::Npu,
+                Ok("rom") | Ok("disk") => PerfSel::Disk(String::new()),
+                Ok("gpu") => PerfSel::Gpu(String::new()),
+                Ok("npu") => PerfSel::Npu(String::new()),
                 _ => PerfSel::Cpu,
             },
             cpu_graph_mode: match std::env::var("MINITASK_TAB").as_deref() {
@@ -294,30 +329,54 @@ impl MiniTaskApp {
             };
             self.cpu_hist.push_back(load.cpu);
             self.mem_hist.push_back(mem_pct);
-            self.rom_hist.push_back(load.rom);
-            self.gpu_hist.push_back(load.gpu);
-            self.npu_hist.push_back(load.npu);
-            // エンジン種別ごとの履歴 (GPU/NPU の「グラフの変更」用)
-            for (hists, engines) in [
-                (&mut self.gpu_engine_hist, &load.gpu_engines),
-                (&mut self.npu_engine_hist, &load.npu_engines),
-            ] {
-                for (key, val) in engines.iter() {
-                    let hist = match hists.iter_mut().find(|(k, _)| k == key) {
-                        Some((_, h)) => h,
-                        None => {
-                            hists.push((key.clone(), VecDeque::new()));
-                            &mut hists.last_mut().unwrap().1
-                        }
-                    };
-                    hist.push_back(*val);
-                    while hist.len() > HISTORY_LEN {
-                        hist.pop_front();
-                    }
-                }
-                // 使われなくなった種別の履歴を破棄
-                hists.retain(|(k, _)| engines.iter().any(|(k2, _)| k2 == k));
+
+            // 接続中のデバイスごとに履歴を更新
+            for d in &load.disks {
+                push_device_hist(&mut self.disk_active_hist, &d.id, d.active_pct);
+                push_device_hist(&mut self.disk_read_hist, &d.id, d.read_bps as f32);
+                push_device_hist(&mut self.disk_write_hist, &d.id, d.write_bps as f32);
             }
+            for g in &load.gpus {
+                push_device_hist(&mut self.gpu_hist, &g.id, g.usage);
+            }
+            for n in &load.npus {
+                push_device_hist(&mut self.npu_hist, &n.id, n.usage);
+            }
+            // 切断されたデバイスの履歴を破棄 (再接続時は新しい履歴から開始)
+            let disk_ids: HashSet<&str> = load.disks.iter().map(|d| d.id.as_str()).collect();
+            let gpu_ids: HashSet<&str> = load.gpus.iter().map(|g| g.id.as_str()).collect();
+            let npu_ids: HashSet<&str> = load.npus.iter().map(|n| n.id.as_str()).collect();
+            self.disk_active_hist
+                .retain(|(id, _)| disk_ids.contains(id.as_str()));
+            self.disk_read_hist
+                .retain(|(id, _)| disk_ids.contains(id.as_str()));
+            self.disk_write_hist
+                .retain(|(id, _)| disk_ids.contains(id.as_str()));
+            self.gpu_hist.retain(|(id, _)| gpu_ids.contains(id.as_str()));
+            self.npu_hist.retain(|(id, _)| npu_ids.contains(id.as_str()));
+
+            // エンジン種別ごとの履歴 (GPU/NPU の「グラフの変更」用)
+            for (key, val) in load.gpu_engines.iter() {
+                push_device_hist(&mut self.gpu_engine_hist, key, *val);
+            }
+            let gpu_engine_keys: HashSet<&str> =
+                load.gpu_engines.iter().map(|(k, _)| k.as_str()).collect();
+            self.gpu_engine_hist
+                .retain(|(k, _)| gpu_engine_keys.contains(k.as_str()));
+            // NPU はデバイス (LUID) ごとにエンジン履歴を分ける: キーは "LUID|engtype"
+            for n in &load.npus {
+                for (key, val) in n.engines.iter() {
+                    push_device_hist(&mut self.npu_engine_hist, &format!("{}|{}", n.id, key), *val);
+                }
+            }
+            let npu_engine_keys: HashSet<String> = load
+                .npus
+                .iter()
+                .flat_map(|n| n.engines.iter().map(|(k, _)| format!("{}|{}", n.id, k)))
+                .collect();
+            self.npu_engine_hist
+                .retain(|(k, _)| npu_engine_keys.contains(k));
+
             self.load = load;
             // コア別履歴
             if self.core_hist.len() != self.load.core_usage.len() {
@@ -329,17 +388,12 @@ impl MiniTaskApp {
                     hist.pop_front();
                 }
             }
-            for hist in [
-                &mut self.cpu_hist,
-                &mut self.mem_hist,
-                &mut self.rom_hist,
-                &mut self.gpu_hist,
-                &mut self.npu_hist,
-            ] {
+            for hist in [&mut self.cpu_hist, &mut self.mem_hist] {
                 while hist.len() > HISTORY_LEN {
                     hist.pop_front();
                 }
             }
+            self.normalize_selection();
             if let Some(pid) = self.selected {
                 if !self.rows.iter().any(|r| r.pid == pid) {
                     self.selected = None;
@@ -349,6 +403,67 @@ impl MiniTaskApp {
         if let Some((_, t)) = &self.toast {
             if t.elapsed() > Duration::from_secs(5) {
                 self.toast = None;
+            }
+        }
+    }
+
+    /// デバイスの増減に合わせて選択中項目を調整する。
+    /// 切断されたデバイスが選択中なら別のデバイス (無ければ CPU) に切り替える。
+    fn normalize_selection(&mut self) {
+        let valid = match &self.perf_sel {
+            PerfSel::Cpu | PerfSel::Ram => true,
+            PerfSel::Disk(id) => id.is_empty() || self.load.disks.iter().any(|d| &d.id == id),
+            PerfSel::Gpu(id) => id.is_empty() || self.load.gpus.iter().any(|g| &g.id == id),
+            PerfSel::Npu(id) => id.is_empty() || self.load.npus.iter().any(|n| &n.id == id),
+        };
+        if !valid {
+            self.perf_sel = if let Some(d) = self.load.disks.first() {
+                PerfSel::Disk(d.id.clone())
+            } else if let Some(g) = self.load.gpus.first() {
+                PerfSel::Gpu(g.id.clone())
+            } else if let Some(n) = self.load.npus.first() {
+                PerfSel::Npu(n.id.clone())
+            } else {
+                PerfSel::Cpu
+            };
+            self.gpu_sel = None;
+            self.npu_sel = None;
+        }
+        // 起動時フックの空 ID を実 ID に解決
+        match &mut self.perf_sel {
+            PerfSel::Disk(id) if id.is_empty() => {
+                if let Some(d) = self.load.disks.first() {
+                    *id = d.id.clone();
+                }
+            }
+            PerfSel::Gpu(id) if id.is_empty() => {
+                if let Some(g) = self.load.gpus.first() {
+                    *id = g.id.clone();
+                }
+            }
+            PerfSel::Npu(id) if id.is_empty() => {
+                if let Some(n) = self.load.npus.first() {
+                    *id = n.id.clone();
+                }
+            }
+            _ => {}
+        }
+        // 選択中のエンジンが現在のデバイスに無ければ解除
+        if let Some(key) = &self.gpu_sel {
+            if !self.load.gpu_engines.iter().any(|(k, _)| k == key) {
+                self.gpu_sel = None;
+            }
+        }
+        if let PerfSel::Npu(id) = &self.perf_sel {
+            let has = self
+                .load
+                .npus
+                .iter()
+                .find(|n| &n.id == id)
+                .map(|n| n.engines.iter().any(|(k, _)| k == self.npu_sel.as_deref().unwrap_or("")))
+                .unwrap_or(false);
+            if !has {
+                self.npu_sel = None;
             }
         }
     }
@@ -620,70 +735,142 @@ impl MiniTaskApp {
             });
     }
 
-    /// パフォーマンスタブの左ナビ 1 項目 (クリックでメトリクス選択)。
-    /// 各項目にミニグラフを内蔵する (タスクマネージャー風)。
+    /// パフォーマンスタブの左ナビ 1 項目 (本家タスクマネージャー風:
+    /// 左にミニグラフ、右に名前・補足・値の 3 行)。
     fn perf_nav_item(
         ui: &mut egui::Ui,
         label: &str,
-        pct: f32,
+        detail: &str,
+        value: &str,
         hist: &VecDeque<f32>,
         color: Color32,
         selected: bool,
     ) -> egui::Response {
         let width = ui.available_width().clamp(80.0, 300.0);
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 66.0), egui::Sense::click());
-        let bg = if selected {
-            Color32::from_rgb(45, 49, 60)
-        } else if resp.hovered() {
-            Color32::from_rgb(38, 42, 52)
-        } else {
-            Color32::TRANSPARENT
-        };
-        if bg != Color32::TRANSPARENT {
-            ui.painter().rect_filled(rect, 5.0, bg);
-        }
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 84.0), egui::Sense::click());
+        Self::paint_nav_background(ui, rect, resp.hovered(), selected, color, 84.0);
+        let graph_rect = Self::nav_graph_rect(rect);
+        util::paint_mini_graph(ui.painter(), graph_rect, hist, 100.0, color);
+        Self::paint_nav_text(ui, rect, label, detail, value, color);
+        resp
+    }
+
+    /// ディスク用ナビ項目 (読み取り/書き込みの 2 本線ミニグラフ)。
+    #[allow(clippy::too_many_arguments)]
+    fn perf_nav_item_dual(
+        ui: &mut egui::Ui,
+        label: &str,
+        detail: &str,
+        value: &str,
+        read: &VecDeque<f32>,
+        write: &VecDeque<f32>,
+        max: f32,
+        color: Color32,
+        selected: bool,
+    ) -> egui::Response {
+        let width = ui.available_width().clamp(80.0, 300.0);
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 84.0), egui::Sense::click());
+        Self::paint_nav_background(ui, rect, resp.hovered(), selected, color, 84.0);
+        let graph_rect = Self::nav_graph_rect(rect);
+        util::paint_mini_dual_graph(ui.painter(), graph_rect, read, write, max, CPU_COLOR, color);
+        Self::paint_nav_text(ui, rect, label, detail, value, color);
+        resp
+    }
+
+    fn nav_graph_rect(rect: egui::Rect) -> egui::Rect {
+        egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 8.0, rect.top() + 10.0),
+            egui::pos2(rect.left() + 96.0, rect.bottom() - 10.0),
+        )
+    }
+
+    fn paint_nav_background(
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        hovered: bool,
+        selected: bool,
+        color: Color32,
+        height: f32,
+    ) {
+        let painter = ui.painter();
         if selected {
-            let bar = egui::Rect::from_min_max(
-                egui::pos2(rect.left(), rect.top() + 10.0),
-                egui::pos2(rect.left() + 3.5, rect.bottom() - 10.0),
+            painter.rect_filled(rect, 4.0, Color32::from_rgb(45, 49, 60));
+            // 本家のような選択枠
+            painter.rect_stroke(
+                rect.shrink(1.0),
+                3.0,
+                egui::Stroke::new(1.0, color),
+                egui::StrokeKind::Inside,
             );
-            ui.painter().rect_filled(bar, 1.5, color);
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(rect.left(), rect.top() + 10.0),
+                    egui::pos2(rect.left() + 3.5, rect.top() + height - 10.0),
+                ),
+                1.5,
+                color,
+            );
+        } else if hovered {
+            painter.rect_filled(rect, 4.0, Color32::from_rgb(38, 42, 52));
         }
-        ui.painter().text(
-            egui::pos2(rect.left() + 14.0, rect.top() + 7.0),
+        // グラフ枠
+        let g = Self::nav_graph_rect(rect);
+        painter.rect_filled(g, 2.0, ui.visuals().extreme_bg_color);
+        painter.rect_stroke(
+            g,
+            2.0,
+            egui::Stroke::new(1.0, Color32::from_gray(55)),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    fn paint_nav_text(
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        label: &str,
+        detail: &str,
+        value: &str,
+        color: Color32,
+    ) {
+        let painter = ui.painter();
+        let x = rect.left() + 106.0;
+        painter.text(
+            egui::pos2(x, rect.top() + 10.0),
             egui::Align2::LEFT_TOP,
             label,
             egui::FontId::proportional(14.0),
             ui.visuals().text_color(),
         );
-        ui.painter().text(
-            egui::pos2(rect.right() - 10.0, rect.top() + 5.0),
-            egui::Align2::RIGHT_TOP,
-            format!("{pct:.0}%"),
-            egui::FontId::proportional(17.0),
-            color,
-        );
-        // 項目内のミニグラフ
-        let graph_rect = egui::Rect::from_min_max(
-            egui::pos2(rect.left() + 10.0, rect.top() + 30.0),
-            egui::pos2(rect.right() - 10.0, rect.bottom() - 8.0),
-        );
-        util::paint_mini_graph(ui.painter(), graph_rect, hist, 100.0, color);
-        ui.add_space(3.0);
-        resp
+        if !detail.is_empty() {
+            painter.text(
+                egui::pos2(x, rect.top() + 31.0),
+                egui::Align2::LEFT_TOP,
+                detail,
+                egui::FontId::proportional(11.0),
+                Color32::from_gray(145),
+            );
+        }
+        if !value.is_empty() {
+            painter.text(
+                egui::pos2(x, rect.top() + 50.0),
+                egui::Align2::LEFT_TOP,
+                value,
+                egui::FontId::proportional(13.0),
+                color,
+            );
+        }
     }
 
-    /// 詳細情報の 1 行 (ラベル左・値右)。
+    /// 詳細情報の 1 行 (ラベル左・値は固定幅の右側、本家風)。
     fn detail_row(ui: &mut egui::Ui, label: &str, value: impl Into<String>) {
         ui.horizontal(|ui| {
-            ui.label(
+            let resp = ui.label(
                 RichText::new(label)
                     .size(12.0)
                     .color(Color32::from_gray(150)),
             );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(value).size(12.0).monospace());
-            });
+            ui.add_space((170.0 - resp.rect.width()).max(10.0));
+            ui.label(RichText::new(value).size(13.0).monospace());
         });
     }
 
@@ -740,31 +927,139 @@ impl MiniTaskApp {
             0.0
         };
 
-        // --- 左ナビ: メトリクス選択 + ミニグラフ (タスクマネージャー風) ---
+        // --- 左ナビ: 接続中のデバイスのみ表示 (切断時は自動的に消える) ---
+        let empty_hist = VecDeque::new();
+        // ディスクは読み取り/書き込み 2 本線グラフを使う
+        let disk_dual = match &self.perf_sel {
+            PerfSel::Disk(id) => {
+                let ah = find_hist(&self.disk_active_hist, id, &empty_hist).clone();
+                let rh = find_hist(&self.disk_read_hist, id, &empty_hist).clone();
+                let wh = find_hist(&self.disk_write_hist, id, &empty_hist).clone();
+                let max = util::nice_max(&rh, &wh);
+                Some((ah, rh, wh, max))
+            }
+            _ => None,
+        };
+        // (選択項目, 名前, 補足, 値, 履歴, 色)
+        type NavItem<'a> = (PerfSel, String, String, String, &'a VecDeque<f32>, Color32);
+        let top_items: Vec<NavItem<'_>> = vec![
+            (
+                PerfSel::Cpu,
+                "CPU".to_owned(),
+                format!("{:.2} GHz", self.load.cpu_freq_mhz as f64 / 1000.0),
+                format!("{:.0}%", self.load.cpu),
+                &self.cpu_hist,
+                CPU_COLOR,
+            ),
+            (
+                PerfSel::Ram,
+                "メモリ".to_owned(),
+                format!(
+                    "{}/{} ({}%)",
+                    util::fmt_bytes(self.load.mem_used),
+                    util::fmt_bytes(self.load.mem_total),
+                    mem_pct as u32
+                ),
+                String::new(),
+                &self.mem_hist,
+                MEM_COLOR,
+            ),
+        ];
+        let mut bottom_items: Vec<NavItem<'_>> = Vec::new();
+        for g in &self.load.gpus {
+            let h = find_hist(&self.gpu_hist, &g.id, &empty_hist);
+            bottom_items.push((
+                PerfSel::Gpu(g.id.clone()),
+                g.label.clone(),
+                g.model.clone(),
+                format!("{:.0}%", g.usage),
+                h,
+                GPU_COLOR,
+            ));
+        }
+        for n in &self.load.npus {
+            let h = find_hist(&self.npu_hist, &n.id, &empty_hist);
+            bottom_items.push((
+                PerfSel::Npu(n.id.clone()),
+                n.label.clone(),
+                n.name.clone(),
+                format!("{:.0}%", n.usage),
+                h,
+                NPU_COLOR,
+            ));
+        }
+        let mut clicked_sel: Option<PerfSel> = None;
         egui::Panel::left("perf_nav")
-            .exact_size(190.0)
+            .exact_size(280.0)
             .resizable(false)
             .drag_to_open(false)
             .show(ui, |ui| {
                 ui.add_space(4.0);
-                let items = [
-                    (PerfSel::Cpu, "CPU", self.load.cpu, &self.cpu_hist, CPU_COLOR),
-                    (PerfSel::Ram, "メモリ", mem_pct, &self.mem_hist, MEM_COLOR),
-                    (PerfSel::Rom, "ディスク (C:)", self.load.rom, &self.rom_hist, ROM_COLOR),
-                    (PerfSel::Gpu, "GPU", self.load.gpu, &self.gpu_hist, GPU_COLOR),
-                    (PerfSel::Npu, "NPU", self.load.npu, &self.npu_hist, NPU_COLOR),
-                ];
-                for (sel, label, pct, hist, color) in items {
-                    let resp = Self::perf_nav_item(ui, label, pct, hist, color, self.perf_sel == sel);
+                for (sel, label, detail, value, hist, color) in top_items {
+                    let resp = Self::perf_nav_item(
+                        ui,
+                        &label,
+                        &detail,
+                        &value,
+                        hist,
+                        color,
+                        self.perf_sel == sel,
+                    );
                     if resp.clicked() {
-                        self.perf_sel = sel;
+                        clicked_sel = Some(sel);
+                    }
+                }
+                // ディスク: 物理ディスク単位、読み取り/書き込みの 2 本線グラフ
+                for d in &self.load.disks {
+                    let rh = find_hist(&self.disk_read_hist, &d.id, &empty_hist);
+                    let wh = find_hist(&self.disk_write_hist, &d.id, &empty_hist);
+                    let max = util::nice_max(rh, wh);
+                    let val = util::fmt_rate(d.read_bps.max(d.write_bps));
+                    let sel = PerfSel::Disk(d.id.clone());
+                    let resp = Self::perf_nav_item_dual(
+                        ui,
+                        &d.label,
+                        &d.type_label,
+                        &val,
+                        rh,
+                        wh,
+                        max,
+                        ROM_COLOR,
+                        self.perf_sel == sel,
+                    );
+                    if resp.clicked() {
+                        clicked_sel = Some(sel);
+                    }
+                }
+                for (sel, label, detail, value, hist, color) in bottom_items {
+                    let resp = Self::perf_nav_item(
+                        ui,
+                        &label,
+                        &detail,
+                        &value,
+                        hist,
+                        color,
+                        self.perf_sel == sel,
+                    );
+                    if resp.clicked() {
+                        clicked_sel = Some(sel);
                     }
                 }
             });
+        if let Some(sel) = clicked_sel {
+            self.perf_sel = sel;
+            self.gpu_sel = None;
+            self.npu_sel = None;
+        }
 
+        // 右側の内容は縦にはみ出したらスクロールできるようにする
+        // (ウィンドウが小さくても詳細情報までアクセス可能)
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
         // --- 中央: 選択中メトリクスの大きなグラフと詳細 ---
         // GPU/NPU はエンジン種別が選択されていればそのグラフを表示する
-        let (title, subtitle, value, hist, color, _is_engine_sel) = match self.perf_sel {
+        let (title, subtitle, value, hist, color) = match &self.perf_sel {
             PerfSel::Cpu => (
                 "CPU".to_owned(),
                 if self.load.cpu_brand.is_empty() {
@@ -775,7 +1070,6 @@ impl MiniTaskApp {
                 format!("{:.0}%", self.load.cpu),
                 &self.cpu_hist,
                 CPU_COLOR,
-                false,
             ),
             PerfSel::Ram => (
                 "メモリ".to_owned(),
@@ -783,111 +1077,92 @@ impl MiniTaskApp {
                 format!("{mem_pct:.0}%"),
                 &self.mem_hist,
                 MEM_COLOR,
-                false,
             ),
-            PerfSel::Rom => (
-                "ディスク (C:)".to_owned(),
-                "ストレージ (ROM)".to_owned(),
-                format!("{:.0}%", self.load.rom),
-                &self.rom_hist,
-                ROM_COLOR,
-                false,
-            ),
-            PerfSel::Gpu => {
-                if let Some(key) = self.gpu_sel.clone() {
-                    let name = crate::perf::engine_display_name(&key);
-                    let hist = self
-                        .gpu_engine_hist
-                        .iter()
-                        .find(|(k, _)| *k == key)
-                        .map(|(_, h)| h);
-                    let cur = self
-                        .load
-                        .gpu_engines
-                        .iter()
-                        .find(|(k, _)| *k == key)
-                        .map(|(_, v)| *v)
-                        .unwrap_or(0.0);
-                    if let Some(h) = hist {
+            PerfSel::Disk(id) => {
+                let d = self.load.disks.iter().find(|d| &d.id == id);
+                let title = d
+                    .map(|d| d.label.clone())
+                    .unwrap_or_else(|| "ディスク".to_owned());
+                let value = d
+                    .map(|d| format!("{:.0}%", d.active_pct))
+                    .unwrap_or_else(|| "0%".to_owned());
+                let subtitle = d
+                    .map(|d| d.type_label.clone())
+                    .unwrap_or_else(|| "ストレージ".to_owned());
+                let h = find_hist(&self.disk_active_hist, id, &empty_hist);
+                (title, subtitle, value, h, MEM_COLOR)
+            }
+            PerfSel::Gpu(id) => {
+                let g = self.load.gpus.iter().find(|g| &g.id == id);
+                let model = g
+                    .map(|g| g.model.clone())
+                    .unwrap_or_else(|| "GPU".to_owned());
+                let label = g
+                    .map(|g| g.label.clone())
+                    .unwrap_or_else(|| "GPU".to_owned());
+                let usage = g.map(|g| g.usage).unwrap_or(0.0);
+                let overall = (
+                    label.clone(),
+                    model.clone(),
+                    format!("{usage:.0}%"),
+                    find_hist(&self.gpu_hist, id, &empty_hist),
+                    GPU_COLOR,
+                );
+                if let (Some(g), Some(key)) = (g, self.gpu_sel.clone()) {
+                    if let Some((_, v)) = g.engines.iter().find(|(k, _)| *k == key) {
+                        let name = crate::perf::engine_display_name(&key);
+                        let h = find_hist(&self.gpu_engine_hist, &key, &empty_hist);
                         (
-                            format!("GPU — {name}"),
-                            self.load.gpu_model.clone(),
-                            format!("{cur:.0}%"),
+                            format!("{label} — {name}"),
+                            model,
+                            format!("{v:.0}%"),
                             h,
                             GPU_COLOR,
-                            true,
                         )
                     } else {
-                        (
-                            "GPU".to_owned(),
-                            self.load.gpu_model.clone(),
-                            format!("{:.0}%", self.load.gpu),
-                            &self.gpu_hist,
-                            GPU_COLOR,
-                            false,
-                        )
+                        overall
                     }
                 } else {
-                    (
-                        "GPU".to_owned(),
-                        self.load.gpu_model.clone(),
-                        format!("{:.0}%", self.load.gpu),
-                        &self.gpu_hist,
-                        GPU_COLOR,
-                        false,
-                    )
+                    overall
                 }
             }
-            PerfSel::Npu => {
+            PerfSel::Npu(id) => {
+                let n = self.load.npus.iter().find(|n| &n.id == id);
+                let label = n
+                    .map(|n| n.label.clone())
+                    .unwrap_or_else(|| "NPU".to_owned());
+                let name = n.map(|n| n.name.clone()).unwrap_or_default();
+                let usage = n.map(|n| n.usage).unwrap_or(0.0);
                 let npu_sub = if self.load.npu_available {
                     "NPU エンジン".to_owned()
-                } else if self.load.npu_device_present {
-                    "搭載済み (使用率カウンタ未提供)".to_owned()
                 } else {
-                    "NPU 非搭載 / 取得不可".to_owned()
+                    name
                 };
+                let overall = (
+                    label.clone(),
+                    npu_sub.clone(),
+                    format!("{usage:.0}%"),
+                    find_hist(&self.npu_hist, id, &empty_hist),
+                    NPU_COLOR,
+                );
                 if let Some(key) = self.npu_sel.clone() {
-                    let name = crate::perf::npu_engine_display_name(&key);
-                    let hist = self
-                        .npu_engine_hist
-                        .iter()
-                        .find(|(k, _)| *k == key)
-                        .map(|(_, h)| h);
-                    let cur = self
-                        .load
-                        .npu_engines
-                        .iter()
-                        .find(|(k, _)| *k == key)
-                        .map(|(_, v)| *v)
-                        .unwrap_or(0.0);
-                    if let Some(h) = hist {
+                    let cur = n.and_then(|n| n.engines.iter().find(|(k, _)| *k == key));
+                    if let Some((_, v)) = cur {
+                        let dname = crate::perf::npu_engine_display_name(&key);
+                        let hist_key = format!("{id}|{key}");
+                        let h = find_hist(&self.npu_engine_hist, &hist_key, &empty_hist);
                         (
-                            format!("NPU — {name}"),
+                            format!("{label} — {dname}"),
                             npu_sub,
-                            format!("{cur:.0}%"),
+                            format!("{v:.0}%"),
                             h,
                             NPU_COLOR,
-                            true,
                         )
                     } else {
-                        (
-                            "NPU".to_owned(),
-                            npu_sub,
-                            format!("{:.0}%", self.load.npu),
-                            &self.npu_hist,
-                            NPU_COLOR,
-                            false,
-                        )
+                        overall
                     }
                 } else {
-                    (
-                        "NPU".to_owned(),
-                        npu_sub,
-                        format!("{:.0}%", self.load.npu),
-                        &self.npu_hist,
-                        NPU_COLOR,
-                        false,
-                    )
+                    overall
                 }
             }
         };
@@ -981,31 +1256,84 @@ impl MiniTaskApp {
                 // 論理プロセッサ表示でも右クリックで「全体的な使用率」に戻せる
                 row_resp.context_menu(|ui| self.cpu_graph_menu(ui));
             }
+        } else if let Some((ah, rh, wh, max)) = disk_dual {
+            // 本家タスクマネージャーと同じ 2 段構成:
+            // 上 = アクティブな時間 (%)、下 = ディスクの転送速度 (読み取り/書き込み)
+            let main_h = (gh * 0.62).max(80.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("アクティブな時間")
+                        .size(12.0)
+                        .color(Color32::from_gray(150)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new("100%")
+                            .size(11.0)
+                            .color(Color32::from_gray(120)),
+                    );
+                });
+            });
+            util::perf_chart(ui, &ah, 100.0, MEM_COLOR, Vec2::new(gw, main_h));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("ディスクの転送速度")
+                        .size(12.0)
+                        .color(Color32::from_gray(150)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("{}/秒", util::fmt_bytes(max as u64)))
+                            .size(11.0)
+                            .color(Color32::from_gray(120)),
+                    );
+                });
+            });
+            util::perf_dual_chart(
+                ui,
+                &rh,
+                &wh,
+                max,
+                CPU_COLOR,
+                ROM_COLOR,
+                Vec2::new(gw, (gh - main_h - 12.0).max(60.0)),
+            );
         } else {
             let resp = util::perf_chart(ui, hist, 100.0, color, Vec2::new(gw, gh));
-            match self.perf_sel {
+            match &self.perf_sel {
                 PerfSel::Cpu => {
                     resp.on_hover_text("右クリックでグラフの変更")
                         .context_menu(|ui| self.cpu_graph_menu(ui));
                 }
-                PerfSel::Gpu => {
+                PerfSel::Gpu(id) => {
+                    let engines = self
+                        .load
+                        .gpus
+                        .iter()
+                        .find(|g| &g.id == id)
+                        .map(|g| g.engines.clone())
+                        .unwrap_or_default();
+                    let sel = &mut self.gpu_sel;
                     resp.on_hover_text("右クリックでグラフの変更 (エンジン種別)")
-                        .context_menu(|ui| Self::engine_graph_menu(
-                            ui,
-                            &mut self.gpu_sel,
-                            &self.load.gpu_engines,
-                            false,
-                        ));
+                        .context_menu(move |ui| {
+                            Self::engine_graph_menu(ui, sel, &engines, false)
+                        });
                 }
-                PerfSel::Npu => {
-                    if self.load.npu_available {
+                PerfSel::Npu(id) => {
+                    let engines = self
+                        .load
+                        .npus
+                        .iter()
+                        .find(|n| &n.id == id)
+                        .map(|n| n.engines.clone())
+                        .unwrap_or_default();
+                    if !engines.is_empty() {
+                        let sel = &mut self.npu_sel;
                         resp.on_hover_text("右クリックでグラフの変更 (エンジン種別)")
-                            .context_menu(|ui| Self::engine_graph_menu(
-                                ui,
-                                &mut self.npu_sel,
-                                &self.load.npu_engines,
-                                true,
-                            ));
+                            .context_menu(move |ui| {
+                                Self::engine_graph_menu(ui, sel, &engines, true)
+                            });
                     }
                 }
                 _ => {}
@@ -1020,7 +1348,7 @@ impl MiniTaskApp {
         ui.columns(2, |cols| {
             let (l, rest) = cols.split_first_mut().unwrap();
             let r = rest.first_mut().unwrap();
-            l.vertical(|ui| match self.perf_sel {
+            l.vertical(|ui| match &self.perf_sel {
                 PerfSel::Cpu => {
                     Self::detail_row(ui, "利用率", format!("{:.1}%", d.cpu));
                     Self::detail_row(
@@ -1043,23 +1371,36 @@ impl MiniTaskApp {
                     Self::detail_row(ui, "ページ プール", gb(d.kernel_paged));
                     Self::detail_row(ui, "非ページ プール", gb(d.kernel_nonpaged));
                 }
-                PerfSel::Rom => {
-                    Self::detail_row(ui, "利用率", format!("{:.1}%", d.rom));
+                PerfSel::Disk(id) => {
+                    if let Some(disk) = d.disks.iter().find(|x| &x.id == id) {
+                        Self::detail_row(
+                            ui,
+                            "アクティブな時間",
+                            format!("{:.0}%", disk.active_pct),
+                        );
+                        Self::detail_row(
+                            ui,
+                            "平均応答時間",
+                            format!("{:.1} ミリ秒", disk.response_ms),
+                        );
+                        Self::detail_row(ui, "読み取り速度", util::fmt_rate(disk.read_bps));
+                        Self::detail_row(ui, "書き込み速度", util::fmt_rate(disk.write_bps));
+                    }
+                }
+                PerfSel::Gpu(id) => {
+                    if let Some(g) = d.gpus.iter().find(|x| &x.id == id) {
+                        Self::detail_row(ui, "使用率", format!("{:.1}%", g.usage));
+                        Self::detail_row(ui, "ビデオメモリ使用", gb(g.mem_used));
+                        Self::detail_row(ui, "ビデオメモリ合計", gb(g.mem_total));
+                    }
+                }
+                PerfSel::Npu(id) => {
+                    let n = d.npus.iter().find(|x| &x.id == id);
                     Self::detail_row(
                         ui,
-                        "容量",
-                        format!("{} / {}", gb(d.rom_total - d.rom_free), gb(d.rom_total)),
+                        "使用率",
+                        format!("{:.1}%", n.map(|n| n.usage).unwrap_or(0.0)),
                     );
-                    Self::detail_row(ui, "空き容量", gb(d.rom_free));
-                    Self::detail_row(ui, "読み取り速度", util::fmt_rate(d.rom_read));
-                }
-                PerfSel::Gpu => {
-                    Self::detail_row(ui, "使用率", format!("{:.1}%", d.gpu));
-                    Self::detail_row(ui, "ビデオメモリ使用", gb(d.gpu_mem_used));
-                    Self::detail_row(ui, "ビデオメモリ合計", gb(d.gpu_mem_total));
-                }
-                PerfSel::Npu => {
-                    Self::detail_row(ui, "使用率", format!("{:.1}%", d.npu));
                     Self::detail_row(
                         ui,
                         "状態",
@@ -1073,7 +1414,7 @@ impl MiniTaskApp {
                     );
                 }
             });
-            r.vertical(|ui| match self.perf_sel {
+            r.vertical(|ui| match &self.perf_sel {
                 PerfSel::Cpu => {
                     Self::detail_row(ui, "スレッド数", d.threads.to_string());
                     let s = d.uptime_secs;
@@ -1089,28 +1430,52 @@ impl MiniTaskApp {
                     Self::detail_row(ui, "合計 (物理)", gb(d.mem_total));
                     Self::detail_row(ui, "プロセス数", d.processes.to_string());
                 }
-                PerfSel::Rom => {
-                    Self::detail_row(ui, "書き込み速度", util::fmt_rate(d.rom_written));
+                PerfSel::Disk(id) => {
+                    if let Some(disk) = d.disks.iter().find(|x| &x.id == id) {
+                        Self::detail_row(ui, "容量", gb(disk.total));
+                        Self::detail_row(ui, "フォーマット済み", gb(disk.total));
+                        let system = disk.letters.iter().any(|l| l == "C");
+                        Self::detail_row(
+                            ui,
+                            "システム ディスク",
+                            if system { "はい" } else { "いいえ" },
+                        );
+                        Self::detail_row(
+                            ui,
+                            "ページ ファイル",
+                            if system { "はい" } else { "いいえ" },
+                        );
+                        Self::detail_row(ui, "種類", disk.type_label.clone());
+                        Self::detail_row(ui, "空き容量", gb(disk.free));
+                    }
                 }
-                PerfSel::Gpu => {
-                    Self::detail_row(ui, "モデル", d.gpu_model.clone());
-                    let top = d.gpu_engines.first();
-                    Self::detail_row(
-                        ui,
-                        "最も使用された GPU エンジン",
-                        match top {
-                            Some((k, v)) => {
-                                format!("{} ({v:.1}%)", crate::perf::engine_display_name(k))
-                            }
-                            None => "—".to_owned(),
-                        },
-                    );
+                PerfSel::Gpu(id) => {
+                    if let Some(g) = d.gpus.iter().find(|x| &x.id == id) {
+                        Self::detail_row(ui, "モデル", g.model.clone());
+                        let top = g.engines.first();
+                        Self::detail_row(
+                            ui,
+                            "最も使用された GPU エンジン",
+                            match top {
+                                Some((k, v)) => {
+                                    format!("{} ({v:.1}%)", crate::perf::engine_display_name(k))
+                                }
+                                None => "—".to_owned(),
+                            },
+                        );
+                    }
                 }
-                PerfSel::Npu => {
+                PerfSel::Npu(id) => {
+                    let has_counter = d
+                        .npus
+                        .iter()
+                        .find(|x| &x.id == id)
+                        .map(|n| !n.engines.is_empty())
+                        .unwrap_or(false);
                     Self::detail_row(
                         ui,
                         "カウンタ",
-                        if d.npu_available {
+                        if has_counter {
                             "NPU Engine"
                         } else if d.npu_device_present {
                             "未提供 (デバイスは搭載済み)"
@@ -1120,6 +1485,7 @@ impl MiniTaskApp {
                     );
                 }
             });
+        });
         });
     }
 

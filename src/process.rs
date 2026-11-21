@@ -17,7 +17,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::net::{self, NetCounters};
-use crate::perf::{EngineMeter, GPU_ENGINE_COUNTER, NPU_ENGINE_COUNTER};
+use crate::perf::{DiskMeter, EngineMeter, GPU_ENGINE_COUNTER, NPU_ENGINE_COUNTER};
 
 /// UI に表示する 1 プロセス分の情報。
 #[derive(Clone, Debug)]
@@ -43,6 +43,55 @@ pub struct ProcRow {
     pub start_time: u64, // UNIX 秒
 }
 
+/// ストレージ デバイス 1 台分の情報。
+#[derive(Clone, Debug, Default)]
+pub struct DiskInfo {
+    /// 物理ディスク番号 (PDH インスタンス名の先頭数字)
+    pub id: String,
+    /// 表示名 (例: "ディスク 2 (D: E:)")
+    pub label: String,
+    /// この物理ディスクに属するドライブレター
+    pub letters: Vec<String>,
+    pub read_bps: u64,
+    pub write_bps: u64,
+    /// アクティブな時間 (0..100)
+    pub active_pct: f32,
+    /// 平均応答時間 (ミリ秒)
+    pub response_ms: f32,
+    /// 種類 (例: "リムーバブル (USB)")
+    pub type_label: String,
+    pub free: u64,
+    pub total: u64,
+}
+
+/// GPU 1 台分の情報。
+#[derive(Clone, Debug, Default)]
+pub struct GpuInfo {
+    /// 列挙順の ID (例: "0")
+    pub id: String,
+    /// 表示名 (例: "GPU 0")
+    pub label: String,
+    pub model: String,
+    pub usage: f32,
+    pub mem_used: u64,
+    pub mem_total: u64,
+    /// エンジン種別ごとの使用率 (複数 GPU の場合は全 GPU の合計)
+    pub engines: Vec<(String, f32)>,
+}
+
+/// NPU 1 台分の情報。
+#[derive(Clone, Debug, Default)]
+pub struct NpuInfo {
+    /// PDH カウンタの LUID
+    pub id: String,
+    /// 表示名 (例: "NPU 0")
+    pub label: String,
+    pub name: String,
+    pub usage: f32,
+    /// エンジン種別ごとの使用率
+    pub engines: Vec<(String, f32)>,
+}
+
 /// システム全体の負荷。
 #[derive(Clone, Debug, Default)]
 pub struct SysLoad {
@@ -62,6 +111,12 @@ pub struct SysLoad {
     pub gpu_engines: Vec<(String, f32)>,
     /// NPU エンジン種別ごとの使用率
     pub npu_engines: Vec<(String, f32)>,
+    /// 接続中のストレージ一覧 (切断時は自動的に消える)
+    pub disks: Vec<DiskInfo>,
+    /// 搭載中の GPU 一覧
+    pub gpus: Vec<GpuInfo>,
+    /// 搭載中の NPU 一覧
+    pub npus: Vec<NpuInfo>,
 
     // --- パフォーマンスタブ向けの詳細情報 ---
     pub cpu_brand: String,
@@ -73,13 +128,6 @@ pub struct SysLoad {
     pub cached: u64,
     pub kernel_paged: u64,
     pub kernel_nonpaged: u64,
-    pub rom_read: u64, // bytes/sec
-    pub rom_written: u64,
-    pub rom_free: u64,
-    pub rom_total: u64,
-    pub gpu_model: String,
-    pub gpu_mem_used: u64,
-    pub gpu_mem_total: u64,
     pub processes: u32,
     pub threads: u32,
     pub handles: u32,
@@ -106,6 +154,7 @@ pub struct ProcCollector {
     user_cache: HashMap<String, String>,
     disks: Disks,
     gpus: Gpus,
+    disk_meter: DiskMeter,
     npu: EngineMeter,
     gpu_engine_meter: EngineMeter,
     npu_device_present: bool,
@@ -137,6 +186,7 @@ impl ProcCollector {
             user_cache: HashMap::new(),
             disks,
             gpus,
+            disk_meter: DiskMeter::new(),
             npu: EngineMeter::new(NPU_ENGINE_COUNTER),
             gpu_engine_meter: EngineMeter::new(GPU_ENGINE_COUNTER),
             npu_device_present: crate::perf::npu_device_present(),
@@ -156,72 +206,160 @@ impl ProcCollector {
         let dt = self.prev_time.elapsed().as_secs_f64().max(0.05);
         self.prev_time = Instant::now();
 
-        // --- ストレージ (ROM): C: ドライブを優先、なければ最初のディスク ---
+        // --- ストレージ: 物理ディスク単位で列挙 (切断時は自動的に消える) ---
+        // PDH の PhysicalDisk インスタンスは "1 c:" / "2 d: e:" のように
+        // 同じ物理ディスクの複数パーティションを 1 つにまとめる。
         self.disks.refresh(false);
-        let (rom, rom_read, rom_written, rom_free, rom_total) = self
+        let disk_samples = self.disk_meter.read();
+        let disk_list: Vec<DiskInfo> = if disk_samples.is_empty() {
+            // フォールバック: sysinfo のボリューム単位
+            self.disks
+                .iter()
+                .enumerate()
+                .map(|(i, d)| {
+                    let mount = d
+                        .mount_point()
+                        .to_string_lossy()
+                        .trim_end_matches('\\')
+                        .to_uppercase();
+                    let du = d.usage();
+                    DiskInfo {
+                        id: i.to_string(),
+                        label: format!("ディスク {} ({})", i, mount),
+                        letters: vec![mount.trim_end_matches(':').to_owned()],
+                        read_bps: (du.read_bytes as f64 / dt) as u64,
+                        write_bps: (du.written_bytes as f64 / dt) as u64,
+                        active_pct: 0.0,
+                        response_ms: 0.0,
+                        type_label: "固定ディスク".to_owned(),
+                        free: d.available_space(),
+                        total: d.total_space(),
+                    }
+                })
+                .collect()
+        } else {
+            disk_samples
+                .into_iter()
+                .map(|s| {
+                    // 容量情報はドライブレターから sysinfo のディスクを引く
+                    let cap = s.letters.iter().find_map(|letter| {
+                        self.disks.iter().find(|d| {
+                            d.mount_point()
+                                .to_string_lossy()
+                                .to_uppercase()
+                                .starts_with(&format!("{letter}:"))
+                        })
+                    });
+                    let type_label = s
+                        .letters
+                        .first()
+                        .map(|letter| crate::perf::disk_type_label(letter))
+                        .unwrap_or_else(|| "リムーバブル (USB)".to_owned());
+                    DiskInfo {
+                        id: s.id,
+                        label: s.label,
+                        letters: s.letters,
+                        read_bps: s.read_bps as u64,
+                        write_bps: s.write_bps as u64,
+                        active_pct: s.active_pct,
+                        response_ms: s.response_ms,
+                        type_label,
+                        free: cap.map(|d| d.available_space()).unwrap_or(0),
+                        total: cap.map(|d| d.total_space()).unwrap_or(0),
+                    }
+                })
+                .collect()
+        };
+        // 互換用の容量使用率 (C:)。グラフには使用しない。
+        let rom = self
             .disks
             .iter()
             .find(|d| d.mount_point().to_string_lossy().starts_with("C:"))
-            .or_else(|| self.disks.iter().next())
             .map(|d| {
-                let total = d.total_space();
-                let pct = if total > 0 {
-                    ((total - d.available_space().min(total)) as f64 / total as f64 * 100.0) as f32
+                let t = d.total_space();
+                if t > 0 {
+                    ((t - d.available_space().min(t)) as f64 / t as f64 * 100.0) as f32
                 } else {
                     0.0
-                };
-                let du = d.usage();
-                (
-                    pct,
-                    (du.read_bytes as f64 / dt) as u64,
-                    (du.written_bytes as f64 / dt) as u64,
-                    d.available_space(),
-                    total,
-                )
+                }
             })
-            .unwrap_or((0.0, 0, 0, 0, 0));
+            .unwrap_or(0.0);
 
-        // --- GPU: 最も使用率の高い GPU を主 GPU として採用 ---
+        // --- GPU: 搭載中の全 GPU を列挙 (非搭載なら空になる) ---
         self.gpus.refresh(false);
-        let gpu = self
+        let mut gpu_list: Vec<GpuInfo> = self
             .gpus
             .iter()
-            .filter_map(|g| g.usage())
-            .fold(0.0_f32, f32::max)
-            .clamp(0.0, 100.0);
-        let primary_gpu = self
-            .gpus
+            .enumerate()
+            .map(|(i, g)| GpuInfo {
+                id: i.to_string(),
+                label: format!("GPU {i}"),
+                model: g.model().unwrap_or("不明").to_owned(),
+                usage: g.usage().unwrap_or(0.0).clamp(0.0, 100.0),
+                mem_used: g.used_memory().unwrap_or(0),
+                mem_total: g.total_memory().unwrap_or(0),
+                engines: Vec::new(), // 下でエンジン一覧を設定する
+            })
+            .collect();
+        let primary_gpu_info = gpu_list
             .iter()
-            .find(|g| g.usage().is_some())
-            .or_else(|| self.gpus.iter().next());
-        let gpu_model = primary_gpu
-            .and_then(|g| g.model())
-            .unwrap_or("不明")
-            .to_owned();
-        let gpu_mem_used = primary_gpu.and_then(|g| g.used_memory()).unwrap_or(0);
-        let gpu_mem_total = primary_gpu.and_then(|g| g.total_memory()).unwrap_or(0);
+            .find(|g| g.usage > 0.0)
+            .or_else(|| gpu_list.first())
+            .cloned()
+            .unwrap_or_default();
+        let gpu = primary_gpu_info.usage;
 
         // --- GPU / NPU エンジン使用率 ---
         // Windows 11 では NPU も \GPU Engine(*) カウンタに含まれ、NPU 固有の
         // LUID で列挙される。3D/Copy/Video 系エンジンを持つ LUID = GPU、
         // compute 系のみの LUID = NPU として分離する (本家と同じ判定)。
-        let (gpu_engines, npu_engines_from_gpu) =
-            self.gpu_engine_meter.read_split().unwrap_or_default();
+        let snapshot = self.gpu_engine_meter.read_split().unwrap_or_default();
+        let gpu_engines = snapshot.gpu_engines.clone();
+        for g in &mut gpu_list {
+            g.engines = gpu_engines.clone();
+        }
 
         // 専用の \NPU Engine(*) カウンタが存在する環境ではそちらを優先する
         self.npu_recheck = self.npu_recheck.wrapping_add(1);
         if !self.npu.available && self.npu_recheck % 30 == 0 {
             self.npu.try_reopen();
         }
-        let (npu_engines, npu) = if self.npu.available {
-            let (_, dedicated) = self.npu.read_split().unwrap_or_default();
-            let total: f32 = dedicated.iter().map(|(_, v)| *v).sum();
-            (dedicated, total.clamp(0.0, 100.0))
+        let npu_snapshot = if self.npu.available {
+            self.npu.read_split().unwrap_or_default()
         } else {
-            let total: f32 = npu_engines_from_gpu.iter().map(|(_, v)| *v).sum();
-            (npu_engines_from_gpu, total.clamp(0.0, 100.0))
+            snapshot
         };
+        let npu_engines = npu_snapshot.npu_engines;
+        let npu: f32 = npu_engines.iter().map(|(_, v)| *v).sum::<f32>().clamp(0.0, 100.0);
         let npu_available = !npu_engines.is_empty();
+
+        // NPU は LUID (デバイス) ごとに 1 エントリ。非搭載なら空 → ナビ非表示。
+        let mut npu_list: Vec<NpuInfo> = npu_snapshot
+            .npu_by_luid
+            .into_iter()
+            .filter(|(_, engines)| !engines.is_empty())
+            .enumerate()
+            .map(|(i, (luid, engines))| {
+                let usage = engines.iter().map(|(_, v)| *v).sum::<f32>().clamp(0.0, 100.0);
+                NpuInfo {
+                    id: luid,
+                    label: format!("NPU {i}"),
+                    name: "NPU Compute Accelerator Device".to_owned(),
+                    usage,
+                    engines,
+                }
+            })
+            .collect();
+        // カウンタ未提供だがデバイスは搭載されている場合: 0% の NPU を表示
+        if npu_list.is_empty() && self.npu_device_present {
+            npu_list.push(NpuInfo {
+                id: "device".to_owned(),
+                label: "NPU 0".to_owned(),
+                name: "NPU Compute Accelerator Device".to_owned(),
+                usage: 0.0,
+                engines: Vec::new(),
+            });
+        }
 
         // --- CPU 詳細 ---
         let cpu_brand = self
@@ -285,13 +423,6 @@ impl ProcCollector {
             cached,
             kernel_paged,
             kernel_nonpaged,
-            rom_read,
-            rom_written,
-            rom_free,
-            rom_total,
-            gpu_model,
-            gpu_mem_used,
-            gpu_mem_total,
             processes,
             threads,
             handles,
@@ -299,6 +430,9 @@ impl ProcCollector {
             core_usage,
             gpu_engines,
             npu_engines,
+            disks: disk_list,
+            gpus: gpu_list,
+            npus: npu_list,
         };
 
         let now_net = net::snapshot();
