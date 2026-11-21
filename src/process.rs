@@ -23,11 +23,16 @@ use crate::perf::NpuMeter;
 #[derive(Clone, Debug)]
 pub struct ProcRow {
     pub pid: u32,
+    pub parent: Option<u32>,
     pub name: String,
+    /// 実行状態 ("実行中" など)
+    pub status: String,
     /// マシン全体に対する CPU 使用率 (0..100, タスクマネージャー準拠)
     pub cpu: f32,
     /// ワーキングセット (バイト)
     pub mem: u64,
+    /// プロセス単位の GPU 使用率 (0..100)
+    pub gpu: f32,
     pub io_read: u64,  // bytes/sec
     pub io_write: u64, // bytes/sec
     pub net_recv: u64, // bytes/sec
@@ -48,6 +53,8 @@ pub struct SysLoad {
     pub gpu: f32, // GPU 使用率 0..100
     pub npu: f32, // NPU 使用率 0..100
     pub npu_available: bool,
+    /// 論理プロセッサごとの使用率 (0..100)
+    pub core_usage: Vec<f32>,
 
     // --- パフォーマンスタブ向けの詳細情報 ---
     pub cpu_brand: String,
@@ -57,6 +64,8 @@ pub struct SysLoad {
     pub commit_used: u64,
     pub commit_limit: u64,
     pub cached: u64,
+    pub kernel_paged: u64,
+    pub kernel_nonpaged: u64,
     pub rom_read: u64, // bytes/sec
     pub rom_written: u64,
     pub rom_free: u64,
@@ -75,6 +84,7 @@ fn refresh_kind() -> ProcessRefreshKind {
         .with_cpu()
         .with_memory()
         .with_disk_usage()
+        .with_gpu_usage()
         .with_exe(UpdateKind::OnlyIfNotSet)
         .with_cmd(UpdateKind::OnlyIfNotSet)
         .with_user(UpdateKind::OnlyIfNotSet)
@@ -190,9 +200,10 @@ impl ProcCollector {
             .max()
             .unwrap_or(0);
         let logical_cores = self.sys.cpus().len();
+        let core_usage: Vec<f32> = self.sys.cpus().iter().map(|c| c.usage()).collect();
 
         // --- システム全体の統計 (プロセス/スレッド/ハンドル/コミット) ---
-        let (mem_available, commit_used, commit_limit, cached, processes, threads, handles) =
+        let (mem_available, commit_used, commit_limit, cached, kernel_paged, kernel_nonpaged, processes, threads, handles) =
             unsafe {
                 let size = std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32;
                 let mut pi = PERFORMANCE_INFORMATION {
@@ -206,12 +217,14 @@ impl ProcCollector {
                         pi.CommitTotal as u64 * ps,
                         pi.CommitLimit as u64 * ps,
                         pi.SystemCache as u64 * ps,
+                        pi.KernelPaged as u64 * ps,
+                        pi.KernelNonpaged as u64 * ps,
                         pi.ProcessCount,
                         pi.ThreadCount,
                         pi.HandleCount,
                     )
                 } else {
-                    (0, 0, 0, 0, 0, 0, 0)
+                    (0, 0, 0, 0, 0, 0, 0, 0, 0)
                 }
             };
         let uptime_secs = unsafe { GetTickCount64() / 1000 };
@@ -231,6 +244,8 @@ impl ProcCollector {
             commit_used,
             commit_limit,
             cached,
+            kernel_paged,
+            kernel_nonpaged,
             rom_read,
             rom_written,
             rom_free,
@@ -242,6 +257,7 @@ impl ProcCollector {
             threads,
             handles,
             uptime_secs,
+            core_usage,
         };
 
         let now_net = net::snapshot();
@@ -271,9 +287,17 @@ impl ProcCollector {
 
             rows.push(ProcRow {
                 pid: pid_u,
+                parent: p.parent().map(|pp| pp.as_u32()),
                 name: p.name().to_string_lossy().into_owned(),
+                status: match p.status() {
+                    sysinfo::ProcessStatus::Run => "実行中".to_owned(),
+                    sysinfo::ProcessStatus::Sleep => "スリープ".to_owned(),
+                    sysinfo::ProcessStatus::Idle => "アイドル".to_owned(),
+                    _ => "不明".to_owned(),
+                },
                 cpu: (p.cpu_usage() / self.cpu_count).clamp(0.0, 100.0),
                 mem: p.memory(),
+                gpu: p.gpu_usage().unwrap_or(0.0).clamp(0.0, 100.0),
                 io_read: (disk.read_bytes as f64 / dt) as u64,
                 io_write: (disk.written_bytes as f64 / dt) as u64,
                 net_recv: (cur.recv.saturating_sub(prev.recv) as f64 / dt) as u64,
@@ -316,6 +340,37 @@ pub fn kill(pid: u32) -> Result<(), String> {
         } else {
             Ok(())
         }
+    }
+}
+
+/// プロセス ツリー (対象とその子孫すべて) を強制終了する。
+/// タスクマネージャーの「プロセス ツリーの終了」相当。
+pub fn kill_tree(pid: u32, rows: &[ProcRow]) -> Result<(), String> {
+    // 親子関係から子孫を収集
+    let mut victims = vec![pid];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for r in rows {
+            if let Some(parent) = r.parent {
+                if victims.contains(&parent) && !victims.contains(&r.pid) {
+                    victims.push(r.pid);
+                    changed = true;
+                }
+            }
+        }
+    }
+    let mut first_err = None;
+    for &v in &victims {
+        if let Err(e) = kill(v) {
+            if v == pid {
+                first_err = Some(e);
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 

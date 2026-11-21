@@ -42,10 +42,12 @@ pub fn run() -> i32 {
         (0.0..=100.0).contains(&load.cpu)
             && (0.0..=100.0).contains(&load.rom)
             && (0.0..=100.0).contains(&load.gpu)
-            && (0.0..=100.0).contains(&load.npu),
+            && (0.0..=100.0).contains(&load.npu)
+            && !load.core_usage.is_empty()
+            && load.core_usage.iter().all(|c| (0.0..=100.0).contains(c)),
         format!(
-            "cpu={:.1}%, rom={:.1}%, gpu={:.1}%, npu={:.1}% (available={})",
-            load.cpu, load.rom, load.gpu, load.npu, load.npu_available
+            "cpu={:.1}%, rom={:.1}%, gpu={:.1}%, npu={:.1}%, cores={} (available={})",
+            load.cpu, load.rom, load.gpu, load.npu, load.core_usage.len(), load.npu_available
         ),
     );
     let self_row = rows.iter().find(|r| r.pid == std::process::id());
@@ -86,6 +88,28 @@ pub fn run() -> i32 {
             );
         }
         Err(e) => check("process kill", false, format!("dummy spawn failed: {e}")),
+    }
+
+    // 3b. プロセス ツリー終了 (cmd → 子 cmd を終了)
+    let dummy = std::process::Command::new("cmd.exe")
+        .args(["/c", "cmd /c ping -n 30 127.0.0.1 >nul"])
+        .spawn();
+    match dummy {
+        Ok(mut child) => {
+            let pid = child.id();
+            std::thread::sleep(Duration::from_millis(1000));
+            // ツリー情報を取得して kill_tree
+            let (rows, _) = collector.refresh();
+            let kill_result = process::kill_tree(pid, &rows);
+            let _ = child.wait();
+            let gone = !pid_alive(pid);
+            check(
+                "process tree kill",
+                kill_result.is_ok() && gone,
+                format!("kill={:?}, pid={pid} gone={gone}", kill_result),
+            );
+        }
+        Err(e) => check("process tree kill", false, format!("dummy spawn failed: {e}")),
     }
 
     // 4. スタートアップ管理 (HKCU Run にテスト値を作成 → 無効化 → 有効化 → 削除)

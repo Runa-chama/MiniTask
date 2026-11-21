@@ -91,11 +91,12 @@ pub fn fmt_bytes(bytes: u64) -> String {
 }
 
 /// 転送速度 (bytes/sec) を見やすい単位に。0 は "—"。
+/// タスクマネージャーと同じ「KB/秒」表記。
 pub fn fmt_rate(bps: u64) -> String {
     if bps == 0 {
         return "—".to_owned();
     }
-    format!("{}/s", fmt_bytes(bps))
+    format!("{}/秒", fmt_bytes(bps))
 }
 
 /// UNIX 秒をローカル時刻の "YYYY/MM/DD HH:MM" に。
@@ -123,6 +124,43 @@ pub fn fmt_time(unix_secs: u64) -> String {
     }
 }
 
+/// 折れ線グラフの共通描画処理 (矩形内に曲線 + 塗りつぶし)。
+fn paint_curve(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    values: &VecDeque<f32>,
+    max: f32,
+    color: Color32,
+    stroke_width: f32,
+    fill_alpha: f32,
+) {
+    let n = values.len();
+    if n < 2 {
+        return;
+    }
+    let inner_h = rect.height() - 4.0;
+    let pts: Vec<Pos2> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let x = rect.left() + 2.0 + (i as f32 / (n - 1) as f32) * (rect.width() - 4.0);
+            let y = rect.bottom() - 2.0 - (v / max).clamp(0.0, 1.0) * inner_h;
+            Pos2::new(x, y)
+        })
+        .collect();
+    // 曲線の下を薄く塗る
+    let mut fill = pts.clone();
+    fill.push(Pos2::new(rect.right() - 2.0, rect.bottom() - 2.0));
+    fill.push(Pos2::new(rect.left() + 2.0, rect.bottom() - 2.0));
+    painter.add(egui::epaint::PathShape {
+        points: fill,
+        closed: true,
+        fill: color.gamma_multiply(fill_alpha),
+        stroke: egui::epaint::PathStroke::NONE,
+    });
+    painter.add(egui::Shape::line(pts, egui::Stroke::new(stroke_width, color)));
+}
+
 /// 小さな折れ線グラフ (CPU / メモリ履歴用)。値は 0..max の百分率。
 pub fn sparkline(
     ui: &mut egui::Ui,
@@ -135,35 +173,24 @@ pub fn sparkline(
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
-        let n = values.len();
-        if n >= 2 {
-            let inner_h = rect.height() - 4.0;
-            let pts: Vec<Pos2> = values
-                .iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    let x = rect.left() + 2.0 + (i as f32 / (n - 1) as f32) * (rect.width() - 4.0);
-                    let y = rect.bottom() - 2.0 - (v / max).clamp(0.0, 1.0) * inner_h;
-                    Pos2::new(x, y)
-                })
-                .collect();
-            // 曲線の下を薄く塗る
-            let mut fill = pts.clone();
-            fill.push(Pos2::new(rect.right() - 2.0, rect.bottom() - 2.0));
-            fill.push(Pos2::new(rect.left() + 2.0, rect.bottom() - 2.0));
-            painter.add(egui::epaint::PathShape {
-                points: fill,
-                closed: true,
-                fill: color.gamma_multiply(0.18),
-                stroke: egui::epaint::PathStroke::NONE,
-            });
-            painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, color)));
-        }
+        paint_curve(painter, rect, values, max, color, 1.5, 0.18);
     }
     resp
 }
 
+/// 既に確保済みの矩形内にミニグラフを描く (左ナビ項目・コア別グラフ用)。
+pub fn paint_mini_graph(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    values: &VecDeque<f32>,
+    max: f32,
+    color: Color32,
+) {
+    paint_curve(painter, rect, values, max, color, 1.2, 0.25);
+}
+
 /// 大きな使用率グラフ (パフォーマンスタブ用)。25/50/75% のグリッド線付き。
+/// 右クリックメニュー用にクリック可能な応答を返す。
 pub fn perf_chart(
     ui: &mut egui::Ui,
     values: &VecDeque<f32>,
@@ -171,7 +198,7 @@ pub fn perf_chart(
     color: Color32,
     size: Vec2,
 ) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         painter.rect_filled(rect, 6.0, ui.visuals().extreme_bg_color);
@@ -184,29 +211,7 @@ pub fn perf_chart(
                 egui::Stroke::new(1.0, grid),
             );
         }
-        let n = values.len();
-        if n >= 2 {
-            let inner_h = rect.height() - 4.0;
-            let pts: Vec<Pos2> = values
-                .iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    let x = rect.left() + 2.0 + (i as f32 / (n - 1) as f32) * (rect.width() - 4.0);
-                    let y = rect.bottom() - 2.0 - (v / max).clamp(0.0, 1.0) * inner_h;
-                    Pos2::new(x, y)
-                })
-                .collect();
-            let mut fill = pts.clone();
-            fill.push(Pos2::new(rect.right() - 2.0, rect.bottom() - 2.0));
-            fill.push(Pos2::new(rect.left() + 2.0, rect.bottom() - 2.0));
-            painter.add(egui::epaint::PathShape {
-                points: fill,
-                closed: true,
-                fill: color.gamma_multiply(0.22),
-                stroke: egui::epaint::PathStroke::NONE,
-            });
-            painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0, color)));
-        }
+        paint_curve(painter, rect, values, max, color, 2.0, 0.22);
     }
     resp
 }

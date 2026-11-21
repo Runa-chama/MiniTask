@@ -32,10 +32,18 @@ enum PerfSel {
     Npu,
 }
 
+/// CPU グラフの表示モード (タスクマネージャーの「グラフの変更」)。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CpuGraphMode {
+    Overall,
+    PerCore,
+}
+
 /// プロセス一覧の列。タブの右クリックメニューで表示/非表示を切り替える。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ColumnKind {
     Name,
+    Status,
     Pid,
     Cpu,
     Mem,
@@ -43,6 +51,7 @@ enum ColumnKind {
     NetSent,
     IoRead,
     IoWrite,
+    Gpu,
     User,
     Start,
     Exe,
@@ -50,8 +59,9 @@ enum ColumnKind {
 }
 
 impl ColumnKind {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 14] = [
         Self::Name,
+        Self::Status,
         Self::Pid,
         Self::Cpu,
         Self::Mem,
@@ -59,6 +69,7 @@ impl ColumnKind {
         Self::NetSent,
         Self::IoRead,
         Self::IoWrite,
+        Self::Gpu,
         Self::User,
         Self::Start,
         Self::Exe,
@@ -68,6 +79,7 @@ impl ColumnKind {
     fn label(self) -> &'static str {
         match self {
             Self::Name => "名前",
+            Self::Status => "状態",
             Self::Pid => "PID",
             Self::Cpu => "CPU",
             Self::Mem => "メモリ",
@@ -75,6 +87,7 @@ impl ColumnKind {
             Self::NetSent => "ネット送信",
             Self::IoRead => "I/O 読取",
             Self::IoWrite => "I/O 書込",
+            Self::Gpu => "GPU",
             Self::User => "ユーザー",
             Self::Start => "開始時刻",
             Self::Exe => "パス",
@@ -83,12 +96,13 @@ impl ColumnKind {
     }
 
     fn is_numeric(self) -> bool {
-        !matches!(self, Self::Name | Self::User | Self::Exe | Self::Cmd)
+        !matches!(self, Self::Name | Self::Status | Self::User | Self::Exe | Self::Cmd)
     }
 
     fn spec(self) -> Column {
         match self {
             Self::Name => Column::auto().at_least(180.0).clip(true),
+            Self::Status => Column::initial(80.0).clip(true),
             Self::Pid => Column::initial(60.0).clip(true),
             Self::Cpu => Column::initial(64.0).clip(true),
             Self::Mem => Column::initial(88.0).clip(true),
@@ -96,6 +110,7 @@ impl ColumnKind {
             Self::NetSent => Column::initial(92.0).clip(true),
             Self::IoRead => Column::initial(88.0).clip(true),
             Self::IoWrite => Column::initial(88.0).clip(true),
+            Self::Gpu => Column::initial(64.0).clip(true),
             Self::User => Column::initial(110.0).clip(true),
             Self::Start => Column::initial(126.0).clip(true),
             Self::Exe => Column::auto().at_least(220.0).clip(true),
@@ -107,6 +122,14 @@ impl ColumnKind {
         match self {
             Self::Name => {
                 ui.label(&row.name);
+            }
+            Self::Status => {
+                let color = if row.status == "実行中" {
+                    Color32::from_gray(160)
+                } else {
+                    WARN
+                };
+                ui.label(RichText::new(&row.status).size(12.0).color(color));
             }
             Self::Pid => util::num_cell(ui, row.pid.to_string(), None),
             Self::Cpu => util::num_cell(ui, format!("{:.1}%", row.cpu), util::cpu_color(row.cpu)),
@@ -123,6 +146,11 @@ impl ColumnKind {
             ),
             Self::IoRead => util::num_cell(ui, util::fmt_rate(row.io_read), None),
             Self::IoWrite => util::num_cell(ui, util::fmt_rate(row.io_write), None),
+            Self::Gpu => util::num_cell(
+                ui,
+                if row.gpu > 0.0 { format!("{:.1}%", row.gpu) } else { "—".to_owned() },
+                util::cpu_color(row.gpu),
+            ),
             Self::User => {
                 ui.label(&row.user);
             }
@@ -153,15 +181,18 @@ pub struct MiniTaskApp {
 
     tab: Tab,
     perf_sel: PerfSel,
+    cpu_graph_mode: CpuGraphMode,
+    core_hist: Vec<VecDeque<f32>>,
     search: String,
     sort_col: ColumnKind,
     sort_desc: bool,
     selected: Option<u32>,
-    columns: [bool; 12],
+    columns: [bool; 14],
     interval: f32,
     last_refresh: Instant,
 
     confirm_kill: Option<(u32, String)>,
+    confirm_kill_tree: Option<(u32, String)>,
     toast: Option<(String, Instant)>,
 
     startup_entries: Vec<StartupEntry>,
@@ -196,15 +227,33 @@ impl MiniTaskApp {
                 Tab::Processes
             },
             perf_sel: PerfSel::Cpu,
+            cpu_graph_mode: CpuGraphMode::Overall,
+            core_hist: Vec::new(),
             search: String::new(),
             sort_col: ColumnKind::Cpu,
             sort_desc: true,
             selected: None,
-            // 既定は基本8列のみ。詳細列はタブの右クリックで有効化する。
-            columns: [true, true, true, true, true, true, true, true, false, false, false, false],
+            // 既定はタスクマネージャーと同じ 7 列。残りはタブの右クリックで追加。
+            columns: [
+                true,  // 名前
+                true,  // 状態
+                false, // PID
+                true,  // CPU
+                true,  // メモリ
+                true,  // ネット受信
+                true,  // ネット送信
+                false, // I/O 読取
+                false, // I/O 書込
+                true,  // GPU
+                false, // ユーザー
+                false, // 開始時刻
+                false, // パス
+                false, // コマンドライン
+            ],
             interval: 1.0,
             last_refresh: Instant::now() - Duration::from_secs(10),
             confirm_kill: None,
+            confirm_kill_tree: None,
             toast: None,
             startup_entries: startup::list(),
             confirm_delete: None,
@@ -229,6 +278,16 @@ impl MiniTaskApp {
             self.gpu_hist.push_back(load.gpu);
             self.npu_hist.push_back(load.npu);
             self.load = load;
+            // コア別履歴
+            if self.core_hist.len() != self.load.core_usage.len() {
+                self.core_hist = vec![VecDeque::new(); self.load.core_usage.len()];
+            }
+            for (hist, val) in self.core_hist.iter_mut().zip(self.load.core_usage.iter()) {
+                hist.push_back(*val);
+                while hist.len() > HISTORY_LEN {
+                    hist.pop_front();
+                }
+            }
             for hist in [
                 &mut self.cpu_hist,
                 &mut self.mem_hist,
@@ -281,6 +340,7 @@ impl MiniTaskApp {
         view.sort_by(|a, b| {
             let ord = match col {
                 ColumnKind::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                ColumnKind::Status => a.status.cmp(&b.status),
                 ColumnKind::Pid => a.pid.cmp(&b.pid),
                 ColumnKind::Cpu => a.cpu.total_cmp(&b.cpu),
                 ColumnKind::Mem => a.mem.cmp(&b.mem),
@@ -288,6 +348,7 @@ impl MiniTaskApp {
                 ColumnKind::NetSent => a.net_sent.cmp(&b.net_sent),
                 ColumnKind::IoRead => a.io_read.cmp(&b.io_read),
                 ColumnKind::IoWrite => a.io_write.cmp(&b.io_write),
+                ColumnKind::Gpu => a.gpu.total_cmp(&b.gpu),
                 ColumnKind::User => a.user.to_lowercase().cmp(&b.user.to_lowercase()),
                 ColumnKind::Start => a.start_time.cmp(&b.start_time),
                 ColumnKind::Exe => a.exe.to_lowercase().cmp(&b.exe.to_lowercase()),
@@ -494,6 +555,10 @@ impl MiniTaskApp {
                                 self.confirm_kill = Some((row.pid, row.name.clone()));
                                 ui.close();
                             }
+                            if ui.button("プロセス ツリーの終了").clicked() {
+                                self.confirm_kill_tree = Some((row.pid, row.name.clone()));
+                                ui.close();
+                            }
                             if ui
                                 .add_enabled(!row.exe.is_empty(), egui::Button::new("ファイルの場所を開く"))
                                 .clicked()
@@ -515,15 +580,17 @@ impl MiniTaskApp {
     }
 
     /// パフォーマンスタブの左ナビ 1 項目 (クリックでメトリクス選択)。
+    /// 各項目にミニグラフを内蔵する (タスクマネージャー風)。
     fn perf_nav_item(
         ui: &mut egui::Ui,
         label: &str,
         pct: f32,
+        hist: &VecDeque<f32>,
         color: Color32,
         selected: bool,
     ) -> egui::Response {
         let width = ui.available_width().clamp(80.0, 300.0);
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 46.0), egui::Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 66.0), egui::Sense::click());
         let bg = if selected {
             Color32::from_rgb(45, 49, 60)
         } else if resp.hovered() {
@@ -555,7 +622,13 @@ impl MiniTaskApp {
             egui::FontId::proportional(17.0),
             color,
         );
-        ui.add_space(2.0);
+        // 項目内のミニグラフ
+        let graph_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 10.0, rect.top() + 30.0),
+            egui::pos2(rect.right() - 10.0, rect.bottom() - 8.0),
+        );
+        util::paint_mini_graph(ui.painter(), graph_rect, hist, 100.0, color);
+        ui.add_space(3.0);
         resp
     }
 
@@ -573,6 +646,23 @@ impl MiniTaskApp {
         });
     }
 
+    /// CPU グラフの右クリックメニュー (タスクマネージャーの「グラフの変更」)。
+    fn cpu_graph_menu(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("グラフの変更").strong());
+        ui.separator();
+        let modes = [
+            (CpuGraphMode::Overall, "全体的な使用率"),
+            (CpuGraphMode::PerCore, "論理プロセッサ"),
+        ];
+        for (mode, label) in modes {
+            let mark = if self.cpu_graph_mode == mode { "✓ " } else { "   " };
+            if ui.button(format!("{mark}{label}")).clicked() {
+                self.cpu_graph_mode = mode;
+                ui.close();
+            }
+        }
+    }
+
     fn performance_tab(&mut self, ui: &mut egui::Ui) {
         let mem_pct = if self.load.mem_total > 0 {
             self.load.mem_used as f32 / self.load.mem_total as f32 * 100.0
@@ -580,53 +670,25 @@ impl MiniTaskApp {
             0.0
         };
 
-        // --- 左ナビ: メトリクス選択 (タスクマネージャー風) ---
+        // --- 左ナビ: メトリクス選択 + ミニグラフ (タスクマネージャー風) ---
         egui::Panel::left("perf_nav")
             .exact_size(190.0)
+            .resizable(false)
+            .drag_to_open(false)
             .show(ui, |ui| {
                 ui.add_space(4.0);
                 let items = [
-                    (PerfSel::Cpu, "CPU", self.load.cpu, CPU_COLOR),
-                    (PerfSel::Ram, "メモリ", mem_pct, MEM_COLOR),
-                    (PerfSel::Rom, "ROM (C:)", self.load.rom, ROM_COLOR),
-                    (PerfSel::Gpu, "GPU", self.load.gpu, GPU_COLOR),
-                    (PerfSel::Npu, "NPU", self.load.npu, NPU_COLOR),
+                    (PerfSel::Cpu, "CPU", self.load.cpu, &self.cpu_hist, CPU_COLOR),
+                    (PerfSel::Ram, "メモリ", mem_pct, &self.mem_hist, MEM_COLOR),
+                    (PerfSel::Rom, "ディスク (C:)", self.load.rom, &self.rom_hist, ROM_COLOR),
+                    (PerfSel::Gpu, "GPU", self.load.gpu, &self.gpu_hist, GPU_COLOR),
+                    (PerfSel::Npu, "NPU", self.load.npu, &self.npu_hist, NPU_COLOR),
                 ];
-                for (sel, label, pct, color) in items {
-                    let resp = Self::perf_nav_item(ui, label, pct, color, self.perf_sel == sel);
+                for (sel, label, pct, hist, color) in items {
+                    let resp = Self::perf_nav_item(ui, label, pct, hist, color, self.perf_sel == sel);
                     if resp.clicked() {
                         self.perf_sel = sel;
                     }
-                }
-            });
-
-        // --- 右サイド: 各メトリクスの簡易グラフ ---
-        egui::Panel::right("perf_minis")
-            .exact_size(215.0)
-            .show(ui, |ui| {
-                ui.add_space(2.0);
-                let w = ui.available_width().clamp(80.0, 240.0);
-                let minis: [(&str, &VecDeque<f32>, f32, Color32); 5] = [
-                    ("CPU", &self.cpu_hist, self.load.cpu, CPU_COLOR),
-                    ("メモリ", &self.mem_hist, mem_pct, MEM_COLOR),
-                    ("ROM (C:)", &self.rom_hist, self.load.rom, ROM_COLOR),
-                    ("GPU", &self.gpu_hist, self.load.gpu, GPU_COLOR),
-                    ("NPU", &self.npu_hist, self.load.npu, NPU_COLOR),
-                ];
-                for (name, hist, pct, color) in minis {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(name).size(12.0).strong());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(format!("{pct:.0}%"))
-                                    .size(12.0)
-                                    .monospace()
-                                    .color(color),
-                            );
-                        });
-                    });
-                    util::sparkline(ui, hist, 100.0, color, Vec2::new(w, 36.0));
-                    ui.add_space(7.0);
                 }
             });
 
@@ -651,8 +713,8 @@ impl MiniTaskApp {
                 MEM_COLOR,
             ),
             PerfSel::Rom => (
-                "ROM (ストレージ)",
-                "C: ドライブ".to_owned(),
+                "ディスク (C:)",
+                "ストレージ (ROM)".to_owned(),
                 format!("{:.0}%", self.load.rom),
                 &self.rom_hist,
                 ROM_COLOR,
@@ -700,11 +762,74 @@ impl MiniTaskApp {
         ui.add_space(4.0);
         let gh = (ui.available_height() * 0.56).clamp(140.0, 340.0);
         let gw = ui.available_width().clamp(200.0, 4000.0);
-        util::perf_chart(ui, hist, 100.0, color, Vec2::new(gw, gh));
+
+        if self.perf_sel == PerfSel::Cpu && self.cpu_graph_mode == CpuGraphMode::PerCore {
+            // 論理プロセッサごとのグラフ (タスクマネージャーの「論理プロセッサ」表示)
+            let n = self.core_hist.len().max(1);
+            let rows = if n <= 4 { 1 } else { 2 };
+            let cols = n.div_ceil(rows);
+            let ch = ((gh - (rows as f32 - 1.0) * 6.0) / rows as f32).max(50.0);
+            for row in 0..rows {
+                let row_resp = ui
+                    .horizontal(|ui| {
+                        let w = ui.available_width();
+                        let cw = ((w - (cols as f32 - 1.0) * 6.0) / cols as f32).max(60.0);
+                        for col in 0..cols {
+                            let idx = row * cols + col;
+                            if idx >= self.core_hist.len() {
+                                break;
+                            }
+                            let (rect, _resp) =
+                                ui.allocate_exact_size(Vec2::new(cw, ch), egui::Sense::hover());
+                            let painter = ui.painter();
+                            painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+                            let cur = self
+                                .load
+                                .core_usage
+                                .get(idx)
+                                .copied()
+                                .unwrap_or(0.0);
+                            painter.text(
+                                rect.left_top() + egui::vec2(8.0, 4.0),
+                                egui::Align2::LEFT_TOP,
+                                format!("CPU {idx}"),
+                                egui::FontId::proportional(11.0),
+                                Color32::from_gray(150),
+                            );
+                            painter.text(
+                                egui::pos2(rect.right() - 8.0, rect.top() + 4.0),
+                                egui::Align2::RIGHT_TOP,
+                                format!("{cur:.0}%"),
+                                egui::FontId::proportional(11.0),
+                                CPU_COLOR,
+                            );
+                            let graph_rect = egui::Rect::from_min_max(
+                                egui::pos2(rect.left() + 6.0, rect.top() + 20.0),
+                                egui::pos2(rect.right() - 6.0, rect.bottom() - 4.0),
+                            );
+                            util::paint_mini_graph(
+                                painter,
+                                graph_rect,
+                                &self.core_hist[idx],
+                                100.0,
+                                CPU_COLOR,
+                            );
+                        }
+                    })
+                    .response;
+                row_resp.context_menu(|ui| self.cpu_graph_menu(ui));
+            }
+        } else {
+            let resp = util::perf_chart(ui, hist, 100.0, color, Vec2::new(gw, gh));
+            if self.perf_sel == PerfSel::Cpu {
+                resp.on_hover_text("右クリックでグラフの変更")
+                    .context_menu(|ui| self.cpu_graph_menu(ui));
+            }
+        }
         ui.add_space(6.0);
         ui.separator();
 
-        // 詳細情報 (2 列)
+        // 詳細情報 (2 列) — 本家タスクマネージャーと同じ文言
         let d = &self.load;
         let gb = util::fmt_bytes;
         ui.columns(2, |cols| {
@@ -718,9 +843,8 @@ impl MiniTaskApp {
                         "速度",
                         format!("{:.2} GHz", d.cpu_freq_mhz as f64 / 1000.0),
                     );
-                    Self::detail_row(ui, "プロセス", d.processes.to_string());
-                    Self::detail_row(ui, "ハンドル", d.handles.to_string());
-                    Self::detail_row(ui, "論理プロセッサ", d.logical_cores.to_string());
+                    Self::detail_row(ui, "プロセス数", d.processes.to_string());
+                    Self::detail_row(ui, "ハンドル数", d.handles.to_string());
                 }
                 PerfSel::Ram => {
                     Self::detail_row(ui, "使用中", gb(d.mem_used));
@@ -731,6 +855,8 @@ impl MiniTaskApp {
                         format!("{} / {}", gb(d.commit_used), gb(d.commit_limit)),
                     );
                     Self::detail_row(ui, "キャッシュ済み", gb(d.cached));
+                    Self::detail_row(ui, "ページ プール", gb(d.kernel_paged));
+                    Self::detail_row(ui, "非ページ プール", gb(d.kernel_nonpaged));
                 }
                 PerfSel::Rom => {
                     Self::detail_row(ui, "利用率", format!("{:.1}%", d.rom));
@@ -758,13 +884,14 @@ impl MiniTaskApp {
             });
             r.vertical(|ui| match self.perf_sel {
                 PerfSel::Cpu => {
-                    Self::detail_row(ui, "スレッド", d.threads.to_string());
+                    Self::detail_row(ui, "スレッド数", d.threads.to_string());
                     let s = d.uptime_secs;
                     Self::detail_row(
                         ui,
                         "稼働時間",
                         format!("{}:{:02}:{:02}:{:02}", s / 86400, s / 3600 % 24, s / 60 % 60, s % 60),
                     );
+                    Self::detail_row(ui, "論理プロセッサ数", d.logical_cores.to_string());
                     Self::detail_row(ui, "更新間隔", format!("{} 秒", self.interval));
                 }
                 PerfSel::Ram => {
@@ -948,6 +1075,41 @@ impl MiniTaskApp {
                         }
                         if ui.button("キャンセル").clicked() {
                             self.confirm_kill = None;
+                        }
+                    });
+                });
+        }
+
+        if let Some((pid, name)) = self.confirm_kill_tree.clone() {
+            egui::Window::new("プロセス ツリーの終了")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.set_min_width(340.0);
+                    ui.label(format!("「{name}」(PID {pid}) とその子孫プロセスすべてを強制終了しますか？"));
+                    ui.label(
+                        RichText::new("対象プロセスが起動したすべての子プロセスも終了します。")
+                            .small()
+                            .color(WARN),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(RichText::new("終了する").color(DANGER))
+                            .clicked()
+                        {
+                            let rows = self.rows.clone();
+                            match process::kill_tree(pid, &rows) {
+                                Ok(()) => self.notify(format!("PID {pid} のツリーを終了しました")),
+                                Err(e) => self.notify(e),
+                            }
+                            self.confirm_kill_tree = None;
+                            self.selected = None;
+                            self.refresh();
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            self.confirm_kill_tree = None;
                         }
                     });
                 });
