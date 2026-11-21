@@ -7,7 +7,7 @@ use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows_sys::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
 use windows_sys::Win32::System::Time::FileTimeToSystemTime;
 
-pub const ACCENT: Color32 = Color32::from_rgb(76, 194, 255); // Win11 ダークアクセント
+pub const ACCENT: Color32 = Color32::from_rgb(47, 154, 154); // テーマ既定のアクセント #2F9A9A
 pub const CPU_COLOR: Color32 = Color32::from_rgb(96, 205, 255);
 pub const MEM_COLOR: Color32 = Color32::from_rgb(108, 203, 95);
 pub const ROM_COLOR: Color32 = Color32::from_rgb(230, 170, 110);
@@ -19,6 +19,136 @@ pub const NET_RECV_COLOR: Color32 = Color32::from_rgb(108, 203, 95);
 pub const NET_SEND_COLOR: Color32 = Color32::from_rgb(230, 200, 90);
 pub const WARN: Color32 = Color32::from_rgb(255, 190, 90);
 pub const DANGER: Color32 = Color32::from_rgb(255, 120, 100);
+
+/// ユーザーが設定できる配色 (ダーク/ライトで個別に保持)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Palette {
+    pub primary: Color32,
+    pub secondary: Color32,
+    pub cpu: Color32,
+    pub mem: Color32,
+    pub disk_read: Color32,
+    pub disk_write: Color32,
+    pub net_recv: Color32,
+    pub net_send: Color32,
+    pub gpu: Color32,
+    pub npu: Color32,
+    pub warn: Color32,
+    pub danger: Color32,
+}
+
+impl Palette {
+    pub fn names() -> [&'static str; 12] {
+        [
+            "プライマリ",
+            "セカンダリ",
+            "CPU",
+            "メモリ",
+            "ディスク (読取)",
+            "ディスク (書込)",
+            "ネットワーク (受信)",
+            "ネットワーク (送信)",
+            "GPU",
+            "NPU",
+            "警告",
+            "危険",
+        ]
+    }
+
+    /// レジストリ保存用のキー名 (Dark*/Light* のprefixは呼び出し側が付ける)。
+    pub fn keys() -> [&'static str; 12] {
+        [
+            "Primary", "Secondary", "Cpu", "Mem", "DiskRead", "DiskWrite", "NetRecv",
+            "NetSend", "Gpu", "Npu", "Warn", "Danger",
+        ]
+    }
+
+    pub fn as_array(&self) -> [Color32; 12] {
+        [
+            self.primary,
+            self.secondary,
+            self.cpu,
+            self.mem,
+            self.disk_read,
+            self.disk_write,
+            self.net_recv,
+            self.net_send,
+            self.gpu,
+            self.npu,
+            self.warn,
+            self.danger,
+        ]
+    }
+
+    pub fn set(&mut self, index: usize, color: Color32) {
+        match index {
+            0 => self.primary = color,
+            1 => self.secondary = color,
+            2 => self.cpu = color,
+            3 => self.mem = color,
+            4 => self.disk_read = color,
+            5 => self.disk_write = color,
+            6 => self.net_recv = color,
+            7 => self.net_send = color,
+            8 => self.gpu = color,
+            9 => self.npu = color,
+            10 => self.warn = color,
+            11 => self.danger = color,
+            _ => {}
+        }
+    }
+
+    pub fn dark_default() -> Self {
+        Self {
+            primary: ACCENT,
+            secondary: Color32::from_rgb(108, 203, 95),
+            cpu: CPU_COLOR,
+            mem: MEM_COLOR,
+            disk_read: CPU_COLOR,
+            disk_write: ROM_COLOR,
+            net_recv: NET_RECV_COLOR,
+            net_send: NET_SEND_COLOR,
+            gpu: GPU_COLOR,
+            npu: NPU_COLOR,
+            warn: WARN,
+            danger: DANGER,
+        }
+    }
+
+    pub fn light_default() -> Self {
+        Self {
+            primary: Color32::from_rgb(20, 115, 115),
+            secondary: Color32::from_rgb(45, 140, 60),
+            cpu: Color32::from_rgb(0, 110, 170),
+            mem: Color32::from_rgb(35, 140, 55),
+            disk_read: Color32::from_rgb(0, 105, 165),
+            disk_write: Color32::from_rgb(180, 105, 30),
+            net_recv: Color32::from_rgb(35, 140, 55),
+            net_send: Color32::from_rgb(175, 130, 0),
+            gpu: Color32::from_rgb(115, 80, 200),
+            npu: Color32::from_rgb(195, 70, 125),
+            warn: Color32::from_rgb(180, 115, 0),
+            danger: Color32::from_rgb(200, 55, 45),
+        }
+    }
+
+    /// "#RRGGBB" をパースする (不正なら None)。
+    pub fn parse_hex(s: &str) -> Option<Color32> {
+        let s = s.trim().trim_start_matches('#');
+        if s.len() != 6 {
+            return None;
+        }
+        let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+        Some(Color32::from_rgb(r, g, b))
+    }
+
+    pub fn to_hex(c: Color32) -> String {
+        format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
+    }
+}
+
 
 /// 日本語フォントをシステムフォントから読み込む。
 /// egui 同梱フォントには日本語グリフが無いため必須。
@@ -43,20 +173,40 @@ pub fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// Win11 風ダークテーマ。
-pub fn setup_theme(ctx: &egui::Context) {
-    ctx.set_theme(egui::ThemePreference::Dark);
+/// テーマを適用する (ダーク / ホワイト + ユーザー配色)。
+pub fn setup_theme(ctx: &egui::Context, dark: bool, pal: &Palette) {
+    ctx.set_theme(if dark {
+        egui::ThemePreference::Dark
+    } else {
+        egui::ThemePreference::Light
+    });
     let mut style = (*ctx.global_style()).clone();
     let v = &mut style.visuals;
-    *v = egui::Visuals::dark();
-    v.panel_fill = Color32::from_rgb(25, 27, 33);
-    v.window_fill = Color32::from_rgb(32, 34, 42);
-    v.extreme_bg_color = Color32::from_rgb(17, 18, 23);
-    v.faint_bg_color = Color32::from_rgb(30, 33, 41);
-    v.override_text_color = Some(Color32::from_rgb(228, 230, 235));
-    v.hyperlink_color = ACCENT;
-    v.selection.bg_fill = Color32::from_rgb(0, 90, 158);
-    v.selection.stroke = egui::Stroke::new(1.0, ACCENT);
+    *v = if dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    if dark {
+        v.panel_fill = Color32::from_rgb(25, 27, 33);
+        v.window_fill = Color32::from_rgb(32, 34, 42);
+        v.extreme_bg_color = Color32::from_rgb(17, 18, 23);
+        v.faint_bg_color = Color32::from_rgb(30, 33, 41);
+        v.override_text_color = Some(Color32::from_rgb(228, 230, 235));
+    } else {
+        v.panel_fill = Color32::from_rgb(243, 243, 243);
+        v.window_fill = Color32::from_rgb(250, 250, 250);
+        v.extreme_bg_color = Color32::from_rgb(255, 255, 255);
+        v.faint_bg_color = Color32::from_rgb(236, 236, 236);
+        v.override_text_color = Some(Color32::from_rgb(30, 30, 30));
+    }
+    v.hyperlink_color = pal.primary;
+    v.selection.bg_fill = if dark {
+        pal.primary.gamma_multiply(0.55)
+    } else {
+        pal.primary.gamma_multiply(0.28)
+    };
+    v.selection.stroke = egui::Stroke::new(1.0, pal.primary);
     v.window_corner_radius = egui::CornerRadius::same(10);
     v.menu_corner_radius = egui::CornerRadius::same(8);
     for w in [
@@ -68,10 +218,26 @@ pub fn setup_theme(ctx: &egui::Context) {
     ] {
         w.corner_radius = egui::CornerRadius::same(6);
     }
-    v.widgets.noninteractive.bg_fill = Color32::from_rgb(32, 34, 42);
-    v.widgets.inactive.bg_fill = Color32::from_rgb(45, 48, 58);
-    v.widgets.hovered.bg_fill = Color32::from_rgb(58, 62, 74);
-    v.widgets.active.bg_fill = Color32::from_rgb(0, 90, 158);
+    v.widgets.noninteractive.bg_fill = if dark {
+        Color32::from_rgb(32, 34, 42)
+    } else {
+        Color32::from_rgb(238, 238, 238)
+    };
+    v.widgets.inactive.bg_fill = if dark {
+        Color32::from_rgb(45, 48, 58)
+    } else {
+        Color32::from_rgb(225, 225, 225)
+    };
+    v.widgets.hovered.bg_fill = if dark {
+        Color32::from_rgb(58, 62, 74)
+    } else {
+        Color32::from_rgb(212, 212, 212)
+    };
+    v.widgets.active.bg_fill = if dark {
+        pal.primary.gamma_multiply(0.65)
+    } else {
+        pal.primary.gamma_multiply(0.35)
+    };
     style.spacing.item_spacing = Vec2::new(8.0, 6.0);
     style.spacing.button_padding = Vec2::new(10.0, 5.0);
     ctx.set_global_style(style);
@@ -275,7 +441,7 @@ pub fn perf_dual_chart(
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         painter.rect_filled(rect, 6.0, ui.visuals().extreme_bg_color);
-        let grid = Color32::from_gray(45);
+        let grid = ui.visuals().widgets.noninteractive.bg_stroke.color;
         for f in [0.25, 0.5, 0.75] {
             let y = rect.bottom() - 2.0 - f * (rect.height() - 4.0);
             painter.line_segment(
@@ -285,7 +451,7 @@ pub fn perf_dual_chart(
         }
         paint_curve(painter, rect, read, max, read_color, 2.0, style);
         paint_curve(painter, rect, write, max, write_color, 2.0, style);
-        let stamp = Color32::from_gray(110);
+        let stamp = ui.visuals().weak_text_color();
         let font = egui::FontId::proportional(10.0);
         painter.text(
             egui::pos2(rect.left() + 4.0, rect.bottom() - 2.0),
@@ -352,7 +518,7 @@ pub fn perf_chart(
         let painter = ui.painter();
         painter.rect_filled(rect, 6.0, ui.visuals().extreme_bg_color);
         // グリッド線
-        let grid = Color32::from_gray(45);
+        let grid = ui.visuals().widgets.noninteractive.bg_stroke.color;
         for f in [0.25, 0.5, 0.75] {
             let y = rect.bottom() - 2.0 - f * (rect.height() - 4.0);
             painter.line_segment(
@@ -367,10 +533,10 @@ pub fn perf_chart(
             egui::Align2::RIGHT_TOP,
             format!("{max:.0}%"),
             egui::FontId::proportional(11.0),
-            Color32::from_gray(150),
+            ui.visuals().weak_text_color(),
         );
         // 本家と同じ時間目盛り (左 = 30 秒前、右 = 現在)
-        let stamp = Color32::from_gray(110);
+        let stamp = ui.visuals().weak_text_color();
         let font = egui::FontId::proportional(10.0);
         painter.text(
             egui::pos2(rect.left() + 4.0, rect.bottom() - 2.0),
@@ -402,11 +568,11 @@ pub fn num_cell(ui: &mut egui::Ui, text: impl Into<String>, color: Option<Color3
 }
 
 /// CPU 使用率に応じた色。
-pub fn cpu_color(pct: f32) -> Option<Color32> {
+pub fn cpu_color(pct: f32, palette: &Palette) -> Option<Color32> {
     if pct >= 80.0 {
-        Some(DANGER)
+        Some(palette.danger)
     } else if pct >= 40.0 {
-        Some(WARN)
+        Some(palette.warn)
     } else {
         None
     }

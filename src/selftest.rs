@@ -56,7 +56,7 @@ pub fn run() -> i32 {
     let settings = AppSettings::load();
     check(
         "settings persistence",
-        [500, 1000, 5000].contains(&settings.interval_ms)
+        [500, 1000, 2000, 5000].contains(&settings.interval_ms)
             && settings.sort_col < 14
             && settings.tab <= 2
             && settings.perf_kind <= 5

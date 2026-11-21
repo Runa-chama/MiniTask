@@ -1,7 +1,8 @@
 //! プロセス情報の収集 (sysinfo + Win32) とプロセス終了。
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use sysinfo::{CpuRefreshKind, Disks, Gpus, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree, LUID};
@@ -19,6 +20,7 @@ use windows_sys::Win32::System::Threading::{
 use crate::net::{self, NetCounters};
 use crate::netadapter::NetAdapterMeter;
 use crate::perf::{DiskMeter, EngineMeter, GpuMemoryMeter, GPU_ENGINE_COUNTER, NPU_ENGINE_COUNTER};
+use crate::smart::{self, SmartInfo};
 
 /// UI に表示する 1 プロセス分の情報。
 #[derive(Clone, Debug)]
@@ -63,6 +65,8 @@ pub struct DiskInfo {
     pub type_label: String,
     pub free: u64,
     pub total: u64,
+    /// SMART 健康状態 (取得できた場合)
+    pub smart: Option<Arc<SmartInfo>>,
 }
 
 /// GPU 1 台分の情報。
@@ -170,6 +174,8 @@ pub struct ProcCollector {
     npu_device_present: bool,
     /// カウンタ未開の NPU を定期的に開き直すためのリフレッシュ回数カウンタ
     npu_recheck: u32,
+    /// SMART 情報のキャッシュ (60秒TTL)
+    smart_cache: HashMap<String, (Instant, Arc<SmartInfo>)>,
 }
 
 /// グラフ描画用の軽量メトリック (高速ティック用)。
@@ -226,6 +232,7 @@ impl ProcCollector {
             gpu_engine_meter: EngineMeter::new(GPU_ENGINE_COUNTER),
             npu_device_present: crate::perf::npu_device_present(),
             npu_recheck: 0,
+            smart_cache: HashMap::new(),
         })
     }
 
@@ -292,6 +299,19 @@ impl ProcCollector {
         }
     }
 
+    /// SMART 情報を 60 秒ごとに更新して返す。
+    fn smart_for(&mut self, id: &str) -> Option<Arc<SmartInfo>> {
+        if let Some((at, info)) = self.smart_cache.get(id) {
+            if at.elapsed() < Duration::from_secs(60) {
+                return Some(info.clone());
+            }
+        }
+        let info = Arc::new(smart::query(id));
+        self.smart_cache
+            .insert(id.to_owned(), (Instant::now(), info.clone()));
+        Some(info)
+    }
+
     /// 全プロセスを再取得し、前回からの差分で速度系を計算する。
     pub fn refresh(&mut self) -> (Vec<ProcRow>, SysLoad) {
         self.sys.refresh_cpu_specifics(
@@ -332,6 +352,7 @@ impl ProcCollector {
                         type_label: "固定ディスク".to_owned(),
                         free: d.available_space(),
                         total: d.total_space(),
+                        smart: None,
                     }
                 })
                 .collect()
@@ -353,8 +374,8 @@ impl ProcCollector {
                         .first()
                         .map(|letter| crate::perf::disk_type_label(letter))
                         .unwrap_or_else(|| "リムーバブル (USB)".to_owned());
-                    DiskInfo {
-                        id: s.id,
+                    let mut info = DiskInfo {
+                        id: s.id.clone(),
                         label: s.label,
                         letters: s.letters,
                         read_bps: s.read_bps as u64,
@@ -364,10 +385,17 @@ impl ProcCollector {
                         type_label,
                         free: cap.map(|d| d.available_space()).unwrap_or(0),
                         total: cap.map(|d| d.total_space()).unwrap_or(0),
-                    }
+                        smart: None,
+                    };
+                    info.smart = self.smart_for(&s.id);
+                    info
                 })
                 .collect()
         };
+        // 切断されたディスクの SMART キャッシュを破棄
+        let active_disks: HashSet<String> = disk_list.iter().map(|d| d.id.clone()).collect();
+        self.smart_cache.retain(|k, _| active_disks.contains(k));
+
         // 互換用の容量使用率 (C:)。グラフには使用しない。
         let rom = self
             .disks

@@ -9,12 +9,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod icon;
+mod integration;
 mod net;
 mod netadapter;
 mod perf;
 mod process;
 mod selftest;
 mod settings;
+mod smart;
 mod startup;
 mod util;
 
@@ -36,12 +39,16 @@ fn main() -> eframe::Result {
             Some([w, h])
         })
         .unwrap_or([1020.0, 660.0]);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size(initial_size)
+        .with_min_inner_size([760.0, 440.0])
+        .with_maximized(std::env::var("MINITASK_MAXIMIZE").is_ok())
+        .with_title("MiniTask — 軽量タスクマネージャー");
+    if let Some(data) = icon::window_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(data));
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size(initial_size)
-            .with_min_inner_size([760.0, 440.0])
-            .with_maximized(std::env::var("MINITASK_MAXIMIZE").is_ok())
-            .with_title("MiniTask — 軽量タスクマネージャー"),
+        viewport,
         ..Default::default()
     };
 
@@ -50,8 +57,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             util::setup_fonts(&cc.egui_ctx);
-            util::setup_theme(&cc.egui_ctx);
-            Ok(Box::new(app::MiniTaskApp::new()))
+            Ok(Box::new(app::MiniTaskApp::new(&cc.egui_ctx)))
         }),
     )
 }

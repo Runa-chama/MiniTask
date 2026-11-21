@@ -1,19 +1,19 @@
 //! アプリ本体: 状態管理と UI 描画。
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText, Vec2};
 use egui_extras::{Column, TableBuilder};
 
+use crate::icon::{self, IconCache};
+use crate::integration::{self, TrayClick};
 use crate::net::NetSession;
 use crate::process::{self, FastMetrics, ProcCollector, ProcRow, SysLoad};
 use crate::settings::AppSettings;
 use crate::startup::{self, StartupEntry};
-use crate::util::{
-    self, ACCENT, CPU_COLOR, DANGER, GPU_COLOR, HISTORY_LEN, MEM_COLOR, NET_RECV_COLOR,
-    NET_SEND_COLOR, NPU_COLOR, ROM_COLOR, WARN,
-};
+use crate::util::{self, HISTORY_LEN, Palette};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -164,38 +164,38 @@ impl ColumnKind {
         }
     }
 
-    fn render(self, ui: &mut egui::Ui, row: &ProcRow) {
+    fn render(self, ui: &mut egui::Ui, row: &ProcRow, pal: &Palette) {
         match self {
             Self::Name => {
                 ui.label(&row.name);
             }
             Self::Status => {
                 let color = if row.status == "実行中" {
-                    Color32::from_gray(160)
+                    ui.visuals().weak_text_color()
                 } else {
-                    WARN
+                    pal.warn
                 };
                 ui.label(RichText::new(&row.status).size(12.0).color(color));
             }
             Self::Pid => util::num_cell(ui, row.pid.to_string(), None),
-            Self::Cpu => util::num_cell(ui, format!("{:.1}%", row.cpu), util::cpu_color(row.cpu)),
+            Self::Cpu => util::num_cell(ui, format!("{:.1}%", row.cpu), util::cpu_color(row.cpu, pal)),
             Self::Mem => util::num_cell(ui, util::fmt_bytes(row.mem), None),
             Self::NetRecv => util::num_cell(
                 ui,
                 util::fmt_rate(row.net_recv),
-                (row.net_recv > 0).then_some(MEM_COLOR),
+                (row.net_recv > 0).then_some(pal.net_recv),
             ),
             Self::NetSent => util::num_cell(
                 ui,
                 util::fmt_rate(row.net_sent),
-                (row.net_sent > 0).then_some(CPU_COLOR),
+                (row.net_sent > 0).then_some(pal.net_send),
             ),
             Self::IoRead => util::num_cell(ui, util::fmt_rate(row.io_read), None),
             Self::IoWrite => util::num_cell(ui, util::fmt_rate(row.io_write), None),
             Self::Gpu => util::num_cell(
                 ui,
                 if row.gpu > 0.0 { format!("{:.1}%", row.gpu) } else { "—".to_owned() },
-                util::cpu_color(row.gpu),
+                util::cpu_color(row.gpu, pal),
             ),
             Self::User => {
                 ui.label(&row.user);
@@ -272,6 +272,30 @@ pub struct MiniTaskApp {
     confirm_delete: Option<StartupEntry>,
     /// 最後に保存した設定 (差分検出用)
     saved_settings: AppSettings,
+
+    // --- 外観・動作 ---
+    palette: Palette,
+    dark_mode: bool,
+    theme_dirty: bool,
+    always_on_top: bool,
+    startup_tab_mode: u8,
+    confirm_kill_setting: bool,
+    settings_open: bool,
+    settings_page: u8,
+
+    // --- システム統合 ---
+    replace_taskmgr: bool,
+    taskbar_menu: bool,
+    tray_rx: Option<Receiver<TrayClick>>,
+    tray_hook: Option<*mut std::ffi::c_void>,
+    tray_popup: Option<TrayClick>,
+    tray_popup_at: Option<Instant>,
+    ifeo_restore: Option<(String, Instant)>,
+    taskmgr_icon: Option<egui::TextureHandle>,
+
+    // --- アイコン / SMART ---
+    icon_cache: IconCache,
+    smart_dialog_disk: Option<String>,
 }
 
 /// グラフ履歴へのサンプル反映に必要な値のまとまり。
@@ -349,10 +373,41 @@ impl PerfSample {
 }
 
 impl MiniTaskApp {
-    pub fn new() -> Self {
+    pub fn new(ctx: &egui::Context) -> Self {
         let settings = AppSettings::load();
         let env_tab = std::env::var("MINITASK_TAB").ok();
         let collector = ProcCollector::new().ok();
+
+        // システム統合の適用 (権限不足で失敗しても起動は続ける)
+        if let Ok(exe) = std::env::current_exe() {
+            let exe = exe.to_string_lossy().to_string();
+            if settings.replace_taskmgr {
+                let _ = integration::set_replace_taskmgr(true, &exe);
+            }
+            if settings.taskbar_menu {
+                let _ = integration::set_shell_menu(true, &exe);
+                let _ = integration::inject_hook();
+            }
+        }
+        let (tray_rx, tray_hook): (Option<Receiver<TrayClick>>, Option<*mut std::ffi::c_void>) =
+            if settings.taskbar_menu {
+            let (rx, hook) = integration::start_tray_monitor();
+            (Some(rx), hook)
+        } else {
+            (None, None)
+        };
+        let taskmgr_icon = {
+            let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_owned());
+            icon::extract_icon(&format!("{windir}\\System32\\taskmgr.exe"), true).map(
+                |(w, h, rgba)| {
+                    ctx.load_texture(
+                        "taskmgr_icon",
+                        egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba),
+                        egui::TextureOptions::LINEAR,
+                    )
+                },
+            )
+        };
         let (net, net_err) = if std::env::var("MINITASK_NO_ETW").is_ok() {
             (None, Some("MINITASK_NO_ETW により無効化".to_owned()))
         } else {
@@ -382,7 +437,7 @@ impl MiniTaskApp {
             tab: match env_tab.as_deref() {
                 Some("processes") => Tab::Processes,
                 Some(_) => Tab::Performance,
-                None => match settings.tab {
+                None => match settings.initial_tab() {
                     1 => Tab::Performance,
                     2 => Tab::Startup,
                     _ => Tab::Processes,
@@ -457,6 +512,24 @@ impl MiniTaskApp {
             startup_entries: startup::list(),
             confirm_delete: None,
             saved_settings: settings.snapshot(),
+            palette: settings.active_palette(),
+            dark_mode: settings.dark_mode,
+            theme_dirty: true,
+            always_on_top: settings.always_on_top,
+            startup_tab_mode: settings.startup_tab_mode,
+            confirm_kill_setting: settings.confirm_kill,
+            settings_open: false,
+            settings_page: 0,
+            replace_taskmgr: settings.replace_taskmgr,
+            taskbar_menu: settings.taskbar_menu,
+            tray_rx,
+            tray_hook,
+            tray_popup: None,
+            tray_popup_at: None,
+            ifeo_restore: None,
+            taskmgr_icon,
+            icon_cache: IconCache::default(),
+            smart_dialog_disk: None,
         };
         app.refresh();
         app
@@ -682,7 +755,16 @@ impl MiniTaskApp {
 
     fn ask_kill(&mut self, pid: u32) {
         if let Some(row) = self.rows.iter().find(|r| r.pid == pid) {
-            self.confirm_kill = Some((pid, row.name.clone()));
+            if !self.confirm_kill_setting {
+                match process::kill(pid) {
+                    Ok(()) => self.notify(format!("PID {pid} を終了しました")),
+                    Err(e) => self.notify(e),
+                }
+                self.selected = None;
+                self.refresh();
+            } else {
+                self.confirm_kill = Some((pid, row.name.clone()));
+            }
         }
     }
 
@@ -754,6 +836,35 @@ impl MiniTaskApp {
 
 impl eframe::App for MiniTaskApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.theme_dirty {
+            util::setup_theme(ctx, self.dark_mode, &self.palette);
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                if self.always_on_top {
+                    egui::WindowLevel::AlwaysOnTop
+                } else {
+                    egui::WindowLevel::Normal
+                },
+            ));
+            self.theme_dirty = false;
+        }
+        // タスクバー右クリックの通知を受け取る
+        if let Some(rx) = &self.tray_rx {
+            while let Ok(click) = rx.try_recv() {
+                let (_, fired) = integration::hook_status();
+                if !fired {
+                    self.tray_popup = Some(click);
+                    self.tray_popup_at = Some(Instant::now());
+                }
+            }
+        }
+        // 純正タスクマネージャー起動後の IFEO 復元
+        if let Some((_, at)) = &self.ifeo_restore {
+            if at.elapsed() >= Duration::from_millis(500) {
+                if let Some((old, _)) = self.ifeo_restore.take() {
+                    integration::restore_ifeo(Some(old));
+                }
+            }
+        }
         let interval = Duration::from_secs_f32(self.interval);
         let elapsed = self.last_refresh.elapsed();
         if elapsed >= interval && !self.paused {
@@ -807,6 +918,14 @@ impl eframe::App for MiniTaskApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.current_settings().save();
+        if self.taskbar_menu {
+            let _ = integration::uninject_hook();
+            let _ = integration::set_shell_menu(false, "");
+        }
+        integration::stop_tray_monitor(self.tray_hook.take());
+        if let Some((old, _)) = self.ifeo_restore.take() {
+            integration::restore_ifeo(Some(old));
+        }
         if let Some(mut session) = self.net.take() {
             session.stop();
         }
@@ -849,17 +968,66 @@ impl MiniTaskApp {
             perf_kind,
             perf_id,
             cpu_graph_mode: self.cpu_graph_mode == CpuGraphMode::PerCore,
+            dark_mode: self.dark_mode,
+            dark_colors: if self.dark_mode {
+                self.palette
+            } else {
+                self.saved_settings.dark_colors
+            },
+            light_colors: if self.dark_mode {
+                self.saved_settings.light_colors
+            } else {
+                self.palette
+            },
+            always_on_top: self.always_on_top,
+            startup_tab_mode: self.startup_tab_mode,
+            confirm_kill: self.confirm_kill_setting,
+            replace_taskmgr: self.replace_taskmgr,
+            taskbar_menu: self.taskbar_menu,
         }
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("MiniTask").size(20.0).strong().color(ACCENT));
+            ui.label(
+                RichText::new("MiniTask")
+                    .size(20.0)
+                    .strong()
+                    .color(self.palette.primary),
+            );
             ui.label(
                 RichText::new("軽量タスクマネージャー")
                     .size(12.0)
-                    .color(Color32::from_gray(140)),
+                    .color(ui.visuals().weak_text_color()),
             );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("⚙ 設定").on_hover_text("設定").clicked() {
+                    self.settings_open = true;
+                }
+                if self.replace_taskmgr {
+                    let button = if let Some(tex) = &self.taskmgr_icon {
+                        egui::Button::image(
+                            egui::Image::from_texture(tex).fit_to_exact_size(Vec2::splat(18.0)),
+                        )
+                    } else {
+                        egui::Button::new("📋")
+                    };
+                    if ui
+                        .add(button)
+                        .on_hover_text("タスクマネージャーを開く")
+                        .clicked()
+                    {
+                        match integration::pause_ifeo_for_taskmgr() {
+                            Ok(old) => {
+                                if let Some(v) = old {
+                                    self.ifeo_restore = Some((v, Instant::now()));
+                                }
+                            }
+                            Err(e) => self.notify(e),
+                        }
+                    }
+                }
+            });
         });
     }
 
@@ -904,6 +1072,18 @@ impl MiniTaskApp {
         ui.add_space(2.0);
 
         let view = self.sorted_view();
+        self.icon_cache.reset_frame();
+        let pal = self.palette;
+        // 名前列のアイコンを先に取得 (テーブル描画中の借用を避ける)
+        let mut icons: HashMap<u32, Option<egui::TextureHandle>> = HashMap::new();
+        for r in view.iter().take(60) {
+            let key = if r.exe.is_empty() {
+                r.name.clone()
+            } else {
+                r.exe.clone()
+            };
+            icons.insert(r.pid, self.icon_cache.get(ui.ctx(), &key, &key));
+        }
         // タブの右クリックメニューで選んだ列だけを表示 (名前は常に表示)
         let visible: Vec<ColumnKind> = ColumnKind::ALL
             .into_iter()
@@ -933,7 +1113,14 @@ impl MiniTaskApp {
                     body.row(20.0, |mut table_row| {
                         table_row.set_selected(self.selected == Some(row.pid));
                         for &c in &visible {
-                            table_row.col(|ui| c.render(ui, &row));
+                            table_row.col(|ui| {
+                                if c == ColumnKind::Name {
+                                    if let Some(tex) = icons.get(&row.pid).and_then(|t| t.as_ref()) {
+                                        icon::paint(ui, tex);
+                                    }
+                                }
+                                c.render(ui, &row, &pal);
+                            });
                         }
                         let resp = table_row.response();
                         if resp.clicked() {
@@ -944,7 +1131,7 @@ impl MiniTaskApp {
                         }
                         resp.context_menu(|ui| {
                             if ui.button("タスクの終了").clicked() {
-                                self.confirm_kill = Some((row.pid, row.name.clone()));
+                                self.ask_kill(row.pid);
                                 ui.close();
                             }
                             if ui.button("プロセス ツリーの終了").clicked() {
@@ -982,10 +1169,11 @@ impl MiniTaskApp {
         color: Color32,
         selected: bool,
         style: util::GraphStyle,
+        pal: &Palette,
     ) -> egui::Response {
         let width = ui.available_width().clamp(80.0, 300.0);
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 84.0), egui::Sense::click());
-        Self::paint_nav_background(ui, rect, resp.hovered(), selected, color, 84.0);
+        Self::paint_nav_background(ui, rect, resp.hovered(), selected, color, 84.0, pal);
         let graph_rect = Self::nav_graph_rect(rect);
         util::paint_mini_graph(ui.painter(), graph_rect, hist, 100.0, color, style);
         Self::paint_nav_text(ui, rect, label, detail, value, color);
@@ -1007,10 +1195,11 @@ impl MiniTaskApp {
         write_color: Color32,
         selected: bool,
         style: util::GraphStyle,
+        pal: &Palette,
     ) -> egui::Response {
         let width = ui.available_width().clamp(80.0, 300.0);
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 84.0), egui::Sense::click());
-        Self::paint_nav_background(ui, rect, resp.hovered(), selected, color, 84.0);
+        Self::paint_nav_background(ui, rect, resp.hovered(), selected, color, 84.0, pal);
         let graph_rect = Self::nav_graph_rect(rect);
         util::paint_mini_dual_graph(ui.painter(), graph_rect, read, write, max, read_color, write_color, style);
         Self::paint_nav_text(ui, rect, label, detail, value, color);
@@ -1031,10 +1220,11 @@ impl MiniTaskApp {
         selected: bool,
         color: Color32,
         height: f32,
+        pal: &Palette,
     ) {
         let painter = ui.painter();
         if selected {
-            painter.rect_filled(rect, 4.0, Color32::from_rgb(45, 49, 60));
+            painter.rect_filled(rect, 4.0, ui.visuals().faint_bg_color);
             // 本家のような選択枠
             painter.rect_stroke(
                 rect.shrink(1.0),
@@ -1051,7 +1241,7 @@ impl MiniTaskApp {
                 color,
             );
         } else if hovered {
-            painter.rect_filled(rect, 4.0, Color32::from_rgb(38, 42, 52));
+            painter.rect_filled(rect, 4.0, ui.visuals().widgets.hovered.bg_fill);
         }
         // グラフ枠
         let g = Self::nav_graph_rect(rect);
@@ -1059,7 +1249,7 @@ impl MiniTaskApp {
         painter.rect_stroke(
             g,
             2.0,
-            egui::Stroke::new(1.0, Color32::from_gray(55)),
+            egui::Stroke::new(1.0, pal.primary.gamma_multiply(0.35)),
             egui::StrokeKind::Inside,
         );
     }
@@ -1088,7 +1278,7 @@ impl MiniTaskApp {
             let mut job = egui::text::LayoutJob::simple(
                 detail.to_owned(),
                 egui::FontId::proportional(11.0),
-                Color32::from_gray(145),
+                ui.visuals().weak_text_color(),
                 wrap_width,
             );
             job.wrap = egui::text::TextWrapping {
@@ -1102,7 +1292,7 @@ impl MiniTaskApp {
             painter.galley(
                 egui::pos2(x, detail_y),
                 galley.clone(),
-                Color32::from_gray(145),
+                ui.visuals().weak_text_color(),
             );
             value_y = (detail_y + galley.size().y + 3.0).max(value_y);
         }
@@ -1123,7 +1313,7 @@ impl MiniTaskApp {
             let resp = ui.label(
                 RichText::new(label)
                     .size(12.0)
-                    .color(Color32::from_gray(150)),
+                    .color(ui.visuals().weak_text_color()),
             );
             ui.add_space((170.0 - resp.rect.width()).max(10.0));
             ui.label(RichText::new(value).size(13.0).monospace());
@@ -1273,7 +1463,7 @@ impl MiniTaskApp {
                 format!("{:.2} GHz", self.load.cpu_freq_mhz as f64 / 1000.0),
                 format!("{:.0}%", self.load.cpu),
                 &self.cpu_hist,
-                CPU_COLOR,
+                self.palette.cpu,
             ),
             (
                 PerfSel::Ram,
@@ -1286,7 +1476,7 @@ impl MiniTaskApp {
                 ),
                 String::new(),
                 &self.mem_hist,
-                MEM_COLOR,
+                self.palette.mem,
             ),
         ];
         let mut bottom_items: Vec<NavItem<'_>> = Vec::new();
@@ -1298,7 +1488,7 @@ impl MiniTaskApp {
                 g.model.clone(),
                 format!("{:.0}%", g.usage),
                 h,
-                GPU_COLOR,
+                self.palette.gpu,
             ));
         }
         for n in &self.load.npus {
@@ -1309,7 +1499,7 @@ impl MiniTaskApp {
                 n.name.clone(),
                 format!("{:.0}%", n.usage),
                 h,
-                NPU_COLOR,
+                self.palette.npu,
             ));
         }
         let mut clicked_sel: Option<PerfSel> = None;
@@ -1333,6 +1523,7 @@ impl MiniTaskApp {
                         color,
                         self.perf_sel == sel,
                         style,
+                        &self.palette,
                     );
                     if resp.clicked() {
                         clicked_sel = Some(sel);
@@ -1353,11 +1544,12 @@ impl MiniTaskApp {
                         rh,
                         wh,
                         max,
-                        ROM_COLOR,
-                        CPU_COLOR,
-                        ROM_COLOR,
+                        self.palette.disk_write,
+                        self.palette.cpu,
+                        self.palette.disk_write,
                         self.perf_sel == sel,
                         style,
+                        &self.palette,
                     );
                     if resp.clicked() {
                         clicked_sel = Some(sel);
@@ -1379,11 +1571,12 @@ impl MiniTaskApp {
                         rh,
                         sh,
                         max,
-                        NET_RECV_COLOR,
-                        NET_RECV_COLOR,
-                        NET_SEND_COLOR,
+                        self.palette.net_recv,
+                        self.palette.net_recv,
+                        self.palette.net_send,
                         self.perf_sel == sel,
                         style,
+                        &self.palette,
                     );
                     if resp.clicked() {
                         clicked_sel = Some(sel);
@@ -1399,6 +1592,7 @@ impl MiniTaskApp {
                         color,
                         self.perf_sel == sel,
                         style,
+                        &self.palette,
                     );
                     if resp.clicked() {
                         clicked_sel = Some(sel);
@@ -1442,14 +1636,14 @@ impl MiniTaskApp {
                 },
                 format!("{:.0}%", self.load.cpu),
                 &self.cpu_hist,
-                CPU_COLOR,
+                self.palette.cpu,
             ),
             PerfSel::Ram => (
                 "メモリ".to_owned(),
                 "物理メモリ (RAM)".to_owned(),
                 format!("{mem_pct:.0}%"),
                 &self.mem_hist,
-                MEM_COLOR,
+                self.palette.mem,
             ),
             PerfSel::Disk(id) => {
                 let d = self.load.disks.iter().find(|d| &d.id == id);
@@ -1463,7 +1657,7 @@ impl MiniTaskApp {
                     .map(|d| d.type_label.clone())
                     .unwrap_or_else(|| "ストレージ".to_owned());
                 let h = find_hist(&self.disk_active_hist, id, &empty_hist);
-                (title, subtitle, value, h, MEM_COLOR)
+                (title, subtitle, value, h, self.palette.mem)
             }
             PerfSel::Gpu(id) => {
                 let g = self.load.gpus.iter().find(|g| &g.id == id);
@@ -1479,7 +1673,7 @@ impl MiniTaskApp {
                     model.clone(),
                     format!("{usage:.0}%"),
                     find_hist(&self.gpu_hist, id, &empty_hist),
-                    GPU_COLOR,
+                    self.palette.gpu,
                 );
                 if let (Some(g), Some(key)) = (g, self.gpu_sel.clone()) {
                     if let Some((_, v)) = g.engines.iter().find(|(k, _)| *k == key) {
@@ -1490,7 +1684,7 @@ impl MiniTaskApp {
                             model,
                             format!("{v:.0}%"),
                             h,
-                            GPU_COLOR,
+                            self.palette.gpu,
                         )
                     } else {
                         overall
@@ -1516,7 +1710,7 @@ impl MiniTaskApp {
                     npu_sub.clone(),
                     format!("{usage:.0}%"),
                     find_hist(&self.npu_hist, id, &empty_hist),
-                    NPU_COLOR,
+                    self.palette.npu,
                 );
                 if let Some(key) = self.npu_sel.clone() {
                     let cur = n.and_then(|n| n.engines.iter().find(|(k, _)| *k == key));
@@ -1529,7 +1723,7 @@ impl MiniTaskApp {
                             npu_sub,
                             format!("{v:.0}%"),
                             h,
-                            NPU_COLOR,
+                            self.palette.npu,
                         )
                     } else {
                         overall
@@ -1550,7 +1744,7 @@ impl MiniTaskApp {
                     .map(|a| util::fmt_rate(a.recv_bps.max(a.sent_bps)))
                     .unwrap_or_else(|| "0 KB/秒".to_owned());
                 let h = find_hist(&self.net_recv_hist, id, &empty_hist);
-                (title, subtitle, value, h, NET_RECV_COLOR)
+                (title, subtitle, value, h, self.palette.net_recv)
             }
         };
 
@@ -1561,7 +1755,7 @@ impl MiniTaskApp {
                 ui.label(
                     RichText::new(subtitle)
                         .size(12.0)
-                        .color(Color32::from_gray(140)),
+                        .color(ui.visuals().weak_text_color()),
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1618,14 +1812,14 @@ impl MiniTaskApp {
                         egui::Align2::LEFT_TOP,
                         format!("CPU {idx}"),
                         egui::FontId::proportional(11.0),
-                        Color32::from_gray(150),
+                        ui.visuals().weak_text_color(),
                     );
                     painter.text(
                         egui::pos2(rect.right() - 8.0, rect.top() + 4.0),
                         egui::Align2::RIGHT_TOP,
                         format!("{cur:.0}%"),
                         egui::FontId::proportional(11.0),
-                        CPU_COLOR,
+                        self.palette.cpu,
                     );
                     let graph_rect = egui::Rect::from_min_max(
                         egui::pos2(rect.left() + 6.0, rect.top() + 20.0),
@@ -1636,7 +1830,7 @@ impl MiniTaskApp {
                         graph_rect,
                         &self.core_hist[idx],
                         100.0,
-                        CPU_COLOR,
+                        self.palette.cpu,
                         style,
                     );
                 }
@@ -1651,10 +1845,10 @@ impl MiniTaskApp {
                 ui.label(
                     RichText::new("アクティブな時間")
                         .size(12.0)
-                        .color(Color32::from_gray(150)),
+                        .color(ui.visuals().weak_text_color()),
                 );
             });
-            util::perf_chart(ui, &ah, 100.0, MEM_COLOR, Vec2::new(gw, main_h), style)
+            util::perf_chart(ui, &ah, 100.0, self.palette.mem, Vec2::new(gw, main_h), style)
                 .context_menu(|ui| {
                     Self::update_speed_menu(
                         ui,
@@ -1669,13 +1863,13 @@ impl MiniTaskApp {
                 ui.label(
                     RichText::new("ディスクの転送速度")
                         .size(12.0)
-                        .color(Color32::from_gray(150)),
+                        .color(ui.visuals().weak_text_color()),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         RichText::new(format!("{}/秒", util::fmt_bytes(max as u64)))
                             .size(11.0)
-                            .color(Color32::from_gray(120)),
+                            .color(ui.visuals().weak_text_color()),
                     );
                 });
             });
@@ -1684,8 +1878,8 @@ impl MiniTaskApp {
                 &rh,
                 &wh,
                 max,
-                CPU_COLOR,
-                ROM_COLOR,
+                self.palette.cpu,
+                self.palette.disk_write,
                 Vec2::new(gw, (gh - main_h - 12.0).max(60.0)),
                 style,
             );
@@ -1695,13 +1889,13 @@ impl MiniTaskApp {
                 ui.label(
                     RichText::new("送信 / 受信")
                         .size(12.0)
-                        .color(Color32::from_gray(150)),
+                        .color(ui.visuals().weak_text_color()),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         RichText::new(format!("{}/秒", util::fmt_bytes(max as u64)))
                             .size(11.0)
-                            .color(Color32::from_gray(120)),
+                            .color(ui.visuals().weak_text_color()),
                     );
                 });
             });
@@ -1710,8 +1904,8 @@ impl MiniTaskApp {
                 &rh,
                 &sh,
                 max,
-                NET_RECV_COLOR,
-                NET_SEND_COLOR,
+                self.palette.net_recv,
+                self.palette.net_send,
                 Vec2::new(gw, gh),
                 style,
             )
@@ -1725,8 +1919,8 @@ impl MiniTaskApp {
                 )
             });
             ui.horizontal(|ui| {
-                ui.label(RichText::new("■ 送信").size(11.0).color(NET_SEND_COLOR));
-                ui.label(RichText::new("■ 受信").size(11.0).color(NET_RECV_COLOR));
+                ui.label(RichText::new("■ 送信").size(11.0).color(self.palette.net_send));
+                ui.label(RichText::new("■ 受信").size(11.0).color(self.palette.net_recv));
             });
         } else {
             let resp = util::perf_chart(ui, hist, 100.0, color, Vec2::new(gw, gh), style);
@@ -1769,13 +1963,13 @@ impl MiniTaskApp {
                         ui.label(
                             RichText::new("専用 GPU メモリ")
                                 .size(12.0)
-                                .color(Color32::from_gray(150)),
+                                .color(ui.visuals().weak_text_color()),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
                                 RichText::new(util::fmt_bytes(mem_max as u64))
                                     .size(11.0)
-                                    .color(Color32::from_gray(120)),
+                                    .color(ui.visuals().weak_text_color()),
                             );
                         });
                     });
@@ -1784,8 +1978,8 @@ impl MiniTaskApp {
                         &mem_hist,
                         &mem_hist,
                         mem_max,
-                        GPU_COLOR,
-                        GPU_COLOR,
+                        self.palette.gpu,
+                        self.palette.gpu,
                         Vec2::new(gw, (gh * 0.3).max(50.0)),
                         style,
                     );
@@ -1826,7 +2020,7 @@ impl MiniTaskApp {
                         ui.label(
                             RichText::new("専用 NPU メモリ")
                                 .size(12.0)
-                                .color(Color32::from_gray(150)),
+                                .color(ui.visuals().weak_text_color()),
                         );
                     });
                     util::perf_dual_chart(
@@ -1834,8 +2028,8 @@ impl MiniTaskApp {
                         &mem_hist,
                         &mem_hist,
                         mem_max,
-                        NPU_COLOR,
-                        NPU_COLOR,
+                        self.palette.npu,
+                        self.palette.npu,
                         Vec2::new(gw, (gh * 0.3).max(50.0)),
                         style,
                     );
@@ -1859,6 +2053,8 @@ impl MiniTaskApp {
         // 詳細情報 (2 列) — 本家タスクマネージャーと同じ文言
         let d = &self.load;
         let gb = util::fmt_bytes;
+        let pal = self.palette;
+        let mut smart_open: Option<String> = None;
         ui.columns(2, |cols| {
             let (l, rest) = cols.split_first_mut().unwrap();
             let r = rest.first_mut().unwrap();
@@ -1899,6 +2095,51 @@ impl MiniTaskApp {
                         );
                         Self::detail_row(ui, "読み取り速度", util::fmt_rate(disk.read_bps));
                         Self::detail_row(ui, "書き込み速度", util::fmt_rate(disk.write_bps));
+                        if let Some(smart) = &disk.smart {
+                            use crate::smart::SmartStatus;
+                            let health_color = match smart.status {
+                                SmartStatus::Good => pal.mem,
+                                SmartStatus::Caution => pal.warn,
+                                SmartStatus::Bad => pal.danger,
+                                SmartStatus::Unknown => ui.visuals().weak_text_color(),
+                            };
+                            let resp = ui.label(
+                                RichText::new("健康状態")
+                                    .size(12.0)
+                                    .color(ui.visuals().weak_text_color()),
+                            );
+                            ui.add_space((170.0 - resp.rect.width()).max(10.0));
+                            ui.label(
+                                RichText::new(smart.status_text())
+                                    .size(13.0)
+                                    .monospace()
+                                    .color(health_color),
+                            );
+                            if let Some(temp) = smart.temperature_c {
+                                let temp_color = if temp >= 70 {
+                                    pal.danger
+                                } else if temp >= 60 {
+                                    pal.warn
+                                } else {
+                                    pal.cpu
+                                };
+                                let resp = ui.label(
+                                    RichText::new("温度")
+                                        .size(12.0)
+                                        .color(ui.visuals().weak_text_color()),
+                                );
+                                ui.add_space((170.0 - resp.rect.width()).max(10.0));
+                                ui.label(
+                                    RichText::new(format!("{temp} °C"))
+                                        .size(13.0)
+                                        .monospace()
+                                        .color(temp_color),
+                                );
+                            }
+                            if ui.button("SMART 詳細...").clicked() {
+                                smart_open = Some(id.clone());
+                            }
+                        }
                     }
                 }
                 PerfSel::Gpu(id) => {
@@ -2070,6 +2311,9 @@ impl MiniTaskApp {
                 }
             });
         });
+        if let Some(id) = smart_open {
+            self.smart_dialog_disk = Some(id);
+        }
         content_h = ui.min_rect().height();
         });
         });
@@ -2096,13 +2340,24 @@ impl MiniTaskApp {
                 ui.label(
                     RichText::new("右クリックで削除 / 状態ボタンで有効・無効切替")
                         .size(12.0)
-                        .color(Color32::from_gray(140)),
+                        .color(ui.visuals().weak_text_color()),
                 );
             });
         });
         ui.add_space(2.0);
 
         let entries = self.startup_entries.clone();
+        self.icon_cache.reset_frame();
+        let mut entry_icons: HashMap<String, Option<egui::TextureHandle>> = HashMap::new();
+        for entry in entries.iter().take(60) {
+            let path = icon::exe_path_from_command(&entry.command);
+            let key = if path.is_empty() {
+                entry.name.clone()
+            } else {
+                path.clone()
+            };
+            entry_icons.insert(entry.name.clone(), self.icon_cache.get(ui.ctx(), &key, &path));
+        }
         TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
@@ -2130,11 +2385,14 @@ impl MiniTaskApp {
                 for entry in entries {
                     body.row(26.0, |mut row| {
                         row.col(|ui| {
+                            if let Some(tex) = entry_icons.get(&entry.name).and_then(|t| t.as_ref()) {
+                                icon::paint(ui, tex);
+                            }
                             ui.label(&entry.name);
                         });
                         row.col(|ui| {
                             let label = if entry.enabled { "有効" } else { "無効" };
-                            let color = if entry.enabled { MEM_COLOR } else { Color32::from_gray(140) };
+                            let color = if entry.enabled { self.palette.mem } else { ui.visuals().weak_text_color() };
                             if ui.button(RichText::new(label).color(color)).clicked() {
                                 match startup::set_enabled(&entry, !entry.enabled) {
                                     Ok(()) => {
@@ -2178,14 +2436,14 @@ impl MiniTaskApp {
                     ui.label(
                         RichText::new("ネットワーク計測: 有効 (ETW)")
                             .size(12.0)
-                            .color(MEM_COLOR),
+                            .color(self.palette.mem),
                     );
                 }
                 Some(_) => {
                     ui.label(
                         RichText::new("ネットワーク計測: セッション停止")
                             .size(12.0)
-                            .color(WARN),
+                            .color(self.palette.warn),
                     );
                 }
                 None => {
@@ -2193,7 +2451,7 @@ impl MiniTaskApp {
                         ui.label(
                             RichText::new(format!("ネットワーク計測: 無効 — {err}"))
                                 .size(12.0)
-                                .color(WARN),
+                                .color(self.palette.warn),
                         );
                     }
                 }
@@ -2210,7 +2468,7 @@ impl MiniTaskApp {
                 ui.label(RichText::new("更新間隔:").size(12.0));
                 if let Some((msg, _)) = &self.toast {
                     ui.separator();
-                    ui.label(RichText::new(msg).size(12.0).color(ACCENT));
+                    ui.label(RichText::new(msg).size(12.0).color(self.palette.primary));
                 }
             });
         });
@@ -2228,12 +2486,12 @@ impl MiniTaskApp {
                     ui.label(
                         RichText::new("保存されていないデータは失われます。")
                             .small()
-                            .color(WARN),
+                            .color(self.palette.warn),
                     );
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui
-                            .button(RichText::new("終了する").color(DANGER))
+                            .button(RichText::new("終了する").color(self.palette.danger))
                             .clicked()
                         {
                             match process::kill(pid) {
@@ -2262,12 +2520,12 @@ impl MiniTaskApp {
                     ui.label(
                         RichText::new("対象プロセスが起動したすべての子プロセスも終了します。")
                             .small()
-                            .color(WARN),
+                            .color(self.palette.warn),
                     );
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui
-                            .button(RichText::new("終了する").color(DANGER))
+                            .button(RichText::new("終了する").color(self.palette.danger))
                             .clicked()
                         {
                             let rows = self.rows.clone();
@@ -2297,12 +2555,12 @@ impl MiniTaskApp {
                     ui.label(
                         RichText::new("レジストリ値またはファイルが削除されます。")
                             .small()
-                            .color(WARN),
+                            .color(self.palette.warn),
                     );
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui
-                            .button(RichText::new("削除する").color(DANGER))
+                            .button(RichText::new("削除する").color(self.palette.danger))
                             .clicked()
                         {
                             match startup::delete(&entry) {
@@ -2319,6 +2577,395 @@ impl MiniTaskApp {
                         }
                     });
                 });
+        }
+
+        // ==================== 設定ダイアログ ====================
+        if self.settings_open {
+            let mut open = true;
+            let mut dark = self.dark_mode;
+            let mut top = self.always_on_top;
+            let mut tab_mode = self.startup_tab_mode;
+            let mut confirm = self.confirm_kill_setting;
+            let mut replace = self.replace_taskmgr;
+            let mut taskbar = self.taskbar_menu;
+            let mut interval = self.interval;
+            let mut anim = self.graph_animation;
+            let mut spline = self.graph_spline;
+            let mut page = self.settings_page;
+            let mut dark_colors = self.saved_settings.dark_colors;
+            let mut light_colors = self.saved_settings.light_colors;
+            let (hook_installed, hook_fired) = integration::hook_status();
+            let ifeo_active = integration::is_replace_active();
+
+            egui::Window::new("設定")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_width(620.0)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut page, 0, "外観");
+                        ui.selectable_value(&mut page, 1, "グラフと更新");
+                        ui.selectable_value(&mut page, 2, "動作");
+                        ui.selectable_value(&mut page, 3, "システム統合");
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical().max_height(480.0).show(ui, |ui| match page {
+                        0 => {
+                            ui.label(RichText::new("テーマ").strong());
+                            ui.horizontal(|ui| {
+                                ui.radio_value(&mut dark, true, "ダークモード");
+                                ui.radio_value(&mut dark, false, "ホワイトモード");
+                            });
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("配色").strong());
+                            let defaults = if dark {
+                                Palette::dark_default()
+                            } else {
+                                Palette::light_default()
+                            };
+                            for i in 0..12 {
+                                let mut color = if dark {
+                                    dark_colors.as_array()[i]
+                                } else {
+                                    light_colors.as_array()[i]
+                                };
+                                ui.horizontal(|ui| {
+                                    if ui.color_edit_button_srgba(&mut color).changed() {
+                                        if dark {
+                                            dark_colors.set(i, color);
+                                        } else {
+                                            light_colors.set(i, color);
+                                        }
+                                    }
+                                    ui.label(Palette::names()[i]);
+                                    if ui.small_button("既定").clicked() {
+                                        let c = defaults.as_array()[i];
+                                        if dark {
+                                            dark_colors.set(i, c);
+                                        } else {
+                                            light_colors.set(i, c);
+                                        }
+                                    }
+                                });
+                            }
+                            if ui.button("すべて既定に戻す").clicked() {
+                                dark_colors = Palette::dark_default();
+                                light_colors = Palette::light_default();
+                            }
+                        }
+                        1 => {
+                            ui.label(RichText::new("更新の速度").strong());
+                            for (label, value) in [
+                                ("0.5 秒", 0.5_f32),
+                                ("1 秒 (通常)", 1.0),
+                                ("2 秒", 2.0),
+                                ("5 秒 (低)", 5.0),
+                            ] {
+                                ui.radio_value(&mut interval, value, label);
+                            }
+                            ui.add_space(8.0);
+                            ui.checkbox(&mut anim, "なめらかなアニメーション補間");
+                            ui.checkbox(&mut spline, "スプライン補間 (滑らかな曲線)");
+                        }
+                        2 => {
+                            ui.checkbox(&mut top, "常に手前に表示");
+                            ui.label(RichText::new("起動時に開くタブ").strong());
+                            ui.radio_value(&mut tab_mode, 0, "前回のタブを復元");
+                            ui.radio_value(&mut tab_mode, 1, "常にプロセス");
+                            ui.radio_value(&mut tab_mode, 2, "常にパフォーマンス");
+                            ui.add_space(8.0);
+                            ui.checkbox(&mut confirm, "タスク終了時に確認ダイアログを表示");
+                        }
+                        _ => {
+                            ui.checkbox(&mut replace, "Ctrl+Shift+Esc で MiniTask を開く");
+                            ui.label(
+                                RichText::new(format!(
+                                    "現在の状態: {} / Debugger: {}",
+                                    if ifeo_active { "有効" } else { "無効" },
+                                    if integration::debugger_value().is_some() {
+                                        "設定済み"
+                                    } else {
+                                        "未設定"
+                                    }
+                                ))
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                            );
+                            ui.add_space(6.0);
+                            ui.checkbox(&mut taskbar, "タスクバーの右クリックに MiniTask を追加");
+                            ui.label(
+                                RichText::new(format!(
+                                    "注入: {} / メニュー拡張: {}",
+                                    if hook_installed { "有効" } else { "無効" },
+                                    if hook_fired {
+                                        "有効"
+                                    } else {
+                                        "このOSでは非対応 (ポップアップを使用)"
+                                    }
+                                ))
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                            );
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(
+                                    "システム統合の切替には管理者権限が必要です。",
+                                )
+                                .small()
+                                .color(self.palette.warn),
+                            );
+                        }
+                    });
+                });
+
+            self.settings_open = open;
+            self.settings_page = page;
+            if dark != self.dark_mode
+                || dark_colors != self.saved_settings.dark_colors
+                || light_colors != self.saved_settings.light_colors
+            {
+                self.theme_dirty = true;
+            }
+            self.dark_mode = dark;
+            self.saved_settings.dark_colors = dark_colors;
+            self.saved_settings.light_colors = light_colors;
+            self.palette = if dark { dark_colors } else { light_colors };
+            self.interval = interval;
+            self.graph_animation = anim;
+            self.graph_spline = spline;
+            self.always_on_top = top;
+            self.startup_tab_mode = tab_mode;
+            self.confirm_kill_setting = confirm;
+            if top && self.theme_dirty == false {
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                    egui::WindowLevel::AlwaysOnTop,
+                ));
+            } else if !top {
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                    egui::WindowLevel::Normal,
+                ));
+            }
+            if replace != self.replace_taskmgr {
+                match std::env::current_exe() {
+                    Ok(exe) => match integration::set_replace_taskmgr(
+                        replace,
+                        &exe.to_string_lossy(),
+                    ) {
+                        Ok(()) => {
+                            self.replace_taskmgr = replace;
+                            self.notify(if replace {
+                                "Ctrl+Shift+Esc で MiniTask を開くようにしました"
+                            } else {
+                                "タスクマネージャーの置換を解除しました"
+                            });
+                        }
+                        Err(e) => self.notify(format!("置換の切替に失敗: {e}")),
+                    },
+                    Err(e) => self.notify(e.to_string()),
+                }
+            }
+            if taskbar != self.taskbar_menu {
+                let exe = std::env::current_exe()
+                    .map(|e| e.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if taskbar {
+                    let _ = integration::set_shell_menu(true, &exe);
+                    match integration::inject_hook() {
+                        Ok(()) => self.notify("タスクバーメニューを有効にしました"),
+                        Err(e) => self.notify(format!("注入に失敗 (ポップアップで動作します): {e}")),
+                    }
+                    let (rx, hook) = integration::start_tray_monitor();
+                    self.tray_rx = Some(rx);
+                    self.tray_hook = hook;
+                } else {
+                    let _ = integration::uninject_hook();
+                    let _ = integration::set_shell_menu(false, &exe);
+                    integration::stop_tray_monitor(self.tray_hook.take());
+                    self.tray_rx = None;
+                    self.tray_popup = None;
+                    self.notify("タスクバーメニューを無効にしました");
+                }
+                self.taskbar_menu = taskbar;
+            }
+        }
+
+        // ==================== SMART 詳細ダイアログ ====================
+        if let Some(id) = self.smart_dialog_disk.clone() {
+            let smart = self
+                .load
+                .disks
+                .iter()
+                .find(|d| d.id == id)
+                .and_then(|d| d.smart.clone());
+            let mut open = true;
+            let title = format!("SMART 詳細 — {}", self.load.disks.iter().find(|d| d.id == id).map(|d| d.label.as_str()).unwrap_or("ディスク"));
+            egui::Window::new(title)
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_size([640.0, 520.0])
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    if let Some(smart) = &smart {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("健康状態").strong());
+                            let color = match smart.status {
+                                crate::smart::SmartStatus::Good => self.palette.mem,
+                                crate::smart::SmartStatus::Caution => self.palette.warn,
+                                crate::smart::SmartStatus::Bad => self.palette.danger,
+                                crate::smart::SmartStatus::Unknown => ui.visuals().weak_text_color(),
+                            };
+                            ui.label(RichText::new(smart.status_text()).strong().color(color));
+                        });
+                        for (label, value) in [
+                            ("モデル", smart.model.as_str()),
+                            ("シリアル番号", smart.serial.as_str()),
+                            ("ファームウェア", smart.firmware.as_str()),
+                            ("インターフェース", smart.interface.as_str()),
+                            (
+                                "温度",
+                                smart
+                                    .temperature_c
+                                    .map(|t| format!("{t} °C"))
+                                    .as_deref()
+                                    .unwrap_or("—"),
+                            ),
+                            (
+                                "電源投入時間",
+                                smart
+                                    .power_on_hours
+                                    .map(|h| format!("{h} 時間"))
+                                    .as_deref()
+                                    .unwrap_or("—"),
+                            ),
+                            (
+                                "電源投入回数",
+                                smart
+                                    .power_cycles
+                                    .map(|c| c.to_string())
+                                    .as_deref()
+                                    .unwrap_or("—"),
+                            ),
+                        ] {
+                            egui_extras::StripBuilder::new(ui)
+                                .size(egui_extras::Size::exact(150.0))
+                                .size(egui_extras::Size::remainder())
+                                .horizontal(|mut strip| {
+                                    strip.cell(|ui| {
+                                        ui.label(RichText::new(label).color(ui.visuals().weak_text_color()));
+                                    });
+                                    strip.cell(|ui| {
+                                        ui.label(value.to_owned());
+                                    });
+                                });
+                        }
+                        if !smart.extra.is_empty() {
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("追加情報").strong());
+                            for (k, v) in &smart.extra {
+                                Self::detail_row(ui, k, v.clone());
+                            }
+                        }
+                        if !smart.attributes.is_empty() {
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("SMART 属性").strong());
+                            egui_extras::TableBuilder::new(ui)
+                                .striped(true)
+                                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                                .column(Column::initial(50.0))
+                                .column(Column::initial(150.0))
+                                .column(Column::initial(60.0))
+                                .column(Column::initial(60.0))
+                                .column(Column::initial(60.0))
+                                .column(Column::remainder())
+                                .header(22.0, |mut h| {
+                                    for name in ["ID", "属性名", "現在値", "最悪値", "しきい値", "生の値"] {
+                                        h.col(|ui| {
+                                            ui.strong(name);
+                                        });
+                                    }
+                                })
+                                .body(|mut body| {
+                                    for a in &smart.attributes {
+                                        body.row(20.0, |mut row| {
+                                            let bad = a.threshold > 0 && a.current <= a.threshold;
+                                            let color = if bad {
+                                                Some(self.palette.danger)
+                                            } else {
+                                                None
+                                            };
+                                            let cells = [
+                                                format!("{:02X}", a.id),
+                                                a.name.clone(),
+                                                a.current.to_string(),
+                                                a.worst.to_string(),
+                                                a.threshold.to_string(),
+                                                a.raw_text.clone(),
+                                            ];
+                                            for cell in cells {
+                                                row.col(|ui| {
+                                                    let mut rt = RichText::new(cell.clone()).size(12.0);
+                                                    if let Some(c) = color {
+                                                        rt = rt.color(c);
+                                                    }
+                                                    ui.label(rt);
+                                                });
+                                            }
+                                        });
+                                    }
+                                });
+                        }
+                    } else {
+                        ui.label("このディスクの SMART 情報を取得できませんでした。");
+                    }
+                });
+            if !open {
+                self.smart_dialog_disk = None;
+            }
+        }
+
+        // ==================== タスクバー右クリックのポップアップ ====================
+        if let Some(click) = self.tray_popup {
+            let expired = self
+                .tray_popup_at
+                .map(|t| t.elapsed() > Duration::from_secs(4))
+                .unwrap_or(true);
+            if expired {
+                self.tray_popup = None;
+                self.tray_popup_at = None;
+            } else {
+                let id = egui::ViewportId::from_hash_of("minitask_tray_popup");
+                let mut close = false;
+                ctx.show_viewport_immediate(
+                    id,
+                    egui::ViewportBuilder::default()
+                        .with_inner_size([160.0, 42.0])
+                        .with_position(egui::pos2(click.x as f32, click.y as f32))
+                        .with_decorations(false)
+                        .with_resizable(false)
+                        .with_always_on_top(),
+                    |ui, class| {
+                        if class == egui::ViewportClass::Immediate {
+                            let resp = ui.add(
+                                egui::Button::new("MiniTask").min_size(Vec2::new(156.0, 38.0)),
+                            );
+                            if resp.clicked() {
+                                integration::focus_window();
+                                close = true;
+                            }
+                            if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+                                close = true;
+                            }
+                        }
+                    },
+                );
+                if close {
+                    self.tray_popup = None;
+                    self.tray_popup_at = None;
+                }
+            }
         }
     }
 }

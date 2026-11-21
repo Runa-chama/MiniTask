@@ -1,8 +1,10 @@
 //! 設定の永続化 (HKCU\Software\MiniTask)。
-//! 更新の速度・グラフ表示・列表示・ソート・最後に開いたタブ等を保存する。
+//! 更新速度・グラフ・配色・列・ソート・タブ・システム統合を保存する。
 
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 use winreg::RegKey;
+
+use crate::util::Palette;
 
 const SETTINGS_PATH: &str = r"Software\MiniTask";
 
@@ -26,6 +28,21 @@ pub struct AppSettings {
     pub perf_id: String,
     /// CPU グラフモード (false=全体, true=論理プロセッサ)
     pub cpu_graph_mode: bool,
+
+    // --- 外観・動作 ---
+    pub dark_mode: bool,
+    pub dark_colors: Palette,
+    pub light_colors: Palette,
+    pub always_on_top: bool,
+    /// 0=前回のタブを復元, 1=常にプロセス, 2=常にパフォーマンス
+    pub startup_tab_mode: u8,
+    pub confirm_kill: bool,
+
+    // --- システム統合 ---
+    /// Ctrl+Shift+Esc でタスクマネージャーの代わりに MiniTask を起動
+    pub replace_taskmgr: bool,
+    /// タスクバー右クリックに MiniTask を追加
+    pub taskbar_menu: bool,
 }
 
 impl Default for AppSettings {
@@ -52,7 +69,42 @@ impl Default for AppSettings {
             perf_kind: 0,
             perf_id: String::new(),
             cpu_graph_mode: false,
+            dark_mode: true,
+            dark_colors: Palette::dark_default(),
+            light_colors: Palette::light_default(),
+            always_on_top: false,
+            startup_tab_mode: 0,
+            confirm_kill: true,
+            replace_taskmgr: false,
+            taskbar_menu: false,
         }
+    }
+}
+
+fn read_bool(key: &RegKey, name: &str, default: bool) -> bool {
+    match key.get_value::<u32, _>(name) {
+        Ok(v) => v != 0,
+        Err(_) => default,
+    }
+}
+
+fn read_palette(key: &RegKey, prefix: &str, default: Palette) -> Palette {
+    let mut p = default;
+    for (i, (k, name)) in Palette::keys().iter().zip(Palette::names().iter()).enumerate() {
+        let full = format!("{prefix}{k}");
+        let _ = name;
+        if let Ok(v) = key.get_value::<String, _>(&full) {
+            if let Some(c) = Palette::parse_hex(&v) {
+                p.set(i, c);
+            }
+        }
+    }
+    p
+}
+
+fn write_palette(key: &RegKey, prefix: &str, palette: &Palette) {
+    for (k, c) in Palette::keys().iter().zip(palette.as_array().iter()) {
+        let _ = key.set_value(&format!("{prefix}{k}"), &Palette::to_hex(*c));
     }
 }
 
@@ -65,16 +117,12 @@ impl AppSettings {
             return s;
         };
         if let Ok(v) = key.get_value::<u32, _>("IntervalMs") {
-            if [500, 1000, 5000].contains(&v) {
+            if [500, 1000, 2000, 5000].contains(&v) {
                 s.interval_ms = v;
             }
         }
-        if let Ok(v) = key.get_value::<u32, _>("GraphAnimation") {
-            s.graph_animation = v != 0;
-        }
-        if let Ok(v) = key.get_value::<u32, _>("GraphSpline") {
-            s.graph_spline = v != 0;
-        }
+        s.graph_animation = read_bool(&key, "GraphAnimation", s.graph_animation);
+        s.graph_spline = read_bool(&key, "GraphSpline", s.graph_spline);
         if let Ok(v) = key.get_value::<u32, _>("ColumnsMask") {
             s.columns_mask = v;
         }
@@ -102,6 +150,18 @@ impl AppSettings {
         if let Ok(v) = key.get_value::<u32, _>("CpuGraphMode") {
             s.cpu_graph_mode = v != 0;
         }
+        s.dark_mode = read_bool(&key, "DarkMode", true);
+        s.dark_colors = read_palette(&key, "Dark", Palette::dark_default());
+        s.light_colors = read_palette(&key, "Light", Palette::light_default());
+        s.always_on_top = read_bool(&key, "AlwaysOnTop", false);
+        if let Ok(v) = key.get_value::<u32, _>("StartupTabMode") {
+            if v <= 2 {
+                s.startup_tab_mode = v as u8;
+            }
+        }
+        s.confirm_kill = read_bool(&key, "ConfirmKill", true);
+        s.replace_taskmgr = read_bool(&key, "ReplaceTaskmgr", false);
+        s.taskbar_menu = read_bool(&key, "TaskbarMenu", false);
         s
     }
 
@@ -122,9 +182,20 @@ impl AppSettings {
         let _ = key.set_value("PerfKind", &(self.perf_kind as u32));
         let _ = key.set_value("PerfId", &self.perf_id);
         let _ = key.set_value("CpuGraphMode", &(self.cpu_graph_mode as u32));
+        let _ = key.set_value("DarkMode", &(self.dark_mode as u32));
+        write_palette(&key, "Dark", &self.dark_colors);
+        write_palette(&key, "Light", &self.light_colors);
+        let _ = key.set_value("AlwaysOnTop", &(self.always_on_top as u32));
+        let _ = key.set_value("StartupTabMode", &(self.startup_tab_mode as u32));
+        let _ = key.set_value("ConfirmKill", &(self.confirm_kill as u32));
+        let _ = key.set_value("ReplaceTaskmgr", &(self.replace_taskmgr as u32));
+        let _ = key.set_value("TaskbarMenu", &(self.taskbar_menu as u32));
+        // 統合用: 自分のexeパスを書いておき、hook DLL が参照する
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = key.set_value("ExePath", &exe.to_string_lossy().to_string());
+        }
     }
 
-    /// 現在値から変更されたかを判定するための比較用スナップショット。
     pub fn snapshot(&self) -> Self {
         self.clone()
     }
@@ -140,5 +211,31 @@ impl AppSettings {
             && self.perf_kind == other.perf_kind
             && self.perf_id == other.perf_id
             && self.cpu_graph_mode == other.cpu_graph_mode
+            && self.dark_mode == other.dark_mode
+            && self.dark_colors == other.dark_colors
+            && self.light_colors == other.light_colors
+            && self.always_on_top == other.always_on_top
+            && self.startup_tab_mode == other.startup_tab_mode
+            && self.confirm_kill == other.confirm_kill
+            && self.replace_taskmgr == other.replace_taskmgr
+            && self.taskbar_menu == other.taskbar_menu
+    }
+
+    /// 現在のモードに対応するパレット。
+    pub fn active_palette(&self) -> Palette {
+        if self.dark_mode {
+            self.dark_colors
+        } else {
+            self.light_colors
+        }
+    }
+
+    /// 起動時に適用するタブ (設定で固定されている場合は上書きする)。
+    pub fn initial_tab(&self) -> u8 {
+        match self.startup_tab_mode {
+            1 => 0,
+            2 => 1,
+            _ => self.tab,
+        }
     }
 }
