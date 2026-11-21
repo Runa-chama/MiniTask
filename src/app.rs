@@ -989,6 +989,10 @@ impl MiniTaskApp {
             .resizable(false)
             .drag_to_open(false)
             .show(ui, |ui| {
+                // デバイスが増えても左ナビからアクセスできるようスクロール可能に
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                 ui.add_space(4.0);
                 for (sel, label, detail, value, hist, color) in top_items {
                     let resp = Self::perf_nav_item(
@@ -1040,6 +1044,7 @@ impl MiniTaskApp {
                         clicked_sel = Some(sel);
                     }
                 }
+                    });
             });
         if let Some(sel) = clicked_sel {
             self.perf_sel = sel;
@@ -1047,6 +1052,10 @@ impl MiniTaskApp {
             self.npu_sel = None;
         }
 
+        // ScrollArea の内側では available_height() が実質無限大になるため、
+        // 入る前に実ビューポート高さを記録し、グラフ高さの計算に使う。
+        // これにより通常サイズでは収まり、極端に小さい場合だけスクロールする。
+        let viewport_h = ui.available_height().clamp(0.0, 4000.0);
         // 右側の内容は縦にはみ出したらスクロールできるようにする
         // (ウィンドウが小さくても詳細情報までアクセス可能)
         egui::ScrollArea::vertical()
@@ -1183,10 +1192,9 @@ impl MiniTaskApp {
             });
         });
         ui.add_space(4.0);
-        // グラフ高さ: ヘッダー・詳細情報・区切り線 (~225px) が必ず収まるよう
-        // 利用可能高さから予約分を差し引いた値を上限にする (はみ出し防止)
-        let avail_h = ui.available_height().clamp(0.0, 1200.0);
-        let gh = (avail_h * 0.56).min(avail_h - 225.0).clamp(80.0, 340.0);
+        // ヘッダー・ラベル・詳細情報 (最大 6 行)・区切り線の予約分 ~285px
+        let avail_h = viewport_h;
+        let gh = (avail_h * 0.52).min(avail_h - 285.0).clamp(80.0, 340.0);
         let gw = ui.available_width().clamp(60.0, 4000.0);
 
         if self.perf_sel == PerfSel::Cpu && self.cpu_graph_mode == CpuGraphMode::PerCore {
