@@ -55,6 +55,9 @@ pub fn run() -> i32 {
     for (key, val) in load.gpu_engines.iter().take(8) {
         println!("  GPU engine: {} = {:.1}%", crate::perf::engine_display_name(key), val);
     }
+    for (key, val) in load.npu_engines.iter().take(4) {
+        println!("  NPU engine: {} = {:.1}%", crate::perf::npu_engine_display_name(key), val);
+    }
     let self_row = rows.iter().find(|r| r.pid == std::process::id());
     check(
         "self process info",

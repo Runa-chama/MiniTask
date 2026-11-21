@@ -710,6 +710,7 @@ impl MiniTaskApp {
         ui: &mut egui::Ui,
         sel: &mut Option<String>,
         engines: &[(String, f32)],
+        npu: bool,
     ) {
         ui.label(RichText::new("グラフの変更").strong());
         ui.separator();
@@ -719,7 +720,11 @@ impl MiniTaskApp {
             ui.close();
         }
         for (key, _) in engines {
-            let name = crate::perf::engine_display_name(key);
+            let name = if npu {
+                crate::perf::npu_engine_display_name(key)
+            } else {
+                crate::perf::engine_display_name(key)
+            };
             let mark = if sel.as_deref() == Some(key.as_str()) { "✓ " } else { "   " };
             if ui.button(format!("{mark}{name}")).clicked() {
                 *sel = Some(key.clone());
@@ -842,7 +847,7 @@ impl MiniTaskApp {
                     "NPU 非搭載 / 取得不可".to_owned()
                 };
                 if let Some(key) = self.npu_sel.clone() {
-                    let name = crate::perf::engine_display_name(&key);
+                    let name = crate::perf::npu_engine_display_name(&key);
                     let hist = self
                         .npu_engine_hist
                         .iter()
@@ -989,6 +994,7 @@ impl MiniTaskApp {
                             ui,
                             &mut self.gpu_sel,
                             &self.load.gpu_engines,
+                            false,
                         ));
                 }
                 PerfSel::Npu => {
@@ -998,6 +1004,7 @@ impl MiniTaskApp {
                                 ui,
                                 &mut self.npu_sel,
                                 &self.load.npu_engines,
+                                true,
                             ));
                     }
                 }

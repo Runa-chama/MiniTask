@@ -201,19 +201,27 @@ impl ProcCollector {
         let gpu_mem_used = primary_gpu.and_then(|g| g.used_memory()).unwrap_or(0);
         let gpu_mem_total = primary_gpu.and_then(|g| g.total_memory()).unwrap_or(0);
 
-        // --- NPU ---
-        // カウンタが未開なら 30 回 (約 30 秒) ごとに開き直しを試みる
-        // (ドライバー更新で後から現れることがあるため)
+        // --- GPU / NPU エンジン使用率 ---
+        // Windows 11 では NPU も \GPU Engine(*) カウンタに含まれ、NPU 固有の
+        // LUID で列挙される。3D/Copy/Video 系エンジンを持つ LUID = GPU、
+        // compute 系のみの LUID = NPU として分離する (本家と同じ判定)。
+        let (gpu_engines, npu_engines_from_gpu) =
+            self.gpu_engine_meter.read_split().unwrap_or_default();
+
+        // 専用の \NPU Engine(*) カウンタが存在する環境ではそちらを優先する
         self.npu_recheck = self.npu_recheck.wrapping_add(1);
         if !self.npu.available && self.npu_recheck % 30 == 0 {
             self.npu.try_reopen();
         }
-        let npu_available = self.npu.available;
-        let npu = self.npu.total_usage().unwrap_or(0.0);
-        let npu_engines = self.npu.usage_by_type();
-
-        // --- GPU エンジン種別ごとの使用率 (タスクマネージャーの「グラフの変更」用) ---
-        let gpu_engines = self.gpu_engine_meter.usage_by_type();
+        let (npu_engines, npu) = if self.npu.available {
+            let (_, dedicated) = self.npu.read_split().unwrap_or_default();
+            let total: f32 = dedicated.iter().map(|(_, v)| *v).sum();
+            (dedicated, total.clamp(0.0, 100.0))
+        } else {
+            let total: f32 = npu_engines_from_gpu.iter().map(|(_, v)| *v).sum();
+            (npu_engines_from_gpu, total.clamp(0.0, 100.0))
+        };
+        let npu_available = !npu_engines.is_empty();
 
         // --- CPU 詳細 ---
         let cpu_brand = self

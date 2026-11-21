@@ -8,7 +8,7 @@
 //! 種別ごとに Utilization Percentage を合計すると
 //! 「項目ごとの使用率グラフ」が得られる (本家の「グラフの変更」の内部動作)。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::System::Performance::{
@@ -74,9 +74,11 @@ impl EngineMeter {
         self.open()
     }
 
-    /// 全インスタンスを収集し (エンジン種別, 使用率) のリストを返す。
-    /// 種別はインスタンス名末尾の engtype_X (小文字化)。
-    fn collect(&mut self) -> Option<Vec<(String, f64)>> {
+    /// 全インスタンスを収集し (LUID, エンジン種別, 使用率) のリストを返す。
+    /// Windows 11 では NPU も `\GPU Engine(*)` カウンタに含まれ、
+    /// NPU アダプタ固有の LUID で列挙される (本家タスクマネージャーも
+    /// この LUID で NPU と GPU を分けて表示している)。
+    fn collect(&mut self) -> Option<Vec<(String, String, f64)>> {
         if !self.available {
             return None;
         }
@@ -112,43 +114,66 @@ impl EngineMeter {
             );
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                // インスタンス名: pid_X_luid_..._eng_N_engtype_3d
+                // インスタンス名:
+                // pid_X_luid_0x00000000_0x0000f751_phys_0_eng_0_engtype_compute
                 let name = wide_ptr_to_string(item.szName);
                 let Some(engtype) = name.rsplit("_engtype_").next() else {
                     continue;
                 };
+                // luid_0xHHHHHHHH_0xLLLLLLLL を取り出す
+                let luid = name
+                    .split("_luid_")
+                    .nth(1)
+                    .and_then(|s| s.split("_phys_").next())
+                    .unwrap_or("")
+                    .to_owned();
                 let value = item.FmtValue.Anonymous.doubleValue;
                 if !value.is_finite() || value < 0.0 {
                     continue;
                 }
-                out.push((engtype.to_lowercase(), value));
+                out.push((luid, engtype.to_lowercase(), value));
             }
             Some(out)
         }
     }
 
-    /// 全エンジンの合計使用率 (0..100 に丸め)。取得不可なら None。
-    pub fn total_usage(&mut self) -> Option<f32> {
-        let items = self.collect()?;
-        let total: f64 = items.iter().map(|(_, v)| v).sum();
-        Some((total as f32).clamp(0.0, 100.0))
+    /// 3D / Copy / 動画系エンジンを持つ LUID は GPU アダプタ。
+    /// compute 系のみの LUID は NPU (Compute Accelerator) と判定する。
+    fn is_gpu_engine(engtype: &str) -> bool {
+        ["3d", "copy", "video", "display", "security", "timer", "jpeg", "codec"]
+            .iter()
+            .any(|key| engtype.contains(key))
     }
 
-    /// エンジン種別ごとの使用率。使用率の降順にソート。
-    pub fn usage_by_type(&mut self) -> Vec<(String, f32)> {
-        let Some(items) = self.collect() else {
-            return Vec::new();
-        };
-        let mut map: HashMap<String, f32> = HashMap::new();
-        for (engtype, value) in items {
-            *map.entry(engtype).or_insert(0.0) += value as f32;
-        }
+    fn sorted_usage(map: HashMap<String, f32>) -> Vec<(String, f32)> {
         let mut list: Vec<(String, f32)> = map.into_iter().collect();
         for (_, v) in list.iter_mut() {
             *v = v.clamp(0.0, 100.0);
         }
         list.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         list
+    }
+
+    /// 1 回の収集で GPU 用と NPU 用のエンジン別使用率を返す。
+    /// `(GPU エンジン一覧, NPU エンジン一覧)`。
+    pub fn read_split(&mut self) -> Option<(Vec<(String, f32)>, Vec<(String, f32)>)> {
+        let samples = self.collect()?;
+        let gpu_luids: HashSet<String> = samples
+            .iter()
+            .filter(|(_, engtype, _)| Self::is_gpu_engine(engtype))
+            .map(|(luid, _, _)| luid.clone())
+            .collect();
+        let mut gpu: HashMap<String, f32> = HashMap::new();
+        let mut npu: HashMap<String, f32> = HashMap::new();
+        for (luid, engtype, value) in samples {
+            let map = if gpu_luids.contains(&luid) {
+                &mut gpu
+            } else {
+                &mut npu
+            };
+            *map.entry(engtype).or_insert(0.0) += value as f32;
+        }
+        Some((Self::sorted_usage(gpu), Self::sorted_usage(npu)))
     }
 }
 
@@ -207,6 +232,15 @@ pub fn npu_device_present() -> bool {
         let present = SetupDiEnumDeviceInfo(set, 0, &mut data) != 0;
         SetupDiDestroyDeviceInfoList(set);
         present
+    }
+}
+
+/// NPU のエンジン名 (本家タスクマネージャーは NPU の compute を
+/// 「Compute」と表示する)。
+pub fn npu_engine_display_name(engtype: &str) -> String {
+    match engtype {
+        "compute" => "Compute".to_owned(),
+        other => engine_display_name(other),
     }
 }
 

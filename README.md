@@ -34,11 +34,15 @@ Windows 10/11 用の軽量タスクマネージャー。Rust + egui 製。
     コンピュート など、本家と同じ PDH GPU Engine / NPU Engine の
     engtype 集計方式。文言も本家リソース準拠)
   - グラフの高さはウィンドウサイズに応じて自動調整 (はみ出し防止)
-  - GPU 使用率は PDH `GPU Engine` カウンタ、NPU は PDH `NPU Engine` カウンタ。
-    NPU デバイス自体は SetupAPI (ComputeAccelerator クラス) で検出し、
-    カウンタ未提供の環境では「搭載済み (使用率カウンタ未提供)」と表示する
-    （本家タスクマネージャーが N/A になるのと同じ環境要因。カウンタは
-    約 30 秒ごとに再検出するため、ドライバー更新後は再起動なしで反映される）
+  - GPU 使用率は PDH `GPU Engine` カウンタ、NPU も同じ `GPU Engine` カウンタ
+    から取得 (Windows 11 では NPU が Compute Accelerator として同じカウンタに
+    載るため、インスタンス名の LUID で GPU/NPU を分離: 3D/Copy/Video 系
+    エンジンを持つ LUID = GPU、compute のみの LUID = NPU。本家タスク
+    マネージャーと同じ判定)。専用の `NPU Engine` カウンタがある環境では
+    そちらを優先する。NPU デバイス自体は SetupAPI (ComputeAccelerator
+    クラス) で検出し、カウンタ未提供の環境では「搭載済み (使用率カウンタ
+    未提供)」と表示する (`npu_device=true` / `counter=false` の環境でも
+    GPU Engine 側から使用率を取得できる)
   - 文言・レイアウトは本家 taskmgr.exe から抽出した日本語リソースに準拠
 - **プロセス別ネットワーク使用量** — ETW (Microsoft-Windows-Kernel-Network) による
   リアルタイム計測。TCP/UDP の送受信を PID 別に集計
