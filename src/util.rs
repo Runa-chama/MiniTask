@@ -142,9 +142,9 @@ pub struct GraphStyle {
 
 /// 折れ線グラフの共通描画処理 (矩形内に曲線を描く。塗りつぶしなし)。
 ///
-/// タスクマネージャーと同じ挙動: サンプル数が最大に満たない間は
-/// 左端から 1 サンプル = 幅/最大サンプル数 ずつ伸びていき、
-/// 右側は空いたままになる (全体に引き伸ばさない)。
+/// タスクマネージャーと同じ挙動: 最新サンプルは常に右端にあり、
+/// 履歴は左へ流れていく。サンプルが溜まる間は右端から左へ線が伸び、
+/// 左端に到達した後は全体が左へスクロールする (全体に引き伸ばさない)。
 fn paint_curve(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -155,13 +155,12 @@ fn paint_curve(
     style: GraphStyle,
 ) {
     let n = values.len();
-    if n < 2 {
+    if n == 0 {
         return;
     }
     // アニメーション中は最新サンプルを「前の値 → 新しい値」へ位相に沿って
-    // 補間する。更新の瞬間に線が完成して飛び出すのを防ぎ、更新間隔に
-    // よらずなめらかに登場させる。
-    let eased_last = if style.phase > 0.0 {
+    // 補間する。更新の瞬間に線が完成して飛び出すのを防ぐ。
+    let eased_last = if style.phase > 0.0 && n >= 2 {
         let prev = values[n - 2];
         let cur = values[n - 1];
         let p = style.phase.clamp(0.0, 1.0);
@@ -172,21 +171,27 @@ fn paint_curve(
     };
     let inner_h = rect.height() - 4.0;
     let slot = (rect.width() - 4.0) / HISTORY_LEN.max(n) as f32;
-    let pts: Vec<Pos2> = values
-        .iter()
-        .enumerate()
-        .map(|(i, v)| {
-            let val = if i + 1 == n {
-                eased_last.unwrap_or(*v)
-            } else {
-                *v
-            };
-            // phase (0..1) だけ左へずらすことで、更新間隔の間も滑らかに流れる
-            let x = rect.left() + 2.0 + i as f32 * slot - style.phase * slot;
-            let y = rect.bottom() - 2.0 - (val / max).clamp(0.0, 1.0) * inner_h;
-            Pos2::new(x, y)
-        })
-        .collect();
+    let right_x = rect.right() - 2.0;
+    let to_y = |v: f32| rect.bottom() - 2.0 - (v / max).clamp(0.0, 1.0) * inner_h;
+
+    // 右端基準の配置: サンプル i は (n-1-i) + 1 + 位相 スロットだけ左にある。
+    // 1 スロット余分にずらすことで、最古サンプルが左端を完全に通過した
+    // タイミングで破棄され、次のサンプルが同じ座標に来るため、
+    // 左端での消滅も 1 サンプルも飛ばず連続に見える。
+    let mut pts: Vec<Pos2> = Vec::with_capacity(n + 1);
+    for (i, v) in values.iter().enumerate() {
+        let val = if i + 1 == n {
+            eased_last.unwrap_or(*v)
+        } else {
+            *v
+        };
+        let age = (n - 1 - i) as f32 + 1.0 + style.phase;
+        pts.push(Pos2::new(right_x - age * slot, to_y(val)));
+    }
+    // 先端 (現在 = 右端) まで常に線を延伸する。起動直後も右端の先端から
+    // 左へ伸びていくため、左端に到達するまで滑らかに成長する。
+    let tip_val = eased_last.unwrap_or(values[n - 1]);
+    pts.push(Pos2::new(right_x, to_y(tip_val)));
     let pts = if style.spline && pts.len() >= 3 {
         catmull_rom(&pts, 8)
     } else {

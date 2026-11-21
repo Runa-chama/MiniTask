@@ -737,7 +737,7 @@ impl eframe::App for MiniTaskApp {
             if self.last_hist_tick.elapsed() >= FAST_TICK {
                 self.fast_tick();
             }
-            ctx.request_repaint_after(Duration::from_millis(33));
+            ctx.request_repaint_after(Duration::from_millis(16));
         } else {
             ctx.request_repaint_after(interval.saturating_sub(elapsed));
         }
