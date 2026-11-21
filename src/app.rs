@@ -42,8 +42,13 @@ enum CpuGraphMode {
     PerCore,
 }
 
-/// デバイス (ディスク/GPU/NPU) ごとの履歴に 1 サンプル追加。
-fn push_device_hist(hists: &mut Vec<(String, VecDeque<f32>)>, id: &str, value: f32) {
+/// デバイス履歴に 1 サンプル追加。alpha < 1 のとき EMA 平滑化を行う。
+fn push_device_hist(
+    hists: &mut Vec<(String, VecDeque<f32>)>,
+    id: &str,
+    value: f32,
+    alpha: f32,
+) {
     let hist = match hists.iter_mut().find(|(k, _)| k == id) {
         Some((_, h)) => h,
         None => {
@@ -51,9 +56,18 @@ fn push_device_hist(hists: &mut Vec<(String, VecDeque<f32>)>, id: &str, value: f
             &mut hists.last_mut().unwrap().1
         }
     };
-    hist.push_back(value);
+    let smoothed = smooth_value(hist.back().copied(), value, alpha);
+    hist.push_back(smoothed);
     while hist.len() > HISTORY_LEN {
         hist.pop_front();
+    }
+}
+
+/// EMA 平滑化 (alpha = 1 なら生値)。更新間隔から時定数で alpha を決める。
+fn smooth_value(prev: Option<f32>, value: f32, alpha: f32) -> f32 {
+    match prev {
+        Some(p) if alpha < 1.0 => p + (value - p) * alpha,
+        _ => value,
     }
 }
 
@@ -352,28 +366,47 @@ impl MiniTaskApp {
             } else {
                 0.0
             };
-            self.cpu_hist.push_back(load.cpu);
-            self.mem_hist.push_back(mem_pct);
+            // アニメーション補間ONのときは、更新間隔に依存しない時定数 (2.5秒) で
+            // 値を平滑化し、更新ごとに線の向きがコロコロ変わるのを防ぐ
+            let alpha = if self.graph_animation {
+                (1.0 - (-self.interval / 2.5).exp()).clamp(0.01, 1.0)
+            } else {
+                1.0
+            };
+            self.cpu_hist
+                .push_back(smooth_value(self.cpu_hist.back().copied(), load.cpu, alpha));
+            self.mem_hist
+                .push_back(smooth_value(self.mem_hist.back().copied(), mem_pct, alpha));
 
             // 接続中のデバイスごとに履歴を更新
             for d in &load.disks {
-                push_device_hist(&mut self.disk_active_hist, &d.id, d.active_pct);
-                push_device_hist(&mut self.disk_read_hist, &d.id, d.read_bps as f32);
-                push_device_hist(&mut self.disk_write_hist, &d.id, d.write_bps as f32);
+                push_device_hist(&mut self.disk_active_hist, &d.id, d.active_pct, alpha);
+                push_device_hist(&mut self.disk_read_hist, &d.id, d.read_bps as f32, alpha);
+                push_device_hist(&mut self.disk_write_hist, &d.id, d.write_bps as f32, alpha);
             }
             for g in &load.gpus {
-                push_device_hist(&mut self.gpu_hist, &g.id, g.usage);
+                push_device_hist(&mut self.gpu_hist, &g.id, g.usage, alpha);
             }
             for n in &load.npus {
-                push_device_hist(&mut self.npu_hist, &n.id, n.usage);
+                push_device_hist(&mut self.npu_hist, &n.id, n.usage, alpha);
             }
             for a in &load.adapters {
-                push_device_hist(&mut self.net_recv_hist, &a.id, a.recv_bps as f32);
-                push_device_hist(&mut self.net_sent_hist, &a.id, a.sent_bps as f32);
+                push_device_hist(&mut self.net_recv_hist, &a.id, a.recv_bps as f32, alpha);
+                push_device_hist(&mut self.net_sent_hist, &a.id, a.sent_bps as f32, alpha);
             }
             // GPU/NPU の専用メモリ履歴 (第2グラフ)
-            self.gpu_mem_hist.push_back(load.gpu_dedicated as f32);
-            self.npu_mem_hist.push_back(load.npu_dedicated as f32);
+            let v = smooth_value(
+                self.gpu_mem_hist.back().copied(),
+                load.gpu_dedicated as f32,
+                alpha,
+            );
+            self.gpu_mem_hist.push_back(v);
+            let v = smooth_value(
+                self.npu_mem_hist.back().copied(),
+                load.npu_dedicated as f32,
+                alpha,
+            );
+            self.npu_mem_hist.push_back(v);
             while self.gpu_mem_hist.len() > HISTORY_LEN {
                 self.gpu_mem_hist.pop_front();
             }
@@ -400,7 +433,7 @@ impl MiniTaskApp {
 
             // エンジン種別ごとの履歴 (GPU/NPU の「グラフの変更」用)
             for (key, val) in load.gpu_engines.iter() {
-                push_device_hist(&mut self.gpu_engine_hist, key, *val);
+                push_device_hist(&mut self.gpu_engine_hist, key, *val, alpha);
             }
             let gpu_engine_keys: HashSet<&str> =
                 load.gpu_engines.iter().map(|(k, _)| k.as_str()).collect();
@@ -409,7 +442,7 @@ impl MiniTaskApp {
             // NPU はデバイス (LUID) ごとにエンジン履歴を分ける: キーは "LUID|engtype"
             for n in &load.npus {
                 for (key, val) in n.engines.iter() {
-                    push_device_hist(&mut self.npu_engine_hist, &format!("{}|{}", n.id, key), *val);
+                    push_device_hist(&mut self.npu_engine_hist, &format!("{}|{}", n.id, key), *val, alpha);
                 }
             }
             let npu_engine_keys: HashSet<String> = load
@@ -426,7 +459,8 @@ impl MiniTaskApp {
                 self.core_hist = vec![VecDeque::new(); self.load.core_usage.len()];
             }
             for (hist, val) in self.core_hist.iter_mut().zip(self.load.core_usage.iter()) {
-                hist.push_back(*val);
+                let smoothed = smooth_value(hist.back().copied(), *val, alpha);
+                hist.push_back(smoothed);
                 while hist.len() > HISTORY_LEN {
                     hist.pop_front();
                 }
