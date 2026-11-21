@@ -143,6 +143,7 @@ fn paint_curve(
     max: f32,
     color: Color32,
     stroke_width: f32,
+    phase: f32,
 ) {
     let n = values.len();
     if n < 2 {
@@ -154,11 +155,13 @@ fn paint_curve(
         .iter()
         .enumerate()
         .map(|(i, v)| {
-            let x = rect.left() + 2.0 + i as f32 * slot;
+            // phase (0..1) だけ左へずらすことで、更新間隔の間も滑らかに流れる
+            let x = rect.left() + 2.0 + i as f32 * slot - phase * slot;
             let y = rect.bottom() - 2.0 - (v / max).clamp(0.0, 1.0) * inner_h;
             Pos2::new(x, y)
         })
         .collect();
+    let painter = painter.with_clip_rect(rect);
     painter.add(egui::Shape::line(pts, egui::Stroke::new(stroke_width, color)));
 }
 
@@ -171,9 +174,10 @@ pub fn paint_dual_curve(
     max: f32,
     read_color: Color32,
     write_color: Color32,
+    phase: f32,
 ) {
-    paint_curve(painter, rect, read, max, read_color, 1.6);
-    paint_curve(painter, rect, write, max, write_color, 1.6);
+    paint_curve(painter, rect, read, max, read_color, 1.6, phase);
+    paint_curve(painter, rect, write, max, write_color, 1.6, phase);
 }
 
 /// 既に確保済みの矩形内に読み取り/書き込みグラフを描く。
@@ -185,8 +189,9 @@ pub fn paint_mini_dual_graph(
     max: f32,
     read_color: Color32,
     write_color: Color32,
+    phase: f32,
 ) {
-    paint_dual_curve(painter, rect, read, write, max, read_color, write_color);
+    paint_dual_curve(painter, rect, read, write, max, read_color, write_color, phase);
 }
 
 /// 2 本線の大きなグラフ。25/50/75% のグリッド線付き。
@@ -198,6 +203,7 @@ pub fn perf_dual_chart(
     read_color: Color32,
     write_color: Color32,
     size: Vec2,
+    phase: f32,
 ) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     if ui.is_rect_visible(rect) {
@@ -211,8 +217,8 @@ pub fn perf_dual_chart(
                 egui::Stroke::new(1.0, grid),
             );
         }
-        paint_curve(painter, rect, read, max, read_color, 2.0);
-        paint_curve(painter, rect, write, max, write_color, 2.0);
+        paint_curve(painter, rect, read, max, read_color, 2.0, phase);
+        paint_curve(painter, rect, write, max, write_color, 2.0, phase);
         let stamp = Color32::from_gray(110);
         let font = egui::FontId::proportional(10.0);
         painter.text(
@@ -260,8 +266,9 @@ pub fn paint_mini_graph(
     values: &VecDeque<f32>,
     max: f32,
     color: Color32,
+    phase: f32,
 ) {
-    paint_curve(painter, rect, values, max, color, 1.2);
+    paint_curve(painter, rect, values, max, color, 1.2, phase);
 }
 
 /// 大きな使用率グラフ (パフォーマンスタブ用)。25/50/75% のグリッド線付き。
@@ -272,6 +279,7 @@ pub fn perf_chart(
     max: f32,
     color: Color32,
     size: Vec2,
+    phase: f32,
 ) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     if ui.is_rect_visible(rect) {
@@ -286,7 +294,7 @@ pub fn perf_chart(
                 egui::Stroke::new(1.0, grid),
             );
         }
-        paint_curve(painter, rect, values, max, color, 2.0);
+        paint_curve(painter, rect, values, max, color, 2.0, phase);
         // 本家と同じスケール表示 (グラフ右上)
         painter.text(
             egui::pos2(rect.right() - 5.0, rect.top() + 2.0),

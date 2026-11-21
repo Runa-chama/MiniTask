@@ -239,6 +239,8 @@ pub struct MiniTaskApp {
     interval: f32,
     /// 「更新の速度」メニューによる一時停止中
     paused: bool,
+    /// グラフのなめらかなアニメーション補間 (更新の速度メニューから切替)
+    graph_animation: bool,
     /// パフォーマンス右側の詳細・余白の実測高さ (毎フレーム自動補正)
     perf_overhead: f32,
     last_refresh: Instant,
@@ -324,6 +326,7 @@ impl MiniTaskApp {
             ],
             interval: 1.0,
             paused: false,
+            graph_animation: false,
             perf_overhead: 360.0,
             last_refresh: Instant::now() - Duration::from_secs(10),
             confirm_kill: None,
@@ -596,7 +599,12 @@ impl eframe::App for MiniTaskApp {
         if elapsed >= interval && !self.paused {
             self.refresh();
         }
-        ctx.request_repaint_after(interval.saturating_sub(elapsed));
+        let repaint = if self.graph_animation && !self.paused {
+            Duration::from_millis(33)
+        } else {
+            interval.saturating_sub(elapsed)
+        };
+        ctx.request_repaint_after(repaint);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -763,12 +771,13 @@ impl MiniTaskApp {
         hist: &VecDeque<f32>,
         color: Color32,
         selected: bool,
+        phase: f32,
     ) -> egui::Response {
         let width = ui.available_width().clamp(80.0, 300.0);
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 84.0), egui::Sense::click());
         Self::paint_nav_background(ui, rect, resp.hovered(), selected, color, 84.0);
         let graph_rect = Self::nav_graph_rect(rect);
-        util::paint_mini_graph(ui.painter(), graph_rect, hist, 100.0, color);
+        util::paint_mini_graph(ui.painter(), graph_rect, hist, 100.0, color, phase);
         Self::paint_nav_text(ui, rect, label, detail, value, color);
         resp
     }
@@ -787,12 +796,13 @@ impl MiniTaskApp {
         read_color: Color32,
         write_color: Color32,
         selected: bool,
+        phase: f32,
     ) -> egui::Response {
         let width = ui.available_width().clamp(80.0, 300.0);
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 84.0), egui::Sense::click());
         Self::paint_nav_background(ui, rect, resp.hovered(), selected, color, 84.0);
         let graph_rect = Self::nav_graph_rect(rect);
-        util::paint_mini_dual_graph(ui.painter(), graph_rect, read, write, max, read_color, write_color);
+        util::paint_mini_dual_graph(ui.painter(), graph_rect, read, write, max, read_color, write_color, phase);
         Self::paint_nav_text(ui, rect, label, detail, value, color);
         resp
     }
@@ -925,14 +935,28 @@ impl MiniTaskApp {
                 ui.close();
             }
         }
-        Self::update_speed_menu(ui, &mut self.interval, &mut self.paused);
+        Self::update_speed_menu(
+            ui,
+            &mut self.interval,
+            &mut self.paused,
+            &mut self.graph_animation,
+        );
     }
 
     /// 本家の「更新の速度」メニュー (高/通常/低/一時停止)。
-    fn update_speed_menu(ui: &mut egui::Ui, interval: &mut f32, paused: &mut bool) {
+    fn update_speed_menu(
+        ui: &mut egui::Ui,
+        interval: &mut f32,
+        paused: &mut bool,
+        animation: &mut bool,
+    ) {
         ui.separator();
         ui.label(RichText::new("更新の速度").strong());
-        for (label, value) in [("高", 0.5_f32), ("通常", 1.0), ("低", 5.0)] {
+        for (label, value) in [
+            ("0.5 秒", 0.5_f32),
+            ("1 秒 (通常)", 1.0),
+            ("5 秒 (低)", 5.0),
+        ] {
             let mark = if !*paused && (*interval - value).abs() < 0.01 {
                 "✓ "
             } else {
@@ -949,6 +973,8 @@ impl MiniTaskApp {
             *paused = !*paused;
             ui.close();
         }
+        ui.separator();
+        ui.checkbox(animation, "なめらかなアニメーション補間");
     }
 
     /// GPU / NPU グラフの右クリックメニュー (本家の「グラフの変更」と同じ方式:
@@ -960,6 +986,7 @@ impl MiniTaskApp {
         npu: bool,
         interval: &mut f32,
         paused: &mut bool,
+        animation: &mut bool,
     ) {
         ui.label(RichText::new("グラフの変更").strong());
         ui.separator();
@@ -980,12 +1007,18 @@ impl MiniTaskApp {
                 ui.close();
             }
         }
-        Self::update_speed_menu(ui, interval, paused);
+        Self::update_speed_menu(ui, interval, paused, animation);
     }
 
     fn performance_tab(&mut self, ui: &mut egui::Ui) {
         let mem_pct = if self.load.mem_total > 0 {
             self.load.mem_used as f32 / self.load.mem_total as f32 * 100.0
+        } else {
+            0.0
+        };
+        // なめらか補間の位相 (0..1): 更新時刻から次の更新までの進み具合
+        let phase = if self.graph_animation && !self.paused {
+            (self.last_refresh.elapsed().as_secs_f32() / self.interval.max(0.05)).clamp(0.0, 1.0)
         } else {
             0.0
         };
@@ -1081,6 +1114,7 @@ impl MiniTaskApp {
                         hist,
                         color,
                         self.perf_sel == sel,
+                        phase,
                     );
                     if resp.clicked() {
                         clicked_sel = Some(sel);
@@ -1105,6 +1139,7 @@ impl MiniTaskApp {
                         CPU_COLOR,
                         ROM_COLOR,
                         self.perf_sel == sel,
+                        phase,
                     );
                     if resp.clicked() {
                         clicked_sel = Some(sel);
@@ -1130,6 +1165,7 @@ impl MiniTaskApp {
                         NET_RECV_COLOR,
                         NET_SEND_COLOR,
                         self.perf_sel == sel,
+                        phase,
                     );
                     if resp.clicked() {
                         clicked_sel = Some(sel);
@@ -1144,6 +1180,7 @@ impl MiniTaskApp {
                         hist,
                         color,
                         self.perf_sel == sel,
+                        phase,
                     );
                     if resp.clicked() {
                         clicked_sel = Some(sel);
@@ -1382,6 +1419,7 @@ impl MiniTaskApp {
                         &self.core_hist[idx],
                         100.0,
                         CPU_COLOR,
+                        phase,
                     );
                 }
                 // 論理プロセッサ表示でも右クリックで「全体的な使用率」に戻せる
@@ -1398,8 +1436,15 @@ impl MiniTaskApp {
                         .color(Color32::from_gray(150)),
                 );
             });
-            util::perf_chart(ui, &ah, 100.0, MEM_COLOR, Vec2::new(gw, main_h))
-                .context_menu(|ui| Self::update_speed_menu(ui, &mut self.interval, &mut self.paused));
+            util::perf_chart(ui, &ah, 100.0, MEM_COLOR, Vec2::new(gw, main_h), phase)
+                .context_menu(|ui| {
+                    Self::update_speed_menu(
+                        ui,
+                        &mut self.interval,
+                        &mut self.paused,
+                        &mut self.graph_animation,
+                    )
+                });
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label(
@@ -1423,6 +1468,7 @@ impl MiniTaskApp {
                 CPU_COLOR,
                 ROM_COLOR,
                 Vec2::new(gw, (gh - main_h - 12.0).max(60.0)),
+                phase,
             );
         } else if let Some((rh, sh, max)) = net_dual {
             // ネットワーク: 送信(黄) / 受信(緑) の 2 本線 (本家と同じ凡例付き)
@@ -1448,14 +1494,22 @@ impl MiniTaskApp {
                 NET_RECV_COLOR,
                 NET_SEND_COLOR,
                 Vec2::new(gw, gh),
+                phase,
             )
-            .context_menu(|ui| Self::update_speed_menu(ui, &mut self.interval, &mut self.paused));
+            .context_menu(|ui| {
+                Self::update_speed_menu(
+                    ui,
+                    &mut self.interval,
+                    &mut self.paused,
+                    &mut self.graph_animation,
+                )
+            });
             ui.horizontal(|ui| {
                 ui.label(RichText::new("■ 送信").size(11.0).color(NET_SEND_COLOR));
                 ui.label(RichText::new("■ 受信").size(11.0).color(NET_RECV_COLOR));
             });
         } else {
-            let resp = util::perf_chart(ui, hist, 100.0, color, Vec2::new(gw, gh));
+            let resp = util::perf_chart(ui, hist, 100.0, color, Vec2::new(gw, gh), phase);
             match &self.perf_sel {
                 PerfSel::Cpu => {
                     resp.on_hover_text("右クリックでグラフの変更")
@@ -1472,9 +1526,18 @@ impl MiniTaskApp {
                     let sel = &mut self.gpu_sel;
                     let interval = &mut self.interval;
                     let paused = &mut self.paused;
+                    let animation = &mut self.graph_animation;
                     resp.on_hover_text("右クリックでグラフの変更 (エンジン種別)")
                         .context_menu(move |ui| {
-                            Self::engine_graph_menu(ui, sel, &engines, false, interval, paused)
+                            Self::engine_graph_menu(
+                                ui,
+                                sel,
+                                &engines,
+                                false,
+                                interval,
+                                paused,
+                                animation,
+                            )
                         });
                     // 本家 Win11 と同じ「専用 GPU メモリ」の第2グラフ
                     let mem_hist = self.gpu_mem_hist.clone();
@@ -1502,6 +1565,7 @@ impl MiniTaskApp {
                         GPU_COLOR,
                         GPU_COLOR,
                         Vec2::new(gw, (gh * 0.3).max(50.0)),
+                        phase,
                     );
                 }
                 PerfSel::Npu(id) => {
@@ -1516,9 +1580,18 @@ impl MiniTaskApp {
                         let sel = &mut self.npu_sel;
                         let interval = &mut self.interval;
                         let paused = &mut self.paused;
+                        let animation = &mut self.graph_animation;
                         resp.on_hover_text("右クリックでグラフの変更 (エンジン種別)")
                             .context_menu(move |ui| {
-                                Self::engine_graph_menu(ui, sel, &engines, true, interval, paused)
+                                Self::engine_graph_menu(
+                                    ui,
+                                    sel,
+                                    &engines,
+                                    true,
+                                    interval,
+                                    paused,
+                                    animation,
+                                )
                             });
                     }
                     // NPU 専用メモリの第2グラフ
@@ -1540,11 +1613,17 @@ impl MiniTaskApp {
                         NPU_COLOR,
                         NPU_COLOR,
                         Vec2::new(gw, (gh * 0.3).max(50.0)),
+                        phase,
                     );
                 }
                 _ => {
                     resp.context_menu(|ui| {
-                        Self::update_speed_menu(ui, &mut self.interval, &mut self.paused)
+                        Self::update_speed_menu(
+                            ui,
+                            &mut self.interval,
+                            &mut self.paused,
+                            &mut self.graph_animation,
+                        )
                     });
                 }
             }
