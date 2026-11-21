@@ -3,13 +3,15 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use sysinfo::{Disks, Gpus, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{CpuRefreshKind, Disks, Gpus, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree, LUID};
 use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows_sys::Win32::Security::{
     LookupAccountSidW, LookupPrivilegeValueW, AdjustTokenPrivileges, LUID_AND_ATTRIBUTES,
     SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
+use windows_sys::Win32::System::ProcessStatus::{GetPerformanceInfo, PERFORMANCE_INFORMATION};
+use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, TerminateProcess, PROCESS_TERMINATE,
 };
@@ -37,7 +39,7 @@ pub struct ProcRow {
 }
 
 /// システム全体の負荷。
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SysLoad {
     pub cpu: f32, // 0..100
     pub mem_used: u64,
@@ -46,6 +48,26 @@ pub struct SysLoad {
     pub gpu: f32, // GPU 使用率 0..100
     pub npu: f32, // NPU 使用率 0..100
     pub npu_available: bool,
+
+    // --- パフォーマンスタブ向けの詳細情報 ---
+    pub cpu_brand: String,
+    pub cpu_freq_mhz: u64,
+    pub logical_cores: usize,
+    pub mem_available: u64,
+    pub commit_used: u64,
+    pub commit_limit: u64,
+    pub cached: u64,
+    pub rom_read: u64, // bytes/sec
+    pub rom_written: u64,
+    pub rom_free: u64,
+    pub rom_total: u64,
+    pub gpu_model: String,
+    pub gpu_mem_used: u64,
+    pub gpu_mem_total: u64,
+    pub processes: u32,
+    pub threads: u32,
+    pub handles: u32,
+    pub uptime_secs: u64,
 }
 
 fn refresh_kind() -> ProcessRefreshKind {
@@ -73,7 +95,8 @@ pub struct ProcCollector {
 impl ProcCollector {
     pub fn new() -> Result<Self, String> {
         let mut sys = System::new().map_err(|e| format!("システム情報の初期化に失敗: {e}"))?;
-        sys.refresh_cpu_usage();
+        // ブランド名・周波数も取得しておく
+        sys.refresh_cpu_specifics(CpuRefreshKind::everything());
         let cpu_count = sys.cpus().len().max(1) as f32;
         sys.refresh_memory();
         sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
@@ -93,29 +116,42 @@ impl ProcCollector {
 
     /// 全プロセスを再取得し、前回からの差分で速度系を計算する。
     pub fn refresh(&mut self) -> (Vec<ProcRow>, SysLoad) {
-        self.sys.refresh_cpu_usage();
+        self.sys.refresh_cpu_specifics(
+            CpuRefreshKind::nothing().with_usage().with_frequency(),
+        );
         self.sys.refresh_memory();
         self.sys
             .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
 
-        // ストレージ使用率: C: ドライブを優先、なければ最初のディスク
+        let dt = self.prev_time.elapsed().as_secs_f64().max(0.05);
+        self.prev_time = Instant::now();
+
+        // --- ストレージ (ROM): C: ドライブを優先、なければ最初のディスク ---
         self.disks.refresh(false);
-        let rom = self
+        let (rom, rom_read, rom_written, rom_free, rom_total) = self
             .disks
             .iter()
             .find(|d| d.mount_point().to_string_lossy().starts_with("C:"))
             .or_else(|| self.disks.iter().next())
             .map(|d| {
                 let total = d.total_space();
-                if total > 0 {
+                let pct = if total > 0 {
                     ((total - d.available_space().min(total)) as f64 / total as f64 * 100.0) as f32
                 } else {
                     0.0
-                }
+                };
+                let du = d.usage();
+                (
+                    pct,
+                    (du.read_bytes as f64 / dt) as u64,
+                    (du.written_bytes as f64 / dt) as u64,
+                    d.available_space(),
+                    total,
+                )
             })
-            .unwrap_or(0.0);
+            .unwrap_or((0.0, 0, 0, 0, 0));
 
-        // GPU 使用率: 複数 GPU のうち最大値
+        // --- GPU: 最も使用率の高い GPU を主 GPU として採用 ---
         self.gpus.refresh(false);
         let gpu = self
             .gpus
@@ -123,10 +159,62 @@ impl ProcCollector {
             .filter_map(|g| g.usage())
             .fold(0.0_f32, f32::max)
             .clamp(0.0, 100.0);
+        let primary_gpu = self
+            .gpus
+            .iter()
+            .find(|g| g.usage().is_some())
+            .or_else(|| self.gpus.iter().next());
+        let gpu_model = primary_gpu
+            .and_then(|g| g.model())
+            .unwrap_or("不明")
+            .to_owned();
+        let gpu_mem_used = primary_gpu.and_then(|g| g.used_memory()).unwrap_or(0);
+        let gpu_mem_total = primary_gpu.and_then(|g| g.total_memory()).unwrap_or(0);
 
-        // NPU 使用率 (非搭載機では 0)
+        // --- NPU (非搭載機では 0) ---
         let npu_available = self.npu.available;
         let npu = self.npu.usage().unwrap_or(0.0);
+
+        // --- CPU 詳細 ---
+        let cpu_brand = self
+            .sys
+            .cpus()
+            .first()
+            .map(|c| c.brand().to_owned())
+            .unwrap_or_default();
+        let cpu_freq_mhz = self
+            .sys
+            .cpus()
+            .iter()
+            .map(sysinfo::Cpu::frequency)
+            .max()
+            .unwrap_or(0);
+        let logical_cores = self.sys.cpus().len();
+
+        // --- システム全体の統計 (プロセス/スレッド/ハンドル/コミット) ---
+        let (mem_available, commit_used, commit_limit, cached, processes, threads, handles) =
+            unsafe {
+                let size = std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32;
+                let mut pi = PERFORMANCE_INFORMATION {
+                    cb: size,
+                    ..Default::default()
+                };
+                if GetPerformanceInfo(&mut pi, size) != 0 {
+                    let ps = pi.PageSize as u64;
+                    (
+                        pi.PhysicalAvailable as u64 * ps,
+                        pi.CommitTotal as u64 * ps,
+                        pi.CommitLimit as u64 * ps,
+                        pi.SystemCache as u64 * ps,
+                        pi.ProcessCount,
+                        pi.ThreadCount,
+                        pi.HandleCount,
+                    )
+                } else {
+                    (0, 0, 0, 0, 0, 0, 0)
+                }
+            };
+        let uptime_secs = unsafe { GetTickCount64() / 1000 };
 
         let load = SysLoad {
             cpu: self.sys.global_cpu_usage(),
@@ -136,11 +224,27 @@ impl ProcCollector {
             gpu,
             npu,
             npu_available,
+            cpu_brand,
+            cpu_freq_mhz,
+            logical_cores,
+            mem_available,
+            commit_used,
+            commit_limit,
+            cached,
+            rom_read,
+            rom_written,
+            rom_free,
+            rom_total,
+            gpu_model,
+            gpu_mem_used,
+            gpu_mem_total,
+            processes,
+            threads,
+            handles,
+            uptime_secs,
         };
 
         let now_net = net::snapshot();
-        let dt = self.prev_time.elapsed().as_secs_f64().max(0.05);
-        self.prev_time = Instant::now();
 
         let mut rows = Vec::with_capacity(self.sys.processes().len());
         let mut live = HashSet::with_capacity(self.sys.processes().len());

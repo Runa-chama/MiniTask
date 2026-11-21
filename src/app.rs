@@ -22,6 +22,16 @@ enum Tab {
     Startup,
 }
 
+/// パフォーマンスタブで選択中のメトリクス。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PerfSel {
+    Cpu,
+    Ram,
+    Rom,
+    Gpu,
+    Npu,
+}
+
 /// プロセス一覧の列。タブの右クリックメニューで表示/非表示を切り替える。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ColumnKind {
@@ -142,6 +152,7 @@ pub struct MiniTaskApp {
     net_err: Option<String>,
 
     tab: Tab,
+    perf_sel: PerfSel,
     search: String,
     sort_col: ColumnKind,
     sort_desc: bool,
@@ -184,6 +195,7 @@ impl MiniTaskApp {
             } else {
                 Tab::Processes
             },
+            perf_sel: PerfSel::Cpu,
             search: String::new(),
             sort_col: ColumnKind::Cpu,
             sort_desc: true,
@@ -206,17 +218,17 @@ impl MiniTaskApp {
         if let Some(collector) = &mut self.collector {
             let (rows, load) = collector.refresh();
             self.rows = rows;
-            self.load = load;
-            self.cpu_hist.push_back(load.cpu);
             let mem_pct = if load.mem_total > 0 {
                 load.mem_used as f32 / load.mem_total as f32 * 100.0
             } else {
                 0.0
             };
+            self.cpu_hist.push_back(load.cpu);
             self.mem_hist.push_back(mem_pct);
             self.rom_hist.push_back(load.rom);
             self.gpu_hist.push_back(load.gpu);
             self.npu_hist.push_back(load.npu);
+            self.load = load;
             for hist in [
                 &mut self.cpu_hist,
                 &mut self.mem_hist,
@@ -502,94 +514,277 @@ impl MiniTaskApp {
             });
     }
 
-    /// 1 メトリクスのグラフ行 (左: 値 / 右: 折れ線)。
-    fn perf_graph(
+    /// パフォーマンスタブの左ナビ 1 項目 (クリックでメトリクス選択)。
+    fn perf_nav_item(
         ui: &mut egui::Ui,
-        title: &str,
-        value: f32,
-        hist: &VecDeque<f32>,
+        label: &str,
+        pct: f32,
         color: Color32,
-        subtitle: &str,
-    ) {
-        ui.add_space(4.0);
-        ui.group(|ui| {
-            ui.horizontal_top(|ui| {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(180.0, 0.0),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.label(RichText::new(title).strong().size(15.0).color(color));
-                        ui.label(
-                            RichText::new(format!("{value:.0}%"))
-                                .strong()
-                                .monospace()
-                                .size(27.0)
-                                .color(color),
-                        );
-                        ui.label(
-                            RichText::new(subtitle)
-                                .small()
-                                .color(Color32::from_gray(140)),
-                        );
-                    },
-                );
-                let width = (ui.available_width() - 8.0).max(120.0);
-                util::sparkline(ui, hist, 100.0, color, Vec2::new(width, 84.0));
+        selected: bool,
+    ) -> egui::Response {
+        let width = ui.available_width().clamp(80.0, 300.0);
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 46.0), egui::Sense::click());
+        let bg = if selected {
+            Color32::from_rgb(45, 49, 60)
+        } else if resp.hovered() {
+            Color32::from_rgb(38, 42, 52)
+        } else {
+            Color32::TRANSPARENT
+        };
+        if bg != Color32::TRANSPARENT {
+            ui.painter().rect_filled(rect, 5.0, bg);
+        }
+        if selected {
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(rect.left(), rect.top() + 10.0),
+                egui::pos2(rect.left() + 3.5, rect.bottom() - 10.0),
+            );
+            ui.painter().rect_filled(bar, 1.5, color);
+        }
+        ui.painter().text(
+            egui::pos2(rect.left() + 14.0, rect.top() + 7.0),
+            egui::Align2::LEFT_TOP,
+            label,
+            egui::FontId::proportional(14.0),
+            ui.visuals().text_color(),
+        );
+        ui.painter().text(
+            egui::pos2(rect.right() - 10.0, rect.top() + 5.0),
+            egui::Align2::RIGHT_TOP,
+            format!("{pct:.0}%"),
+            egui::FontId::proportional(17.0),
+            color,
+        );
+        ui.add_space(2.0);
+        resp
+    }
+
+    /// 詳細情報の 1 行 (ラベル左・値右)。
+    fn detail_row(ui: &mut egui::Ui, label: &str, value: impl Into<String>) {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(label)
+                    .size(12.0)
+                    .color(Color32::from_gray(150)),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(value).size(12.0).monospace());
             });
         });
     }
 
     fn performance_tab(&mut self, ui: &mut egui::Ui) {
+        let mem_pct = if self.load.mem_total > 0 {
+            self.load.mem_used as f32 / self.load.mem_total as f32 * 100.0
+        } else {
+            0.0
+        };
+
+        // --- 左ナビ: メトリクス選択 (タスクマネージャー風) ---
+        egui::Panel::left("perf_nav")
+            .exact_size(190.0)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                let items = [
+                    (PerfSel::Cpu, "CPU", self.load.cpu, CPU_COLOR),
+                    (PerfSel::Ram, "メモリ", mem_pct, MEM_COLOR),
+                    (PerfSel::Rom, "ROM (C:)", self.load.rom, ROM_COLOR),
+                    (PerfSel::Gpu, "GPU", self.load.gpu, GPU_COLOR),
+                    (PerfSel::Npu, "NPU", self.load.npu, NPU_COLOR),
+                ];
+                for (sel, label, pct, color) in items {
+                    let resp = Self::perf_nav_item(ui, label, pct, color, self.perf_sel == sel);
+                    if resp.clicked() {
+                        self.perf_sel = sel;
+                    }
+                }
+            });
+
+        // --- 右サイド: 各メトリクスの簡易グラフ ---
+        egui::Panel::right("perf_minis")
+            .exact_size(215.0)
+            .show(ui, |ui| {
+                ui.add_space(2.0);
+                let w = ui.available_width().clamp(80.0, 240.0);
+                let minis: [(&str, &VecDeque<f32>, f32, Color32); 5] = [
+                    ("CPU", &self.cpu_hist, self.load.cpu, CPU_COLOR),
+                    ("メモリ", &self.mem_hist, mem_pct, MEM_COLOR),
+                    ("ROM (C:)", &self.rom_hist, self.load.rom, ROM_COLOR),
+                    ("GPU", &self.gpu_hist, self.load.gpu, GPU_COLOR),
+                    ("NPU", &self.npu_hist, self.load.npu, NPU_COLOR),
+                ];
+                for (name, hist, pct, color) in minis {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(name).size(12.0).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!("{pct:.0}%"))
+                                    .size(12.0)
+                                    .monospace()
+                                    .color(color),
+                            );
+                        });
+                    });
+                    util::sparkline(ui, hist, 100.0, color, Vec2::new(w, 36.0));
+                    ui.add_space(7.0);
+                }
+            });
+
+        // --- 中央: 選択中メトリクスの大きなグラフと詳細 ---
+        let (title, subtitle, value, hist, color) = match self.perf_sel {
+            PerfSel::Cpu => (
+                "CPU",
+                if self.load.cpu_brand.is_empty() {
+                    "プロセッサ".to_owned()
+                } else {
+                    self.load.cpu_brand.clone()
+                },
+                format!("{:.0}%", self.load.cpu),
+                &self.cpu_hist,
+                CPU_COLOR,
+            ),
+            PerfSel::Ram => (
+                "メモリ",
+                "物理メモリ (RAM)".to_owned(),
+                format!("{mem_pct:.0}%"),
+                &self.mem_hist,
+                MEM_COLOR,
+            ),
+            PerfSel::Rom => (
+                "ROM (ストレージ)",
+                "C: ドライブ".to_owned(),
+                format!("{:.0}%", self.load.rom),
+                &self.rom_hist,
+                ROM_COLOR,
+            ),
+            PerfSel::Gpu => (
+                "GPU",
+                self.load.gpu_model.clone(),
+                format!("{:.0}%", self.load.gpu),
+                &self.gpu_hist,
+                GPU_COLOR,
+            ),
+            PerfSel::Npu => (
+                "NPU",
+                if self.load.npu_available {
+                    "NPU エンジン".to_owned()
+                } else {
+                    "NPU 非搭載 / 取得不可".to_owned()
+                },
+                format!("{:.0}%", self.load.npu),
+                &self.npu_hist,
+                NPU_COLOR,
+            ),
+        };
+
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("システム全体の使用率").strong());
+            ui.vertical(|ui| {
+                ui.label(RichText::new(title).size(22.0).strong().color(color));
+                ui.label(
+                    RichText::new(subtitle)
+                        .size(12.0)
+                        .color(Color32::from_gray(140)),
+                );
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    RichText::new("過去 120 サンプル / 0〜100%")
-                        .size(12.0)
-                        .color(Color32::from_gray(120)),
+                    RichText::new(value)
+                        .size(32.0)
+                        .strong()
+                        .monospace()
+                        .color(color),
                 );
             });
         });
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            let mem_pct = if self.load.mem_total > 0 {
-                self.load.mem_used as f32 / self.load.mem_total as f32 * 100.0
-            } else {
-                0.0
-            };
-            let total_gb = self.load.mem_total as f64 / (1024.0 * 1024.0 * 1024.0);
-            let used_gb = self.load.mem_used as f64 / (1024.0 * 1024.0 * 1024.0);
+        ui.add_space(4.0);
+        let gh = (ui.available_height() * 0.56).clamp(140.0, 340.0);
+        let gw = ui.available_width().clamp(200.0, 4000.0);
+        util::perf_chart(ui, hist, 100.0, color, Vec2::new(gw, gh));
+        ui.add_space(6.0);
+        ui.separator();
 
-            Self::perf_graph(ui, "CPU", self.load.cpu, &self.cpu_hist, CPU_COLOR, "プロセッサ");
-            Self::perf_graph(
-                ui,
-                "RAM (メモリ)",
-                mem_pct,
-                &self.mem_hist,
-                MEM_COLOR,
-                &format!("{used_gb:.1} / {total_gb:.1} GB"),
-            );
-            Self::perf_graph(
-                ui,
-                "ROM (ストレージ)",
-                self.load.rom,
-                &self.rom_hist,
-                ROM_COLOR,
-                "C: ドライブ使用率",
-            );
-            Self::perf_graph(
-                ui,
-                "GPU",
-                self.load.gpu,
-                &self.gpu_hist,
-                GPU_COLOR,
-                "グラフィックエンジン",
-            );
-            let npu_sub = if self.load.npu_available {
-                "NPU エンジン"
-            } else {
-                "NPU 非搭載 / 取得不可"
-            };
-            Self::perf_graph(ui, "NPU", self.load.npu, &self.npu_hist, NPU_COLOR, npu_sub);
+        // 詳細情報 (2 列)
+        let d = &self.load;
+        let gb = util::fmt_bytes;
+        ui.columns(2, |cols| {
+            let (l, rest) = cols.split_first_mut().unwrap();
+            let r = rest.first_mut().unwrap();
+            l.vertical(|ui| match self.perf_sel {
+                PerfSel::Cpu => {
+                    Self::detail_row(ui, "利用率", format!("{:.1}%", d.cpu));
+                    Self::detail_row(
+                        ui,
+                        "速度",
+                        format!("{:.2} GHz", d.cpu_freq_mhz as f64 / 1000.0),
+                    );
+                    Self::detail_row(ui, "プロセス", d.processes.to_string());
+                    Self::detail_row(ui, "ハンドル", d.handles.to_string());
+                    Self::detail_row(ui, "論理プロセッサ", d.logical_cores.to_string());
+                }
+                PerfSel::Ram => {
+                    Self::detail_row(ui, "使用中", gb(d.mem_used));
+                    Self::detail_row(ui, "利用可能", gb(d.mem_available));
+                    Self::detail_row(
+                        ui,
+                        "コミット済み",
+                        format!("{} / {}", gb(d.commit_used), gb(d.commit_limit)),
+                    );
+                    Self::detail_row(ui, "キャッシュ済み", gb(d.cached));
+                }
+                PerfSel::Rom => {
+                    Self::detail_row(ui, "利用率", format!("{:.1}%", d.rom));
+                    Self::detail_row(
+                        ui,
+                        "容量",
+                        format!("{} / {}", gb(d.rom_total - d.rom_free), gb(d.rom_total)),
+                    );
+                    Self::detail_row(ui, "空き容量", gb(d.rom_free));
+                    Self::detail_row(ui, "読み取り速度", util::fmt_rate(d.rom_read));
+                }
+                PerfSel::Gpu => {
+                    Self::detail_row(ui, "使用率", format!("{:.1}%", d.gpu));
+                    Self::detail_row(ui, "ビデオメモリ使用", gb(d.gpu_mem_used));
+                    Self::detail_row(ui, "ビデオメモリ合計", gb(d.gpu_mem_total));
+                }
+                PerfSel::Npu => {
+                    Self::detail_row(ui, "使用率", format!("{:.1}%", d.npu));
+                    Self::detail_row(
+                        ui,
+                        "状態",
+                        if d.npu_available { "計測中" } else { "取得不可" },
+                    );
+                }
+            });
+            r.vertical(|ui| match self.perf_sel {
+                PerfSel::Cpu => {
+                    Self::detail_row(ui, "スレッド", d.threads.to_string());
+                    let s = d.uptime_secs;
+                    Self::detail_row(
+                        ui,
+                        "稼働時間",
+                        format!("{}:{:02}:{:02}:{:02}", s / 86400, s / 3600 % 24, s / 60 % 60, s % 60),
+                    );
+                    Self::detail_row(ui, "更新間隔", format!("{} 秒", self.interval));
+                }
+                PerfSel::Ram => {
+                    Self::detail_row(ui, "合計 (物理)", gb(d.mem_total));
+                    Self::detail_row(ui, "プロセス数", d.processes.to_string());
+                }
+                PerfSel::Rom => {
+                    Self::detail_row(ui, "書き込み速度", util::fmt_rate(d.rom_written));
+                }
+                PerfSel::Gpu => {
+                    Self::detail_row(ui, "モデル", d.gpu_model.clone());
+                }
+                PerfSel::Npu => {
+                    Self::detail_row(
+                        ui,
+                        "カウンタ",
+                        if d.npu_available { "NPU Engine" } else { "—" },
+                    );
+                }
+            });
         });
     }
 

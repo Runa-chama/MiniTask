@@ -163,6 +163,54 @@ pub fn sparkline(
     resp
 }
 
+/// 大きな使用率グラフ (パフォーマンスタブ用)。25/50/75% のグリッド線付き。
+pub fn perf_chart(
+    ui: &mut egui::Ui,
+    values: &VecDeque<f32>,
+    max: f32,
+    color: Color32,
+    size: Vec2,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        painter.rect_filled(rect, 6.0, ui.visuals().extreme_bg_color);
+        // グリッド線
+        let grid = Color32::from_gray(45);
+        for f in [0.25, 0.5, 0.75] {
+            let y = rect.bottom() - 2.0 - f * (rect.height() - 4.0);
+            painter.line_segment(
+                [Pos2::new(rect.left() + 2.0, y), Pos2::new(rect.right() - 2.0, y)],
+                egui::Stroke::new(1.0, grid),
+            );
+        }
+        let n = values.len();
+        if n >= 2 {
+            let inner_h = rect.height() - 4.0;
+            let pts: Vec<Pos2> = values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let x = rect.left() + 2.0 + (i as f32 / (n - 1) as f32) * (rect.width() - 4.0);
+                    let y = rect.bottom() - 2.0 - (v / max).clamp(0.0, 1.0) * inner_h;
+                    Pos2::new(x, y)
+                })
+                .collect();
+            let mut fill = pts.clone();
+            fill.push(Pos2::new(rect.right() - 2.0, rect.bottom() - 2.0));
+            fill.push(Pos2::new(rect.left() + 2.0, rect.bottom() - 2.0));
+            painter.add(egui::epaint::PathShape {
+                points: fill,
+                closed: true,
+                fill: color.gamma_multiply(0.22),
+                stroke: egui::epaint::PathStroke::NONE,
+            });
+            painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0, color)));
+        }
+    }
+    resp
+}
+
 /// 数値セルを右揃え・等幅で表示。
 pub fn num_cell(ui: &mut egui::Ui, text: impl Into<String>, color: Option<Color32>) {
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
