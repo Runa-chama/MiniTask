@@ -107,6 +107,12 @@ impl ProcCollector {
         let mut sys = System::new().map_err(|e| format!("システム情報の初期化に失敗: {e}"))?;
         // ブランド名・周波数も取得しておく
         sys.refresh_cpu_specifics(CpuRefreshKind::everything());
+        // PDH 使用率カウンタは初回収集時点では基準値がないため異常値になる。
+        // 少し待って 2 度目の収集まで行い、最初の実サンプルが正しくなるようにする。
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        sys.refresh_cpu_specifics(
+            CpuRefreshKind::nothing().with_usage().with_frequency(),
+        );
         let cpu_count = sys.cpus().len().max(1) as f32;
         sys.refresh_memory();
         sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());

@@ -127,7 +127,7 @@ pub fn fmt_time(unix_secs: u64) -> String {
 /// グラフ履歴の最大サンプル数。すべてのグラフで共有する。
 pub const HISTORY_LEN: usize = 120;
 
-/// 折れ線グラフの共通描画処理 (矩形内に曲線 + 塗りつぶし)。
+/// 折れ線グラフの共通描画処理 (矩形内に曲線を描く。塗りつぶしなし)。
 ///
 /// タスクマネージャーと同じ挙動: サンプル数が最大に満たない間は
 /// 左端から 1 サンプル = 幅/最大サンプル数 ずつ伸びていき、
@@ -139,7 +139,6 @@ fn paint_curve(
     max: f32,
     color: Color32,
     stroke_width: f32,
-    fill_alpha: f32,
 ) {
     let n = values.len();
     if n < 2 {
@@ -156,17 +155,6 @@ fn paint_curve(
             Pos2::new(x, y)
         })
         .collect();
-    // 曲線の下を薄く塗る (描画済みの区間のみ。右の空き部分には伸ばさない)
-    let last_x = pts[pts.len() - 1].x;
-    let mut fill = pts.clone();
-    fill.push(Pos2::new(last_x, rect.bottom() - 2.0));
-    fill.push(Pos2::new(rect.left() + 2.0, rect.bottom() - 2.0));
-    painter.add(egui::epaint::PathShape {
-        points: fill,
-        closed: true,
-        fill: color.gamma_multiply(fill_alpha),
-        stroke: egui::epaint::PathStroke::NONE,
-    });
     painter.add(egui::Shape::line(pts, egui::Stroke::new(stroke_width, color)));
 }
 
@@ -182,7 +170,7 @@ pub fn sparkline(
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
-        paint_curve(painter, rect, values, max, color, 1.5, 0.18);
+        paint_curve(painter, rect, values, max, color, 1.5);
     }
     resp
 }
@@ -195,7 +183,7 @@ pub fn paint_mini_graph(
     max: f32,
     color: Color32,
 ) {
-    paint_curve(painter, rect, values, max, color, 1.2, 0.25);
+    paint_curve(painter, rect, values, max, color, 1.2);
 }
 
 /// 大きな使用率グラフ (パフォーマンスタブ用)。25/50/75% のグリッド線付き。
@@ -220,7 +208,7 @@ pub fn perf_chart(
                 egui::Stroke::new(1.0, grid),
             );
         }
-        paint_curve(painter, rect, values, max, color, 2.0, 0.22);
+        paint_curve(painter, rect, values, max, color, 2.0);
     }
     resp
 }
