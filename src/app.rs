@@ -10,10 +10,9 @@ use crate::net::NetSession;
 use crate::process::{self, ProcCollector, ProcRow, SysLoad};
 use crate::startup::{self, StartupEntry};
 use crate::util::{
-    self, ACCENT, CPU_COLOR, DANGER, GPU_COLOR, MEM_COLOR, NPU_COLOR, ROM_COLOR, WARN,
+    self, ACCENT, CPU_COLOR, DANGER, GPU_COLOR, HISTORY_LEN, MEM_COLOR, NPU_COLOR, ROM_COLOR,
+    WARN,
 };
-
-const HISTORY_LEN: usize = 120;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {

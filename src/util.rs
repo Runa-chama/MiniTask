@@ -124,7 +124,14 @@ pub fn fmt_time(unix_secs: u64) -> String {
     }
 }
 
+/// グラフ履歴の最大サンプル数。すべてのグラフで共有する。
+pub const HISTORY_LEN: usize = 120;
+
 /// 折れ線グラフの共通描画処理 (矩形内に曲線 + 塗りつぶし)。
+///
+/// タスクマネージャーと同じ挙動: サンプル数が最大に満たない間は
+/// 左端から 1 サンプル = 幅/最大サンプル数 ずつ伸びていき、
+/// 右側は空いたままになる (全体に引き伸ばさない)。
 fn paint_curve(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -139,18 +146,20 @@ fn paint_curve(
         return;
     }
     let inner_h = rect.height() - 4.0;
+    let slot = (rect.width() - 4.0) / HISTORY_LEN.max(n) as f32;
     let pts: Vec<Pos2> = values
         .iter()
         .enumerate()
         .map(|(i, v)| {
-            let x = rect.left() + 2.0 + (i as f32 / (n - 1) as f32) * (rect.width() - 4.0);
+            let x = rect.left() + 2.0 + i as f32 * slot;
             let y = rect.bottom() - 2.0 - (v / max).clamp(0.0, 1.0) * inner_h;
             Pos2::new(x, y)
         })
         .collect();
-    // 曲線の下を薄く塗る
+    // 曲線の下を薄く塗る (描画済みの区間のみ。右の空き部分には伸ばさない)
+    let last_x = pts[pts.len() - 1].x;
     let mut fill = pts.clone();
-    fill.push(Pos2::new(rect.right() - 2.0, rect.bottom() - 2.0));
+    fill.push(Pos2::new(last_x, rect.bottom() - 2.0));
     fill.push(Pos2::new(rect.left() + 2.0, rect.bottom() - 2.0));
     painter.add(egui::epaint::PathShape {
         points: fill,
