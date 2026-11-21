@@ -530,7 +530,8 @@ impl MiniTaskApp {
             ""
         };
         let text = RichText::new(format!("{}{arrow}", col.label())).strong();
-        if ui.button(text).clicked() {
+        let resp = ui.button(text);
+        if resp.clicked() {
             if self.sort_col == col {
                 self.sort_desc = !self.sort_desc;
             } else {
@@ -538,6 +539,8 @@ impl MiniTaskApp {
                 self.sort_desc = col.is_numeric();
             }
         }
+        // 本家と同じく列見出しの右クリックでも列選択メニューを開く
+        resp.context_menu(|ui| self.column_menu(ui));
     }
 }
 
@@ -567,13 +570,6 @@ impl eframe::App for MiniTaskApp {
                 processes.context_menu(|ui| self.column_menu(ui));
                 ui.selectable_value(&mut self.tab, Tab::Performance, "  パフォーマンス  ");
                 ui.selectable_value(&mut self.tab, Tab::Startup, "  スタートアップ  ");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new("プロセスタブを右クリックで列を選択")
-                            .size(12.0)
-                            .color(Color32::from_gray(120)),
-                    );
-                });
             });
             ui.separator();
             match self.tab {
