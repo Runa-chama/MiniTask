@@ -102,6 +102,7 @@ cargo build --release
 | `MINITASK_MAXIMIZE=1` | 最大化して起動 |
 | `MINITASK_SIZE=幅x高さ` | 起動ウィンドウ サイズを指定 (例: `820x480`、検証用) |
 | `MINITASK_SPLINE=1` | スプライン補間を有効にして起動 (検証用) |
+| `MINITASK_ANIMATION=1` | なめらかアニメーション補間を有効にして起動 (検証用) |
 | `MINITASK_TAB=performance` | パフォーマンスタブを開いて起動 (`cpu` / `ram` / `rom` / `gpu` / `npu` / `percore` も指定可) |
 
 ## 技術スタック

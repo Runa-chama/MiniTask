@@ -158,15 +158,32 @@ fn paint_curve(
     if n < 2 {
         return;
     }
+    // アニメーション中は最新サンプルを「前の値 → 新しい値」へ位相に沿って
+    // 補間する。更新の瞬間に線が完成して飛び出すのを防ぎ、更新間隔に
+    // よらずなめらかに登場させる。
+    let eased_last = if style.phase > 0.0 {
+        let prev = values[n - 2];
+        let cur = values[n - 1];
+        let p = style.phase.clamp(0.0, 1.0);
+        let smooth = p * p * (3.0 - 2.0 * p); // smoothstep
+        Some(prev + (cur - prev) * smooth)
+    } else {
+        None
+    };
     let inner_h = rect.height() - 4.0;
     let slot = (rect.width() - 4.0) / HISTORY_LEN.max(n) as f32;
     let pts: Vec<Pos2> = values
         .iter()
         .enumerate()
         .map(|(i, v)| {
+            let val = if i + 1 == n {
+                eased_last.unwrap_or(*v)
+            } else {
+                *v
+            };
             // phase (0..1) だけ左へずらすことで、更新間隔の間も滑らかに流れる
             let x = rect.left() + 2.0 + i as f32 * slot - style.phase * slot;
-            let y = rect.bottom() - 2.0 - (v / max).clamp(0.0, 1.0) * inner_h;
+            let y = rect.bottom() - 2.0 - (val / max).clamp(0.0, 1.0) * inner_h;
             Pos2::new(x, y)
         })
         .collect();

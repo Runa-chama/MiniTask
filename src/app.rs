@@ -328,7 +328,7 @@ impl MiniTaskApp {
             ],
             interval: 1.0,
             paused: false,
-            graph_animation: false,
+            graph_animation: std::env::var("MINITASK_ANIMATION").is_ok(),
             graph_spline: std::env::var("MINITASK_SPLINE").is_ok(),
             perf_overhead: 360.0,
             last_refresh: Instant::now() - Duration::from_secs(10),
