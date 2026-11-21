@@ -253,23 +253,6 @@ pub fn nice_max(a: &VecDeque<f32>, b: &VecDeque<f32>) -> f32 {
     (step * base).max(1024.0)
 }
 
-/// 小さな折れ線グラフ (CPU / メモリ履歴用)。値は 0..max の百分率。
-pub fn sparkline(
-    ui: &mut egui::Ui,
-    values: &VecDeque<f32>,
-    max: f32,
-    color: Color32,
-    size: Vec2,
-) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
-    if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
-        paint_curve(painter, rect, values, max, color, 1.5);
-    }
-    resp
-}
-
 /// 既に確保済みの矩形内にミニグラフを描く (左ナビ項目・コア別グラフ用)。
 pub fn paint_mini_graph(
     painter: &egui::Painter,

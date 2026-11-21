@@ -652,14 +652,12 @@ impl MiniTaskApp {
                         .monospace()
                         .size(12.0),
                 );
-                util::sparkline(ui, &self.mem_hist, 100.0, MEM_COLOR, Vec2::new(110.0, 26.0));
                 ui.add_space(14.0);
                 ui.label(
                     RichText::new(format!("CPU {:>3.0}%", self.load.cpu))
                         .monospace()
                         .size(12.0),
                 );
-                util::sparkline(ui, &self.cpu_hist, 100.0, CPU_COLOR, Vec2::new(110.0, 26.0));
             });
         });
     }
