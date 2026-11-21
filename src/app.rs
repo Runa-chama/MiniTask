@@ -566,8 +566,7 @@ impl eframe::App for MiniTaskApp {
             self.header(ui);
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                let processes = ui.selectable_value(&mut self.tab, Tab::Processes, "  プロセス  ");
-                processes.context_menu(|ui| self.column_menu(ui));
+                ui.selectable_value(&mut self.tab, Tab::Processes, "  プロセス  ");
                 ui.selectable_value(&mut self.tab, Tab::Performance, "  パフォーマンス  ");
                 ui.selectable_value(&mut self.tab, Tab::Startup, "  スタートアップ  ");
             });
