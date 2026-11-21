@@ -17,7 +17,8 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::net::{self, NetCounters};
-use crate::perf::{DiskMeter, EngineMeter, GPU_ENGINE_COUNTER, NPU_ENGINE_COUNTER};
+use crate::netadapter::NetAdapterMeter;
+use crate::perf::{DiskMeter, EngineMeter, GpuMemoryMeter, GPU_ENGINE_COUNTER, NPU_ENGINE_COUNTER};
 
 /// UI に表示する 1 プロセス分の情報。
 #[derive(Clone, Debug)]
@@ -117,6 +118,13 @@ pub struct SysLoad {
     pub gpus: Vec<GpuInfo>,
     /// 搭載中の NPU 一覧
     pub npus: Vec<NpuInfo>,
+    /// 接続中のネットワーク アダプター一覧
+    pub adapters: Vec<crate::netadapter::AdapterSample>,
+    /// GPU/NPU の専用・共有メモリ使用量 (bytes)
+    pub gpu_dedicated: u64,
+    pub gpu_shared: u64,
+    pub npu_dedicated: u64,
+    pub npu_shared: u64,
 
     // --- パフォーマンスタブ向けの詳細情報 ---
     pub cpu_brand: String,
@@ -155,6 +163,8 @@ pub struct ProcCollector {
     disks: Disks,
     gpus: Gpus,
     disk_meter: DiskMeter,
+    net_meter: NetAdapterMeter,
+    gpu_memory_meter: GpuMemoryMeter,
     npu: EngineMeter,
     gpu_engine_meter: EngineMeter,
     npu_device_present: bool,
@@ -187,6 +197,8 @@ impl ProcCollector {
             disks,
             gpus,
             disk_meter: DiskMeter::new(),
+            net_meter: NetAdapterMeter::new(),
+            gpu_memory_meter: GpuMemoryMeter::new(),
             npu: EngineMeter::new(NPU_ENGINE_COUNTER),
             gpu_engine_meter: EngineMeter::new(GPU_ENGINE_COUNTER),
             npu_device_present: crate::perf::npu_device_present(),
@@ -315,6 +327,7 @@ impl ProcCollector {
         // compute 系のみの LUID = NPU として分離する (本家と同じ判定)。
         let snapshot = self.gpu_engine_meter.read_split().unwrap_or_default();
         let gpu_engines = snapshot.gpu_engines.clone();
+        let gpu_mem = self.gpu_memory_meter.read(&snapshot.gpu_luids);
         for g in &mut gpu_list {
             g.engines = gpu_engines.clone();
         }
@@ -332,6 +345,9 @@ impl ProcCollector {
         let npu_engines = npu_snapshot.npu_engines;
         let npu: f32 = npu_engines.iter().map(|(_, v)| *v).sum::<f32>().clamp(0.0, 100.0);
         let npu_available = !npu_engines.is_empty();
+
+        // --- ネットワーク アダプター (送受信速度と詳細) ---
+        let adapters = self.net_meter.read();
 
         // NPU は LUID (デバイス) ごとに 1 エントリ。非搭載なら空 → ナビ非表示。
         let mut npu_list: Vec<NpuInfo> = npu_snapshot
@@ -433,6 +449,11 @@ impl ProcCollector {
             disks: disk_list,
             gpus: gpu_list,
             npus: npu_list,
+            adapters,
+            gpu_dedicated: gpu_mem.gpu_dedicated,
+            gpu_shared: gpu_mem.gpu_shared,
+            npu_dedicated: gpu_mem.npu_dedicated,
+            npu_shared: gpu_mem.npu_shared,
         };
 
         let now_net = net::snapshot();

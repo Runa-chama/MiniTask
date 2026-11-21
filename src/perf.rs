@@ -156,7 +156,7 @@ impl Drop for DiskMeter {
 }
 
 /// カウンタの全インスタンスを (インスタンス名, 値) で取得する。
-fn collect_counter_array(counter: PDH_HCOUNTER) -> Option<Vec<(String, f64)>> {
+pub(crate) fn collect_counter_array(counter: PDH_HCOUNTER) -> Option<Vec<(String, f64)>> {
     unsafe {
         let mut size = 0u32;
         let mut count = 0u32;
@@ -209,6 +209,113 @@ pub struct EngineSnapshot {
     pub npu_engines: Vec<(String, f32)>,
     /// NPU デバイス (LUID) ごとのエンジン別使用率
     pub npu_by_luid: Vec<(String, Vec<(String, f32)>)>,
+    /// GPU アダプタの LUID 一覧 (メモリ カウンタの分類に使う)
+    pub gpu_luids: Vec<String>,
+}
+
+/// GPU / NPU の専用・共有メモリ使用量 (bytes)。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuMemorySnapshot {
+    pub gpu_dedicated: u64,
+    pub gpu_shared: u64,
+    pub npu_dedicated: u64,
+    pub npu_shared: u64,
+}
+
+/// `\GPU Process Memory(*)` から LUID 単位でメモリ使用量を集計する。
+pub struct GpuMemoryMeter {
+    query: PDH_HQUERY,
+    counters: Vec<PDH_HCOUNTER>,
+    pub available: bool,
+}
+
+impl GpuMemoryMeter {
+    pub fn new() -> Self {
+        unsafe {
+            let mut query: PDH_HQUERY = std::ptr::null_mut();
+            if PdhOpenQueryW(std::ptr::null(), 0, &mut query) != ERROR_SUCCESS {
+                return Self::unavailable();
+            }
+            let mut counters = Vec::new();
+            for name in [
+                r"\GPU Process Memory(*)\Dedicated Usage",
+                r"\GPU Process Memory(*)\Shared Usage",
+            ] {
+                let path: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+                let mut counter: PDH_HCOUNTER = std::ptr::null_mut();
+                if PdhAddEnglishCounterW(query, path.as_ptr(), 0, &mut counter) != ERROR_SUCCESS {
+                    PdhCloseQuery(query);
+                    return Self::unavailable();
+                }
+                counters.push(counter);
+            }
+            PdhCollectQueryData(query);
+            Self {
+                query,
+                counters,
+                available: true,
+            }
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            query: std::ptr::null_mut(),
+            counters: Vec::new(),
+            available: false,
+        }
+    }
+
+    /// gpu_luids に含まれる LUID を GPU、それ以外を NPU として合計する。
+    pub fn read(&mut self, gpu_luids: &[String]) -> GpuMemorySnapshot {
+        let mut out = GpuMemorySnapshot::default();
+        if !self.available {
+            return out;
+        }
+        unsafe {
+            PdhCollectQueryData(self.query);
+            let dedicated = collect_counter_array(self.counters[0]).unwrap_or_default();
+            let shared = collect_counter_array(self.counters[1]).unwrap_or_default();
+            // Dedicated / Shared で加算先を変えるため個別に回す
+            for (name, value) in dedicated {
+                let luid = name
+                    .split("_luid_")
+                    .nth(1)
+                    .and_then(|s| s.split("_phys_").next())
+                    .unwrap_or("");
+                let v = value.max(0.0) as u64;
+                if gpu_luids.iter().any(|g| g == luid) {
+                    out.gpu_dedicated = out.gpu_dedicated.saturating_add(v);
+                } else {
+                    out.npu_dedicated = out.npu_dedicated.saturating_add(v);
+                }
+            }
+            for (name, value) in shared {
+                let luid = name
+                    .split("_luid_")
+                    .nth(1)
+                    .and_then(|s| s.split("_phys_").next())
+                    .unwrap_or("");
+                let v = value.max(0.0) as u64;
+                if gpu_luids.iter().any(|g| g == luid) {
+                    out.gpu_shared = out.gpu_shared.saturating_add(v);
+                } else {
+                    out.npu_shared = out.npu_shared.saturating_add(v);
+                }
+            }
+            out
+        }
+    }
+}
+
+impl Drop for GpuMemoryMeter {
+    fn drop(&mut self) {
+        if !self.query.is_null() {
+            unsafe {
+                PdhCloseQuery(self.query);
+            }
+        }
+    }
 }
 
 /// エンジン種別ごとの使用率を集計する PDH メータ。
@@ -377,6 +484,7 @@ impl EngineMeter {
             gpu_engines: Self::sorted_usage(gpu),
             npu_engines: Self::sorted_usage(npu),
             npu_by_luid,
+            gpu_luids: gpu_luids.into_iter().collect(),
         })
     }
 }
@@ -392,7 +500,7 @@ impl Drop for EngineMeter {
 }
 
 /// NUL 終端 UTF-16 ポインタを String に変換。
-unsafe fn wide_ptr_to_string(p: windows_sys::core::PWSTR) -> String {
+pub(crate) unsafe fn wide_ptr_to_string(p: windows_sys::core::PWSTR) -> String {
     if p.is_null() {
         return String::new();
     }

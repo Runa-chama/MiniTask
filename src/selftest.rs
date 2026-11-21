@@ -63,9 +63,11 @@ pub fn run() -> i32 {
             && load
                 .npus
                 .iter()
-                .all(|n| !n.id.is_empty() && (0.0..=100.0).contains(&n.usage)),
+                .all(|n| !n.id.is_empty() && (0.0..=100.0).contains(&n.usage))
+            && !load.adapters.is_empty()
+            && load.adapters.iter().all(|a| !a.id.is_empty()),
         format!(
-            "disks=[{}] gpus=[{}] npus=[{}]",
+            "disks=[{}] gpus=[{}] npus=[{}] adapters=[{}]",
             load.disks
                 .iter()
                 .map(|d| d.label.as_str())
@@ -81,6 +83,11 @@ pub fn run() -> i32 {
                 .map(|n| n.label.as_str())
                 .collect::<Vec<_>>()
                 .join(", "),
+            load.adapters
+                .iter()
+                .map(|a| a.label.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
         ),
     );
     for d in &load.disks {
@@ -89,6 +96,18 @@ pub fn run() -> i32 {
             d.label,
             crate::util::fmt_rate(d.read_bps),
             crate::util::fmt_rate(d.write_bps)
+        );
+    }
+    for a in &load.adapters {
+        println!(
+            "  Adapter {}: recv={}/s sent={}/s wifi={} ssid={} signal={}% ipv4={:?}",
+            a.label,
+            crate::util::fmt_rate(a.recv_bps),
+            crate::util::fmt_rate(a.sent_bps),
+            a.is_wifi,
+            a.ssid,
+            a.signal_pct,
+            a.ipv4,
         );
     }
     for (key, val) in load.gpu_engines.iter().take(8) {

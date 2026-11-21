@@ -13,6 +13,10 @@ pub const MEM_COLOR: Color32 = Color32::from_rgb(108, 203, 95);
 pub const ROM_COLOR: Color32 = Color32::from_rgb(230, 170, 110);
 pub const GPU_COLOR: Color32 = Color32::from_rgb(170, 145, 255);
 pub const NPU_COLOR: Color32 = Color32::from_rgb(255, 150, 185);
+/// ネットワーク受信 (本家の緑)
+pub const NET_RECV_COLOR: Color32 = Color32::from_rgb(108, 203, 95);
+/// ネットワーク送信 (本家の黄)
+pub const NET_SEND_COLOR: Color32 = Color32::from_rgb(230, 200, 90);
 pub const WARN: Color32 = Color32::from_rgb(255, 190, 90);
 pub const DANGER: Color32 = Color32::from_rgb(255, 120, 100);
 
@@ -300,6 +304,14 @@ pub fn perf_chart(
             );
         }
         paint_curve(painter, rect, values, max, color, 2.0);
+        // 本家と同じスケール表示 (グラフ右上)
+        painter.text(
+            egui::pos2(rect.right() - 5.0, rect.top() + 2.0),
+            egui::Align2::RIGHT_TOP,
+            format!("{max:.0}%"),
+            egui::FontId::proportional(11.0),
+            Color32::from_gray(150),
+        );
         // 本家と同じ時間目盛り (左 = 30 秒前、右 = 現在)
         let stamp = Color32::from_gray(110);
         let font = egui::FontId::proportional(10.0);

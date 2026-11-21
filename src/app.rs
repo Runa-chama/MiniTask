@@ -10,8 +10,8 @@ use crate::net::NetSession;
 use crate::process::{self, ProcCollector, ProcRow, SysLoad};
 use crate::startup::{self, StartupEntry};
 use crate::util::{
-    self, ACCENT, CPU_COLOR, DANGER, GPU_COLOR, HISTORY_LEN, MEM_COLOR, NPU_COLOR, ROM_COLOR,
-    WARN,
+    self, ACCENT, CPU_COLOR, DANGER, GPU_COLOR, HISTORY_LEN, MEM_COLOR, NET_RECV_COLOR,
+    NET_SEND_COLOR, NPU_COLOR, ROM_COLOR, WARN,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -31,6 +31,8 @@ enum PerfSel {
     Disk(String),
     Gpu(String),
     Npu(String),
+    /// ネットワーク アダプター (PDH インスタンス名)
+    Net(String),
 }
 
 /// CPU グラフの表示モード (タスクマネージャーの「グラフの変更」)。
@@ -208,6 +210,12 @@ pub struct MiniTaskApp {
     disk_write_hist: Vec<(String, VecDeque<f32>)>,
     gpu_hist: Vec<(String, VecDeque<f32>)>,
     npu_hist: Vec<(String, VecDeque<f32>)>,
+    /// ネットワークアダプターごとの受信/送信履歴
+    net_recv_hist: Vec<(String, VecDeque<f32>)>,
+    net_sent_hist: Vec<(String, VecDeque<f32>)>,
+    /// GPU/NPU 専用メモリの履歴 (第2グラフ用)
+    gpu_mem_hist: VecDeque<f32>,
+    npu_mem_hist: VecDeque<f32>,
     net: Option<NetSession>,
     net_err: Option<String>,
 
@@ -229,6 +237,8 @@ pub struct MiniTaskApp {
     selected: Option<u32>,
     columns: [bool; 14],
     interval: f32,
+    /// 「更新の速度」メニューによる一時停止中
+    paused: bool,
     last_refresh: Instant,
 
     confirm_kill: Option<(u32, String)>,
@@ -261,6 +271,10 @@ impl MiniTaskApp {
             disk_write_hist: Vec::new(),
             gpu_hist: Vec::new(),
             npu_hist: Vec::new(),
+            net_recv_hist: Vec::new(),
+            net_sent_hist: Vec::new(),
+            gpu_mem_hist: VecDeque::new(),
+            npu_mem_hist: VecDeque::new(),
             net,
             net_err,
             // MINITASK_TAB: processes / performance / cpu / ram / rom / gpu / npu
@@ -273,6 +287,7 @@ impl MiniTaskApp {
                 Ok("rom") | Ok("disk") => PerfSel::Disk(String::new()),
                 Ok("gpu") => PerfSel::Gpu(String::new()),
                 Ok("npu") => PerfSel::Npu(String::new()),
+                Ok("net") | Ok("network") => PerfSel::Net(String::new()),
                 _ => PerfSel::Cpu,
             },
             cpu_graph_mode: match std::env::var("MINITASK_TAB").as_deref() {
@@ -306,6 +321,7 @@ impl MiniTaskApp {
                 false, // コマンドライン
             ],
             interval: 1.0,
+            paused: false,
             last_refresh: Instant::now() - Duration::from_secs(10),
             confirm_kill: None,
             confirm_kill_tree: None,
@@ -342,10 +358,28 @@ impl MiniTaskApp {
             for n in &load.npus {
                 push_device_hist(&mut self.npu_hist, &n.id, n.usage);
             }
+            for a in &load.adapters {
+                push_device_hist(&mut self.net_recv_hist, &a.id, a.recv_bps as f32);
+                push_device_hist(&mut self.net_sent_hist, &a.id, a.sent_bps as f32);
+            }
+            // GPU/NPU の専用メモリ履歴 (第2グラフ)
+            self.gpu_mem_hist.push_back(load.gpu_dedicated as f32);
+            self.npu_mem_hist.push_back(load.npu_dedicated as f32);
+            while self.gpu_mem_hist.len() > HISTORY_LEN {
+                self.gpu_mem_hist.pop_front();
+            }
+            while self.npu_mem_hist.len() > HISTORY_LEN {
+                self.npu_mem_hist.pop_front();
+            }
             // 切断されたデバイスの履歴を破棄 (再接続時は新しい履歴から開始)
             let disk_ids: HashSet<&str> = load.disks.iter().map(|d| d.id.as_str()).collect();
             let gpu_ids: HashSet<&str> = load.gpus.iter().map(|g| g.id.as_str()).collect();
             let npu_ids: HashSet<&str> = load.npus.iter().map(|n| n.id.as_str()).collect();
+            let adapter_ids: HashSet<&str> = load.adapters.iter().map(|a| a.id.as_str()).collect();
+            self.net_recv_hist
+                .retain(|(id, _)| adapter_ids.contains(id.as_str()));
+            self.net_sent_hist
+                .retain(|(id, _)| adapter_ids.contains(id.as_str()));
             self.disk_active_hist
                 .retain(|(id, _)| disk_ids.contains(id.as_str()));
             self.disk_read_hist
@@ -415,6 +449,7 @@ impl MiniTaskApp {
             PerfSel::Disk(id) => id.is_empty() || self.load.disks.iter().any(|d| &d.id == id),
             PerfSel::Gpu(id) => id.is_empty() || self.load.gpus.iter().any(|g| &g.id == id),
             PerfSel::Npu(id) => id.is_empty() || self.load.npus.iter().any(|n| &n.id == id),
+            PerfSel::Net(id) => id.is_empty() || self.load.adapters.iter().any(|a| &a.id == id),
         };
         if !valid {
             self.perf_sel = if let Some(d) = self.load.disks.first() {
@@ -423,6 +458,8 @@ impl MiniTaskApp {
                 PerfSel::Gpu(g.id.clone())
             } else if let Some(n) = self.load.npus.first() {
                 PerfSel::Npu(n.id.clone())
+            } else if let Some(a) = self.load.adapters.first() {
+                PerfSel::Net(a.id.clone())
             } else {
                 PerfSel::Cpu
             };
@@ -444,6 +481,11 @@ impl MiniTaskApp {
             PerfSel::Npu(id) if id.is_empty() => {
                 if let Some(n) = self.load.npus.first() {
                     *id = n.id.clone();
+                }
+            }
+            PerfSel::Net(id) if id.is_empty() => {
+                if let Some(a) = self.load.adapters.first() {
+                    *id = a.id.clone();
                 }
             }
             _ => {}
@@ -548,7 +590,7 @@ impl eframe::App for MiniTaskApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let interval = Duration::from_secs_f32(self.interval);
         let elapsed = self.last_refresh.elapsed();
-        if elapsed >= interval {
+        if elapsed >= interval && !self.paused {
             self.refresh();
         }
         ctx.request_repaint_after(interval.saturating_sub(elapsed));
@@ -761,13 +803,15 @@ impl MiniTaskApp {
         write: &VecDeque<f32>,
         max: f32,
         color: Color32,
+        read_color: Color32,
+        write_color: Color32,
         selected: bool,
     ) -> egui::Response {
         let width = ui.available_width().clamp(80.0, 300.0);
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 84.0), egui::Sense::click());
         Self::paint_nav_background(ui, rect, resp.hovered(), selected, color, 84.0);
         let graph_rect = Self::nav_graph_rect(rect);
-        util::paint_mini_dual_graph(ui.painter(), graph_rect, read, write, max, CPU_COLOR, color);
+        util::paint_mini_dual_graph(ui.painter(), graph_rect, read, write, max, read_color, write_color);
         Self::paint_nav_text(ui, rect, label, detail, value, color);
         resp
     }
@@ -884,6 +928,30 @@ impl MiniTaskApp {
                 ui.close();
             }
         }
+        Self::update_speed_menu(ui, &mut self.interval, &mut self.paused);
+    }
+
+    /// 本家の「更新の速度」メニュー (高/通常/低/一時停止)。
+    fn update_speed_menu(ui: &mut egui::Ui, interval: &mut f32, paused: &mut bool) {
+        ui.separator();
+        ui.label(RichText::new("更新の速度").strong());
+        for (label, value) in [("高", 0.5_f32), ("通常", 1.0), ("低", 5.0)] {
+            let mark = if !*paused && (*interval - value).abs() < 0.01 {
+                "✓ "
+            } else {
+                "   "
+            };
+            if ui.button(format!("{mark}{label}")).clicked() {
+                *interval = value;
+                *paused = false;
+                ui.close();
+            }
+        }
+        let mark = if *paused { "✓ " } else { "   " };
+        if ui.button(format!("{mark}一時停止と再開")).clicked() {
+            *paused = !*paused;
+            ui.close();
+        }
     }
 
     /// GPU / NPU グラフの右クリックメニュー (本家の「グラフの変更」と同じ方式:
@@ -893,6 +961,8 @@ impl MiniTaskApp {
         sel: &mut Option<String>,
         engines: &[(String, f32)],
         npu: bool,
+        interval: &mut f32,
+        paused: &mut bool,
     ) {
         ui.label(RichText::new("グラフの変更").strong());
         ui.separator();
@@ -913,6 +983,7 @@ impl MiniTaskApp {
                 ui.close();
             }
         }
+        Self::update_speed_menu(ui, interval, paused);
     }
 
     fn performance_tab(&mut self, ui: &mut egui::Ui) {
@@ -932,6 +1003,16 @@ impl MiniTaskApp {
                 let wh = find_hist(&self.disk_write_hist, id, &empty_hist).clone();
                 let max = util::nice_max(&rh, &wh);
                 Some((ah, rh, wh, max))
+            }
+            _ => None,
+        };
+        // ネットワークは受信/送信 2 本線グラフを使う
+        let net_dual = match &self.perf_sel {
+            PerfSel::Net(id) => {
+                let rh = find_hist(&self.net_recv_hist, id, &empty_hist).clone();
+                let sh = find_hist(&self.net_sent_hist, id, &empty_hist).clone();
+                let max = util::nice_max(&rh, &sh);
+                Some((rh, sh, max))
             }
             _ => None,
         };
@@ -1024,6 +1105,33 @@ impl MiniTaskApp {
                         wh,
                         max,
                         ROM_COLOR,
+                        CPU_COLOR,
+                        ROM_COLOR,
+                        self.perf_sel == sel,
+                    );
+                    if resp.clicked() {
+                        clicked_sel = Some(sel);
+                    }
+                }
+                // ネットワーク: アダプターごと、受信(緑)/送信(黄) の 2 本線
+                for a in &self.load.adapters {
+                    let rh = find_hist(&self.net_recv_hist, &a.id, &empty_hist);
+                    let sh = find_hist(&self.net_sent_hist, &a.id, &empty_hist);
+                    let max = util::nice_max(rh, sh);
+                    let val = util::fmt_rate(a.recv_bps.max(a.sent_bps));
+                    let sel = PerfSel::Net(a.id.clone());
+                    let detail = if a.is_wifi { "Wi-Fi" } else { "イーサネット" };
+                    let resp = Self::perf_nav_item_dual(
+                        ui,
+                        &a.label,
+                        detail,
+                        &val,
+                        rh,
+                        sh,
+                        max,
+                        NET_RECV_COLOR,
+                        NET_RECV_COLOR,
+                        NET_SEND_COLOR,
                         self.perf_sel == sel,
                     );
                     if resp.clicked() {
@@ -1169,6 +1277,20 @@ impl MiniTaskApp {
                     overall
                 }
             }
+            PerfSel::Net(id) => {
+                let a = self.load.adapters.iter().find(|x| &x.id == id);
+                let title = a
+                    .map(|a| a.label.clone())
+                    .unwrap_or_else(|| "ネットワーク".to_owned());
+                let subtitle = a
+                    .map(|a| a.description.clone())
+                    .unwrap_or_else(|| "ネットワーク アダプター".to_owned());
+                let value = a
+                    .map(|a| util::fmt_rate(a.recv_bps.max(a.sent_bps)))
+                    .unwrap_or_else(|| "0 KB/秒".to_owned());
+                let h = find_hist(&self.net_recv_hist, id, &empty_hist);
+                (title, subtitle, value, h, NET_RECV_COLOR)
+            }
         };
 
         ui.add_space(2.0);
@@ -1269,15 +1391,9 @@ impl MiniTaskApp {
                         .size(12.0)
                         .color(Color32::from_gray(150)),
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new("100%")
-                            .size(11.0)
-                            .color(Color32::from_gray(120)),
-                    );
-                });
             });
-            util::perf_chart(ui, &ah, 100.0, MEM_COLOR, Vec2::new(gw, main_h));
+            util::perf_chart(ui, &ah, 100.0, MEM_COLOR, Vec2::new(gw, main_h))
+                .context_menu(|ui| Self::update_speed_menu(ui, &mut self.interval, &mut self.paused));
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label(
@@ -1302,6 +1418,36 @@ impl MiniTaskApp {
                 ROM_COLOR,
                 Vec2::new(gw, (gh - main_h - 12.0).max(60.0)),
             );
+        } else if let Some((rh, sh, max)) = net_dual {
+            // ネットワーク: 送信(黄) / 受信(緑) の 2 本線 (本家と同じ凡例付き)
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("送信 / 受信")
+                        .size(12.0)
+                        .color(Color32::from_gray(150)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("{}/秒", util::fmt_bytes(max as u64)))
+                            .size(11.0)
+                            .color(Color32::from_gray(120)),
+                    );
+                });
+            });
+            util::perf_dual_chart(
+                ui,
+                &rh,
+                &sh,
+                max,
+                NET_RECV_COLOR,
+                NET_SEND_COLOR,
+                Vec2::new(gw, gh),
+            )
+            .context_menu(|ui| Self::update_speed_menu(ui, &mut self.interval, &mut self.paused));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("■ 送信").size(11.0).color(NET_SEND_COLOR));
+                ui.label(RichText::new("■ 受信").size(11.0).color(NET_RECV_COLOR));
+            });
         } else {
             let resp = util::perf_chart(ui, hist, 100.0, color, Vec2::new(gw, gh));
             match &self.perf_sel {
@@ -1318,10 +1464,39 @@ impl MiniTaskApp {
                         .map(|g| g.engines.clone())
                         .unwrap_or_default();
                     let sel = &mut self.gpu_sel;
+                    let interval = &mut self.interval;
+                    let paused = &mut self.paused;
                     resp.on_hover_text("右クリックでグラフの変更 (エンジン種別)")
                         .context_menu(move |ui| {
-                            Self::engine_graph_menu(ui, sel, &engines, false)
+                            Self::engine_graph_menu(ui, sel, &engines, false, interval, paused)
                         });
+                    // 本家 Win11 と同じ「専用 GPU メモリ」の第2グラフ
+                    let mem_hist = self.gpu_mem_hist.clone();
+                    let mem_max = util::nice_max(&mem_hist, &mem_hist);
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("専用 GPU メモリ")
+                                .size(12.0)
+                                .color(Color32::from_gray(150)),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(util::fmt_bytes(mem_max as u64))
+                                    .size(11.0)
+                                    .color(Color32::from_gray(120)),
+                            );
+                        });
+                    });
+                    util::perf_dual_chart(
+                        ui,
+                        &mem_hist,
+                        &mem_hist,
+                        mem_max,
+                        GPU_COLOR,
+                        GPU_COLOR,
+                        Vec2::new(gw, (gh * 0.3).max(50.0)),
+                    );
                 }
                 PerfSel::Npu(id) => {
                     let engines = self
@@ -1333,13 +1508,39 @@ impl MiniTaskApp {
                         .unwrap_or_default();
                     if !engines.is_empty() {
                         let sel = &mut self.npu_sel;
+                        let interval = &mut self.interval;
+                        let paused = &mut self.paused;
                         resp.on_hover_text("右クリックでグラフの変更 (エンジン種別)")
                             .context_menu(move |ui| {
-                                Self::engine_graph_menu(ui, sel, &engines, true)
+                                Self::engine_graph_menu(ui, sel, &engines, true, interval, paused)
                             });
                     }
+                    // NPU 専用メモリの第2グラフ
+                    let mem_hist = self.npu_mem_hist.clone();
+                    let mem_max = util::nice_max(&mem_hist, &mem_hist);
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("専用 NPU メモリ")
+                                .size(12.0)
+                                .color(Color32::from_gray(150)),
+                        );
+                    });
+                    util::perf_dual_chart(
+                        ui,
+                        &mem_hist,
+                        &mem_hist,
+                        mem_max,
+                        NPU_COLOR,
+                        NPU_COLOR,
+                        Vec2::new(gw, (gh * 0.3).max(50.0)),
+                    );
                 }
-                _ => {}
+                _ => {
+                    resp.context_menu(|ui| {
+                        Self::update_speed_menu(ui, &mut self.interval, &mut self.paused)
+                    });
+                }
             }
         }
         ui.add_space(6.0);
@@ -1393,8 +1594,17 @@ impl MiniTaskApp {
                 PerfSel::Gpu(id) => {
                     if let Some(g) = d.gpus.iter().find(|x| &x.id == id) {
                         Self::detail_row(ui, "使用率", format!("{:.1}%", g.usage));
-                        Self::detail_row(ui, "ビデオメモリ使用", gb(g.mem_used));
-                        Self::detail_row(ui, "ビデオメモリ合計", gb(g.mem_total));
+                        Self::detail_row(
+                            ui,
+                            "専用 GPU メモリ",
+                            format!("{} / {}", gb(g.mem_used), gb(g.mem_total)),
+                        );
+                        Self::detail_row(
+                            ui,
+                            "共有 GPU メモリ",
+                            format!("{} / {}", gb(d.gpu_shared), gb(d.mem_total)),
+                        );
+                        Self::detail_row(ui, "専用メモリ使用", gb(d.gpu_dedicated));
                     }
                 }
                 PerfSel::Npu(id) => {
@@ -1404,6 +1614,8 @@ impl MiniTaskApp {
                         "使用率",
                         format!("{:.1}%", n.map(|n| n.usage).unwrap_or(0.0)),
                     );
+                    Self::detail_row(ui, "専用 NPU メモリ", gb(d.npu_dedicated));
+                    Self::detail_row(ui, "共有 NPU メモリ", gb(d.npu_shared));
                     Self::detail_row(
                         ui,
                         "状態",
@@ -1415,6 +1627,19 @@ impl MiniTaskApp {
                             "非搭載"
                         },
                     );
+                }
+                PerfSel::Net(id) => {
+                    if let Some(a) = d.adapters.iter().find(|x| &x.id == id) {
+                        Self::detail_row(ui, "送信", util::fmt_rate(a.sent_bps));
+                        Self::detail_row(ui, "受信", util::fmt_rate(a.recv_bps));
+                        if a.is_wifi {
+                            Self::detail_row(
+                                ui,
+                                "信号の品質",
+                                format!("{}%", a.signal_pct),
+                            );
+                        }
+                    }
                 }
             });
             r.vertical(|ui| match &self.perf_sel {
@@ -1486,6 +1711,52 @@ impl MiniTaskApp {
                             "—"
                         },
                     );
+                }
+                PerfSel::Net(id) => {
+                    if let Some(a) = d.adapters.iter().find(|x| &x.id == id) {
+                        Self::detail_row(ui, "アダプター名", a.label.clone());
+                        Self::detail_row(
+                            ui,
+                            "IPv4 アドレス",
+                            if a.ipv4.is_empty() {
+                                "—".to_owned()
+                            } else {
+                                a.ipv4.join(", ")
+                            },
+                        );
+                        Self::detail_row(
+                            ui,
+                            "IPv6 アドレス",
+                            if a.ipv6.is_empty() {
+                                "—".to_owned()
+                            } else {
+                                a.ipv6.join(", ")
+                            },
+                        );
+                        let speed = a.link_speed_bps as f64 / 1_000_000.0;
+                        Self::detail_row(
+                            ui,
+                            "帯域幅",
+                            if speed >= 1000.0 {
+                                format!("{:.1} Gbps", speed / 1000.0)
+                            } else {
+                                format!("{speed:.1} Mbps")
+                            },
+                        );
+                        Self::detail_row(ui, "状態", a.status.clone());
+                        if a.is_wifi {
+                            Self::detail_row(
+                                ui,
+                                "SSID",
+                                if a.ssid.is_empty() {
+                                    "—".to_owned()
+                                } else {
+                                    a.ssid.clone()
+                                },
+                            );
+                        }
+                        Self::detail_row(ui, "説明", a.description.clone());
+                    }
                 }
             });
         });

@@ -10,6 +10,7 @@
 
 mod app;
 mod net;
+mod netadapter;
 mod perf;
 mod process;
 mod selftest;
