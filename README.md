@@ -98,6 +98,7 @@ cargo build --release
 | `MINITASK_SELFTEST=1` | GUI を開かずヘッドレスセルフテストを実行（終了コード 0 = 全合格） |
 | `MINITASK_NO_ETW=1` | ETW ネットワーク計測を無効化（非管理者での動作確認用） |
 | `MINITASK_MAXIMIZE=1` | 最大化して起動 |
+| `MINITASK_SIZE=幅x高さ` | 起動ウィンドウ サイズを指定 (例: `820x480`、検証用) |
 | `MINITASK_TAB=performance` | パフォーマンスタブを開いて起動 (`cpu` / `ram` / `rom` / `gpu` / `npu` / `percore` も指定可) |
 
 ## 技術スタック

@@ -25,9 +25,19 @@ fn main() -> eframe::Result {
     // 他ユーザープロセス等の照会・終了のため SeDebugPrivilege を有効化
     process::enable_debug_privilege();
 
+    // MINITASK_SIZE=幅x高さ で起動サイズを指定可能 (検証用)
+    let initial_size: [f32; 2] = std::env::var("MINITASK_SIZE")
+        .ok()
+        .and_then(|s| {
+            let mut parts = s.split('x');
+            let w: f32 = parts.next()?.parse().ok()?;
+            let h: f32 = parts.next()?.parse().ok()?;
+            Some([w, h])
+        })
+        .unwrap_or([1020.0, 660.0]);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1020.0, 660.0])
+            .with_inner_size(initial_size)
             .with_min_inner_size([760.0, 440.0])
             .with_maximized(std::env::var("MINITASK_MAXIMIZE").is_ok())
             .with_title("MiniTask — 軽量タスクマネージャー"),

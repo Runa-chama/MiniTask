@@ -239,6 +239,8 @@ pub struct MiniTaskApp {
     interval: f32,
     /// 「更新の速度」メニューによる一時停止中
     paused: bool,
+    /// パフォーマンス右側の詳細・余白の実測高さ (毎フレーム自動補正)
+    perf_overhead: f32,
     last_refresh: Instant,
 
     confirm_kill: Option<(u32, String)>,
@@ -322,6 +324,7 @@ impl MiniTaskApp {
             ],
             interval: 1.0,
             paused: false,
+            perf_overhead: 360.0,
             last_refresh: Instant::now() - Duration::from_secs(10),
             confirm_kill: None,
             confirm_kill_tree: None,
@@ -1155,9 +1158,11 @@ impl MiniTaskApp {
         }
 
         // ScrollArea の内側では available_height() が実質無限大になるため、
-        // 入る前に実ビューポート高さを記録し、グラフ高さの計算に使う。
-        // これにより通常サイズでは収まり、極端に小さい場合だけスクロールする。
+        // 入る前に実ビューポート高さを記録する。詳細行・余白の実測高さは
+        // 毎フレーム自動補正し、収まるときはスクロールバーを出さない。
         let viewport_h = ui.available_height().clamp(0.0, 4000.0);
+        let overhead = self.perf_overhead;
+        let mut content_h = 0.0_f32;
         // 右側の内容は四周に余白を取り、縦にはみ出したらスクロールできるようにする
         egui::Frame::default()
             .inner_margin(egui::Margin {
@@ -1317,7 +1322,7 @@ impl MiniTaskApp {
         ui.add_space(10.0);
         // ヘッダー・ラベル・詳細情報 (最大 6 行)・区切り線・余白の予約分 ~320px
         let avail_h = viewport_h;
-        let gh = (avail_h * 0.52).min(avail_h - 320.0).clamp(80.0, 340.0);
+        let gh = (avail_h * 0.52).min(avail_h - overhead).clamp(80.0, 340.0);
         let gw = ui.available_width().clamp(60.0, 4000.0);
 
         if self.perf_sel == PerfSel::Cpu && self.cpu_graph_mode == CpuGraphMode::PerCore {
@@ -1761,8 +1766,20 @@ impl MiniTaskApp {
                 }
             });
         });
+        content_h = ui.min_rect().height();
         });
         });
+        // 実測に基づき予約高さを補正 (数フレームで収まりに収束する)
+        if content_h > 0.0 {
+            // フレーム上下の余白 24px を含めて判定する
+            let diff = content_h + 24.0 - viewport_h;
+            if diff > 0.5 {
+                self.perf_overhead = (self.perf_overhead + diff.min(48.0))
+                    .min((viewport_h - 80.0).max(80.0));
+            } else if diff < -60.0 {
+                self.perf_overhead = (self.perf_overhead - 8.0).max(260.0);
+            }
+        }
     }
 
     fn startup_tab(&mut self, ui: &mut egui::Ui) {
