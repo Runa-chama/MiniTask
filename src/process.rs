@@ -52,7 +52,10 @@ pub struct SysLoad {
     pub rom: f32, // ストレージ使用率 0..100
     pub gpu: f32, // GPU 使用率 0..100
     pub npu: f32, // NPU 使用率 0..100
+    /// NPU 使用率カウンタが利用可能か
     pub npu_available: bool,
+    /// NPU デバイス自体が搭載されているか (カウンタが無くても true になり得る)
+    pub npu_device_present: bool,
     /// 論理プロセッサごとの使用率 (0..100)
     pub core_usage: Vec<f32>,
     /// GPU エンジン種別ごとの使用率 (キーは engtype の小文字)
@@ -105,6 +108,9 @@ pub struct ProcCollector {
     gpus: Gpus,
     npu: EngineMeter,
     gpu_engine_meter: EngineMeter,
+    npu_device_present: bool,
+    /// カウンタ未開の NPU を定期的に開き直すためのリフレッシュ回数カウンタ
+    npu_recheck: u32,
 }
 
 impl ProcCollector {
@@ -133,6 +139,8 @@ impl ProcCollector {
             gpus,
             npu: EngineMeter::new(NPU_ENGINE_COUNTER),
             gpu_engine_meter: EngineMeter::new(GPU_ENGINE_COUNTER),
+            npu_device_present: crate::perf::npu_device_present(),
+            npu_recheck: 0,
         })
     }
 
@@ -193,7 +201,13 @@ impl ProcCollector {
         let gpu_mem_used = primary_gpu.and_then(|g| g.used_memory()).unwrap_or(0);
         let gpu_mem_total = primary_gpu.and_then(|g| g.total_memory()).unwrap_or(0);
 
-        // --- NPU (非搭載機では 0) ---
+        // --- NPU ---
+        // カウンタが未開なら 30 回 (約 30 秒) ごとに開き直しを試みる
+        // (ドライバー更新で後から現れることがあるため)
+        self.npu_recheck = self.npu_recheck.wrapping_add(1);
+        if !self.npu.available && self.npu_recheck % 30 == 0 {
+            self.npu.try_reopen();
+        }
         let npu_available = self.npu.available;
         let npu = self.npu.total_usage().unwrap_or(0.0);
         let npu_engines = self.npu.usage_by_type();
@@ -253,6 +267,7 @@ impl ProcCollector {
             gpu,
             npu,
             npu_available,
+            npu_device_present: self.npu_device_present,
             cpu_brand,
             cpu_freq_mhz,
             logical_cores,

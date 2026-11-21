@@ -240,7 +240,10 @@ impl MiniTaskApp {
                 Ok("npu") => PerfSel::Npu,
                 _ => PerfSel::Cpu,
             },
-            cpu_graph_mode: CpuGraphMode::Overall,
+            cpu_graph_mode: match std::env::var("MINITASK_TAB").as_deref() {
+                Ok("percore") | Ok("logical") => CpuGraphMode::PerCore,
+                _ => CpuGraphMode::Overall,
+            },
             core_hist: Vec::new(),
             gpu_engine_hist: Vec::new(),
             npu_engine_hist: Vec::new(),
@@ -833,6 +836,8 @@ impl MiniTaskApp {
             PerfSel::Npu => {
                 let npu_sub = if self.load.npu_available {
                     "NPU エンジン".to_owned()
+                } else if self.load.npu_device_present {
+                    "搭載済み (使用率カウンタ未提供)".to_owned()
                 } else {
                     "NPU 非搭載 / 取得不可".to_owned()
                 };
@@ -914,56 +919,62 @@ impl MiniTaskApp {
             let n = self.core_hist.len().max(1);
             let rows = if n <= 4 { 1 } else { 2 };
             let cols = n.div_ceil(rows);
-            let ch = ((gh - (rows as f32 - 1.0) * 6.0) / rows as f32).max(36.0);
+            // 行間には egui が item_spacing.y を挿入するので考慮する
+            let row_gap = ui.spacing().item_spacing.y;
+            let ch = ((gh - (rows as f32 - 1.0) * row_gap) / rows as f32).max(36.0);
+            const CELL_GAP: f32 = 6.0;
             for row in 0..rows {
-                ui.horizontal(|ui| {
-                    let w = ui.available_width();
-                    let cw = ((w - (cols as f32 - 1.0) * 6.0) / cols as f32).max(40.0);
-                    for col in 0..cols {
-                        let idx = row * cols + col;
-                        if idx >= self.core_hist.len() {
-                            break;
-                        }
-                        // セル自体をクリック可能にする (右クリックメニュー用)
-                        let (rect, cell_resp) =
-                            ui.allocate_exact_size(Vec2::new(cw, ch), egui::Sense::click());
-                        let painter = ui.painter();
-                        painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
-                        let cur = self
-                            .load
-                            .core_usage
-                            .get(idx)
-                            .copied()
-                            .unwrap_or(0.0);
-                        painter.text(
-                            rect.left_top() + egui::vec2(8.0, 4.0),
-                            egui::Align2::LEFT_TOP,
-                            format!("CPU {idx}"),
-                            egui::FontId::proportional(11.0),
-                            Color32::from_gray(150),
-                        );
-                        painter.text(
-                            egui::pos2(rect.right() - 8.0, rect.top() + 4.0),
-                            egui::Align2::RIGHT_TOP,
-                            format!("{cur:.0}%"),
-                            egui::FontId::proportional(11.0),
-                            CPU_COLOR,
-                        );
-                        let graph_rect = egui::Rect::from_min_max(
-                            egui::pos2(rect.left() + 6.0, rect.top() + 20.0),
-                            egui::pos2(rect.right() - 6.0, rect.bottom() - 4.0),
-                        );
-                        util::paint_mini_graph(
-                            painter,
-                            graph_rect,
-                            &self.core_hist[idx],
-                            100.0,
-                            CPU_COLOR,
-                        );
-                        // 論理プロセッサ表示でも右クリックで「全体的な使用率」に戻せる
-                        cell_resp.context_menu(|ui| self.cpu_graph_menu(ui));
+                // 1 行分の領域をまとめて確保し、セルは内側に手動配置する。
+                // (セルごとに allocate_exact_size すると item_spacing.x が
+                //  自動挿入され、右端がはみ出すため)
+                let w = ui.available_width().clamp(0.0, 8000.0);
+                let (row_rect, row_resp) =
+                    ui.allocate_exact_size(Vec2::new(w, ch), egui::Sense::click());
+                let cw = ((w - (cols as f32 - 1.0) * CELL_GAP) / cols as f32).max(24.0);
+                for col in 0..cols {
+                    let idx = row * cols + col;
+                    if idx >= self.core_hist.len() {
+                        break;
                     }
-                });
+                    let left = row_rect.left() + col as f32 * (cw + CELL_GAP);
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(left, row_rect.top()),
+                        Vec2::new(cw, ch),
+                    );
+                    if rect.right() > row_rect.right() + 1.0 {
+                        break;
+                    }
+                    let painter = ui.painter();
+                    painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+                    let cur = self.load.core_usage.get(idx).copied().unwrap_or(0.0);
+                    painter.text(
+                        rect.left_top() + egui::vec2(8.0, 4.0),
+                        egui::Align2::LEFT_TOP,
+                        format!("CPU {idx}"),
+                        egui::FontId::proportional(11.0),
+                        Color32::from_gray(150),
+                    );
+                    painter.text(
+                        egui::pos2(rect.right() - 8.0, rect.top() + 4.0),
+                        egui::Align2::RIGHT_TOP,
+                        format!("{cur:.0}%"),
+                        egui::FontId::proportional(11.0),
+                        CPU_COLOR,
+                    );
+                    let graph_rect = egui::Rect::from_min_max(
+                        egui::pos2(rect.left() + 6.0, rect.top() + 20.0),
+                        egui::pos2(rect.right() - 6.0, rect.bottom() - 4.0),
+                    );
+                    util::paint_mini_graph(
+                        painter,
+                        graph_rect,
+                        &self.core_hist[idx],
+                        100.0,
+                        CPU_COLOR,
+                    );
+                }
+                // 論理プロセッサ表示でも右クリックで「全体的な使用率」に戻せる
+                row_resp.context_menu(|ui| self.cpu_graph_menu(ui));
             }
         } else {
             let resp = util::perf_chart(ui, hist, 100.0, color, Vec2::new(gw, gh));
@@ -1045,7 +1056,13 @@ impl MiniTaskApp {
                     Self::detail_row(
                         ui,
                         "状態",
-                        if d.npu_available { "計測中" } else { "取得不可" },
+                        if d.npu_available {
+                            "計測中"
+                        } else if d.npu_device_present {
+                            "搭載済み・使用率取得不可"
+                        } else {
+                            "非搭載"
+                        },
                     );
                 }
             });
@@ -1086,7 +1103,13 @@ impl MiniTaskApp {
                     Self::detail_row(
                         ui,
                         "カウンタ",
-                        if d.npu_available { "NPU Engine" } else { "—" },
+                        if d.npu_available {
+                            "NPU Engine"
+                        } else if d.npu_device_present {
+                            "未提供 (デバイスは搭載済み)"
+                        } else {
+                            "—"
+                        },
                     );
                 }
             });

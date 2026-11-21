@@ -48,8 +48,8 @@ pub fn run() -> i32 {
             && !load.gpu_engines.is_empty()
             && load.gpu_engines.iter().all(|(_, v)| (0.0..=100.0).contains(v)),
         format!(
-            "cpu={:.1}%, rom={:.1}%, gpu={:.1}%, npu={:.1}%, cores={}, gpu_engines={} (available={})",
-            load.cpu, load.rom, load.gpu, load.npu, load.core_usage.len(), load.gpu_engines.len(), load.npu_available
+            "cpu={:.1}%, rom={:.1}%, gpu={:.1}%, npu={:.1}%, cores={}, gpu_engines={} (counter={}, npu_device={})",
+            load.cpu, load.rom, load.gpu, load.npu, load.core_usage.len(), load.gpu_engines.len(), load.npu_available, load.npu_device_present
         ),
     );
     for (key, val) in load.gpu_engines.iter().take(8) {

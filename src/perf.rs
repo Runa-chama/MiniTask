@@ -25,6 +25,7 @@ pub const GPU_ENGINE_COUNTER: &str = r"\GPU Engine(*)\Utilization Percentage";
 pub struct EngineMeter {
     query: PDH_HQUERY,
     counter: PDH_HCOUNTER,
+    path: String,
     /// カウンタが利用可能か (NPU 非搭載機などでは false)
     pub available: bool,
 }
@@ -33,33 +34,44 @@ impl EngineMeter {
     /// ワイルドカード付きカウンタパスでメータを作る。
     /// カウンタが存在しない場合は available = false になる。
     pub fn new(counter_path: &str) -> Self {
+        let mut meter = Self {
+            query: std::ptr::null_mut(),
+            counter: std::ptr::null_mut(),
+            path: counter_path.to_owned(),
+            available: false,
+        };
+        meter.open();
+        meter
+    }
+
+    /// カウンタを開く (利用可能なら true)。
+    fn open(&mut self) -> bool {
         unsafe {
             let mut query: PDH_HQUERY = std::ptr::null_mut();
             if PdhOpenQueryW(std::ptr::null(), 0, &mut query) != ERROR_SUCCESS {
-                return Self::unavailable();
+                return false;
             }
-            let path: Vec<u16> = counter_path.encode_utf16().chain(std::iter::once(0)).collect();
+            let path: Vec<u16> = self.path.encode_utf16().chain(std::iter::once(0)).collect();
             let mut counter: PDH_HCOUNTER = std::ptr::null_mut();
             if PdhAddEnglishCounterW(query, path.as_ptr(), 0, &mut counter) != ERROR_SUCCESS {
                 PdhCloseQuery(query);
-                return Self::unavailable();
+                return false;
             }
             // 初期サンプル (最初の Collect は値が安定しない)
             PdhCollectQueryData(query);
-            Self {
-                query,
-                counter,
-                available: true,
-            }
+            self.query = query;
+            self.counter = counter;
+            self.available = true;
+            true
         }
     }
 
-    fn unavailable() -> Self {
-        Self {
-            query: std::ptr::null_mut(),
-            counter: std::ptr::null_mut(),
-            available: false,
+    /// カウンタが未開のとき再度開き直す (ドライバー更新等で後から現れる場合)。
+    pub fn try_reopen(&mut self) -> bool {
+        if self.available {
+            return true;
         }
+        self.open()
     }
 
     /// 全インスタンスを収集し (エンジン種別, 使用率) のリストを返す。
@@ -163,6 +175,39 @@ unsafe fn wide_ptr_to_string(p: windows_sys::core::PWSTR) -> String {
     }
     let slice = unsafe { std::slice::from_raw_parts(p, len) };
     String::from_utf16_lossy(slice)
+}
+
+/// NPU デバイス (ComputeAccelerator クラス) が搭載されているかどうか。
+/// Ryzen AI / Snapdragon X / Intel NPU 等はこのデバイス クラスで列挙される。
+/// カウンタが公開されていなくてもデバイス自体の有無はこれで判定できる。
+pub fn npu_device_present() -> bool {
+    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+        SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
+        DIGCF_PRESENT, SP_DEVINFO_DATA,
+    };
+    // ComputeAccelerator デバイス クラス {f01a9d53-3ff6-48d2-9f97-c8a7004be10c}
+    const COMPUTE_ACCELERATOR: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(
+        0xf01a9d53_3ff6_48d2_9f97_c8a7004be10c,
+    );
+    unsafe {
+        let set = SetupDiGetClassDevsW(
+            &COMPUTE_ACCELERATOR,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            DIGCF_PRESENT,
+        );
+        // 失敗時は INVALID_HANDLE_VALUE (-1)
+        if set == 0 || set == -1 {
+            return false;
+        }
+        let mut data = SP_DEVINFO_DATA {
+            cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+            ..Default::default()
+        };
+        let present = SetupDiEnumDeviceInfo(set, 0, &mut data) != 0;
+        SetupDiDestroyDeviceInfoList(set);
+        present
+    }
 }
 
 /// エンジン種別の内部キー (英語小文字) を日本語表示名にする。
