@@ -37,6 +37,17 @@ pub fn run() -> i32 {
         rows.len() > 10,
         format!("{} processes, cpu={:.1}%, mem={}/{}", rows.len(), load.cpu, load.mem_used, load.mem_total),
     );
+    check(
+        "performance metrics",
+        (0.0..=100.0).contains(&load.cpu)
+            && (0.0..=100.0).contains(&load.rom)
+            && (0.0..=100.0).contains(&load.gpu)
+            && (0.0..=100.0).contains(&load.npu),
+        format!(
+            "cpu={:.1}%, rom={:.1}%, gpu={:.1}%, npu={:.1}% (available={})",
+            load.cpu, load.rom, load.gpu, load.npu, load.npu_available
+        ),
+    );
     let self_row = rows.iter().find(|r| r.pid == std::process::id());
     check(
         "self process info",

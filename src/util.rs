@@ -10,6 +10,9 @@ use windows_sys::Win32::System::Time::FileTimeToSystemTime;
 pub const ACCENT: Color32 = Color32::from_rgb(76, 194, 255); // Win11 ダークアクセント
 pub const CPU_COLOR: Color32 = Color32::from_rgb(96, 205, 255);
 pub const MEM_COLOR: Color32 = Color32::from_rgb(108, 203, 95);
+pub const ROM_COLOR: Color32 = Color32::from_rgb(230, 170, 110);
+pub const GPU_COLOR: Color32 = Color32::from_rgb(170, 145, 255);
+pub const NPU_COLOR: Color32 = Color32::from_rgb(255, 150, 185);
 pub const WARN: Color32 = Color32::from_rgb(255, 190, 90);
 pub const DANGER: Color32 = Color32::from_rgb(255, 120, 100);
 

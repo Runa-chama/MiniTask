@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{Disks, Gpus, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree, LUID};
 use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows_sys::Win32::Security::{
@@ -15,6 +15,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::net::{self, NetCounters};
+use crate::perf::NpuMeter;
 
 /// UI に表示する 1 プロセス分の情報。
 #[derive(Clone, Debug)]
@@ -41,6 +42,10 @@ pub struct SysLoad {
     pub cpu: f32, // 0..100
     pub mem_used: u64,
     pub mem_total: u64,
+    pub rom: f32, // ストレージ使用率 0..100
+    pub gpu: f32, // GPU 使用率 0..100
+    pub npu: f32, // NPU 使用率 0..100
+    pub npu_available: bool,
 }
 
 fn refresh_kind() -> ProcessRefreshKind {
@@ -60,6 +65,9 @@ pub struct ProcCollector {
     prev_net: HashMap<u32, NetCounters>,
     prev_time: Instant,
     user_cache: HashMap<String, String>,
+    disks: Disks,
+    gpus: Gpus,
+    npu: NpuMeter,
 }
 
 impl ProcCollector {
@@ -69,12 +77,17 @@ impl ProcCollector {
         let cpu_count = sys.cpus().len().max(1) as f32;
         sys.refresh_memory();
         sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
+        let disks = Disks::new_with_refreshed_list().unwrap_or_else(|_| Disks::new().unwrap());
+        let gpus = Gpus::new_with_refreshed_list().unwrap_or_else(|_| Gpus::new().unwrap());
         Ok(Self {
             sys,
             cpu_count,
             prev_net: net::snapshot(),
             prev_time: Instant::now(),
             user_cache: HashMap::new(),
+            disks,
+            gpus,
+            npu: NpuMeter::new(),
         })
     }
 
@@ -85,10 +98,44 @@ impl ProcCollector {
         self.sys
             .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
 
+        // ストレージ使用率: C: ドライブを優先、なければ最初のディスク
+        self.disks.refresh(false);
+        let rom = self
+            .disks
+            .iter()
+            .find(|d| d.mount_point().to_string_lossy().starts_with("C:"))
+            .or_else(|| self.disks.iter().next())
+            .map(|d| {
+                let total = d.total_space();
+                if total > 0 {
+                    ((total - d.available_space().min(total)) as f64 / total as f64 * 100.0) as f32
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
+
+        // GPU 使用率: 複数 GPU のうち最大値
+        self.gpus.refresh(false);
+        let gpu = self
+            .gpus
+            .iter()
+            .filter_map(|g| g.usage())
+            .fold(0.0_f32, f32::max)
+            .clamp(0.0, 100.0);
+
+        // NPU 使用率 (非搭載機では 0)
+        let npu_available = self.npu.available;
+        let npu = self.npu.usage().unwrap_or(0.0);
+
         let load = SysLoad {
             cpu: self.sys.global_cpu_usage(),
             mem_used: self.sys.used_memory(),
             mem_total: self.sys.total_memory(),
+            rom,
+            gpu,
+            npu,
+            npu_available,
         };
 
         let now_net = net::snapshot();

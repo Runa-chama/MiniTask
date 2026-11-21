@@ -9,18 +9,22 @@ use egui_extras::{Column, TableBuilder};
 use crate::net::NetSession;
 use crate::process::{self, ProcCollector, ProcRow, SysLoad};
 use crate::startup::{self, StartupEntry};
-use crate::util::{self, ACCENT, CPU_COLOR, DANGER, MEM_COLOR, WARN};
+use crate::util::{
+    self, ACCENT, CPU_COLOR, DANGER, GPU_COLOR, MEM_COLOR, NPU_COLOR, ROM_COLOR, WARN,
+};
 
 const HISTORY_LEN: usize = 120;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Processes,
+    Performance,
     Startup,
 }
 
+/// プロセス一覧の列。タブの右クリックメニューで表示/非表示を切り替える。
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SortCol {
+enum ColumnKind {
     Name,
     Pid,
     Cpu,
@@ -35,9 +39,93 @@ enum SortCol {
     Cmd,
 }
 
-impl SortCol {
+impl ColumnKind {
+    const ALL: [Self; 12] = [
+        Self::Name,
+        Self::Pid,
+        Self::Cpu,
+        Self::Mem,
+        Self::NetRecv,
+        Self::NetSent,
+        Self::IoRead,
+        Self::IoWrite,
+        Self::User,
+        Self::Start,
+        Self::Exe,
+        Self::Cmd,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Name => "名前",
+            Self::Pid => "PID",
+            Self::Cpu => "CPU",
+            Self::Mem => "メモリ",
+            Self::NetRecv => "ネット受信",
+            Self::NetSent => "ネット送信",
+            Self::IoRead => "I/O 読取",
+            Self::IoWrite => "I/O 書込",
+            Self::User => "ユーザー",
+            Self::Start => "開始時刻",
+            Self::Exe => "パス",
+            Self::Cmd => "コマンドライン",
+        }
+    }
+
     fn is_numeric(self) -> bool {
         !matches!(self, Self::Name | Self::User | Self::Exe | Self::Cmd)
+    }
+
+    fn spec(self) -> Column {
+        match self {
+            Self::Name => Column::auto().at_least(180.0).clip(true),
+            Self::Pid => Column::initial(60.0).clip(true),
+            Self::Cpu => Column::initial(64.0).clip(true),
+            Self::Mem => Column::initial(88.0).clip(true),
+            Self::NetRecv => Column::initial(92.0).clip(true),
+            Self::NetSent => Column::initial(92.0).clip(true),
+            Self::IoRead => Column::initial(88.0).clip(true),
+            Self::IoWrite => Column::initial(88.0).clip(true),
+            Self::User => Column::initial(110.0).clip(true),
+            Self::Start => Column::initial(126.0).clip(true),
+            Self::Exe => Column::auto().at_least(220.0).clip(true),
+            Self::Cmd => Column::auto().at_least(260.0).clip(true),
+        }
+    }
+
+    fn render(self, ui: &mut egui::Ui, row: &ProcRow) {
+        match self {
+            Self::Name => {
+                ui.label(&row.name);
+            }
+            Self::Pid => util::num_cell(ui, row.pid.to_string(), None),
+            Self::Cpu => util::num_cell(ui, format!("{:.1}%", row.cpu), util::cpu_color(row.cpu)),
+            Self::Mem => util::num_cell(ui, util::fmt_bytes(row.mem), None),
+            Self::NetRecv => util::num_cell(
+                ui,
+                util::fmt_rate(row.net_recv),
+                (row.net_recv > 0).then_some(MEM_COLOR),
+            ),
+            Self::NetSent => util::num_cell(
+                ui,
+                util::fmt_rate(row.net_sent),
+                (row.net_sent > 0).then_some(CPU_COLOR),
+            ),
+            Self::IoRead => util::num_cell(ui, util::fmt_rate(row.io_read), None),
+            Self::IoWrite => util::num_cell(ui, util::fmt_rate(row.io_write), None),
+            Self::User => {
+                ui.label(&row.user);
+            }
+            Self::Start => {
+                ui.label(RichText::new(util::fmt_time(row.start_time)).monospace().size(12.0));
+            }
+            Self::Exe => {
+                ui.label(RichText::new(&row.exe).size(12.0));
+            }
+            Self::Cmd => {
+                ui.label(RichText::new(&row.cmd).size(12.0));
+            }
+        }
     }
 }
 
@@ -47,15 +135,18 @@ pub struct MiniTaskApp {
     load: SysLoad,
     cpu_hist: VecDeque<f32>,
     mem_hist: VecDeque<f32>,
+    rom_hist: VecDeque<f32>,
+    gpu_hist: VecDeque<f32>,
+    npu_hist: VecDeque<f32>,
     net: Option<NetSession>,
     net_err: Option<String>,
 
     tab: Tab,
     search: String,
-    sort_col: SortCol,
+    sort_col: ColumnKind,
     sort_desc: bool,
     selected: Option<u32>,
-    detail_cols: bool,
+    columns: [bool; 12],
     interval: f32,
     last_refresh: Instant,
 
@@ -83,14 +174,22 @@ impl MiniTaskApp {
             load: SysLoad::default(),
             cpu_hist: VecDeque::new(),
             mem_hist: VecDeque::new(),
+            rom_hist: VecDeque::new(),
+            gpu_hist: VecDeque::new(),
+            npu_hist: VecDeque::new(),
             net,
             net_err,
-            tab: Tab::Processes,
+            tab: if std::env::var("MINITASK_TAB").as_deref() == Ok("performance") {
+                Tab::Performance
+            } else {
+                Tab::Processes
+            },
             search: String::new(),
-            sort_col: SortCol::Cpu,
+            sort_col: ColumnKind::Cpu,
             sort_desc: true,
             selected: None,
-            detail_cols: false,
+            // 既定は基本8列のみ。詳細列はタブの右クリックで有効化する。
+            columns: [true, true, true, true, true, true, true, true, false, false, false, false],
             interval: 1.0,
             last_refresh: Instant::now() - Duration::from_secs(10),
             confirm_kill: None,
@@ -109,16 +208,25 @@ impl MiniTaskApp {
             self.rows = rows;
             self.load = load;
             self.cpu_hist.push_back(load.cpu);
-            self.mem_hist.push_back(if load.mem_total > 0 {
+            let mem_pct = if load.mem_total > 0 {
                 load.mem_used as f32 / load.mem_total as f32 * 100.0
             } else {
                 0.0
-            });
-            while self.cpu_hist.len() > HISTORY_LEN {
-                self.cpu_hist.pop_front();
-            }
-            while self.mem_hist.len() > HISTORY_LEN {
-                self.mem_hist.pop_front();
+            };
+            self.mem_hist.push_back(mem_pct);
+            self.rom_hist.push_back(load.rom);
+            self.gpu_hist.push_back(load.gpu);
+            self.npu_hist.push_back(load.npu);
+            for hist in [
+                &mut self.cpu_hist,
+                &mut self.mem_hist,
+                &mut self.rom_hist,
+                &mut self.gpu_hist,
+                &mut self.npu_hist,
+            ] {
+                while hist.len() > HISTORY_LEN {
+                    hist.pop_front();
+                }
             }
             if let Some(pid) = self.selected {
                 if !self.rows.iter().any(|r| r.pid == pid) {
@@ -160,18 +268,18 @@ impl MiniTaskApp {
         let col = self.sort_col;
         view.sort_by(|a, b| {
             let ord = match col {
-                SortCol::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                SortCol::Pid => a.pid.cmp(&b.pid),
-                SortCol::Cpu => a.cpu.total_cmp(&b.cpu),
-                SortCol::Mem => a.mem.cmp(&b.mem),
-                SortCol::NetRecv => a.net_recv.cmp(&b.net_recv),
-                SortCol::NetSent => a.net_sent.cmp(&b.net_sent),
-                SortCol::IoRead => a.io_read.cmp(&b.io_read),
-                SortCol::IoWrite => a.io_write.cmp(&b.io_write),
-                SortCol::User => a.user.to_lowercase().cmp(&b.user.to_lowercase()),
-                SortCol::Start => a.start_time.cmp(&b.start_time),
-                SortCol::Exe => a.exe.to_lowercase().cmp(&b.exe.to_lowercase()),
-                SortCol::Cmd => a.cmd.to_lowercase().cmp(&b.cmd.to_lowercase()),
+                ColumnKind::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                ColumnKind::Pid => a.pid.cmp(&b.pid),
+                ColumnKind::Cpu => a.cpu.total_cmp(&b.cpu),
+                ColumnKind::Mem => a.mem.cmp(&b.mem),
+                ColumnKind::NetRecv => a.net_recv.cmp(&b.net_recv),
+                ColumnKind::NetSent => a.net_sent.cmp(&b.net_sent),
+                ColumnKind::IoRead => a.io_read.cmp(&b.io_read),
+                ColumnKind::IoWrite => a.io_write.cmp(&b.io_write),
+                ColumnKind::User => a.user.to_lowercase().cmp(&b.user.to_lowercase()),
+                ColumnKind::Start => a.start_time.cmp(&b.start_time),
+                ColumnKind::Exe => a.exe.to_lowercase().cmp(&b.exe.to_lowercase()),
+                ColumnKind::Cmd => a.cmd.to_lowercase().cmp(&b.cmd.to_lowercase()),
             };
             if self.sort_desc {
                 ord.reverse()
@@ -182,7 +290,7 @@ impl MiniTaskApp {
         view
     }
 
-    fn sort_header(&mut self, ui: &mut egui::Ui, col: SortCol, label: &str) {
+    fn sort_header(&mut self, ui: &mut egui::Ui, col: ColumnKind) {
         let arrow = if self.sort_col == col {
             if self.sort_desc {
                 " ▼"
@@ -192,7 +300,7 @@ impl MiniTaskApp {
         } else {
             ""
         };
-        let text = RichText::new(format!("{label}{arrow}")).strong();
+        let text = RichText::new(format!("{}{arrow}", col.label())).strong();
         if ui.button(text).clicked() {
             if self.sort_col == col {
                 self.sort_desc = !self.sort_desc;
@@ -226,12 +334,22 @@ impl eframe::App for MiniTaskApp {
             self.header(ui);
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Processes, "  プロセス  ");
+                let processes = ui.selectable_value(&mut self.tab, Tab::Processes, "  プロセス  ");
+                processes.context_menu(|ui| self.column_menu(ui));
+                ui.selectable_value(&mut self.tab, Tab::Performance, "  パフォーマンス  ");
                 ui.selectable_value(&mut self.tab, Tab::Startup, "  スタートアップ  ");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new("プロセスタブを右クリックで列を選択")
+                            .size(12.0)
+                            .color(Color32::from_gray(120)),
+                    );
+                });
             });
             ui.separator();
             match self.tab {
                 Tab::Processes => self.processes_tab(ui),
+                Tab::Performance => self.performance_tab(ui),
                 Tab::Startup => self.startup_tab(ui),
             }
         });
@@ -280,6 +398,19 @@ impl MiniTaskApp {
         });
     }
 
+    /// プロセスタブの右クリックメニュー: 表示する列を選ぶ。
+    fn column_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(180.0);
+        ui.label(RichText::new("表示する列").strong());
+        ui.separator();
+        for (i, c) in ColumnKind::ALL.into_iter().enumerate() {
+            if ui.checkbox(&mut self.columns[i], c.label()).clicked() {
+                // 何も表示されなくならないよう、名前列は常に表示する
+                self.columns[0] = true;
+            }
+        }
+    }
+
     fn processes_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("検索:");
@@ -291,7 +422,6 @@ impl MiniTaskApp {
             if ui.button("✕").on_hover_text("検索をクリア").clicked() {
                 self.search.clear();
             }
-            ui.checkbox(&mut self.detail_cols, "詳細列");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add_enabled(self.selected.is_some(), egui::Button::new("タスクの終了"))
@@ -309,114 +439,37 @@ impl MiniTaskApp {
         ui.add_space(2.0);
 
         let view = self.sorted_view();
-        let detail = self.detail_cols;
+        // タブの右クリックメニューで選んだ列だけを表示 (名前は常に表示)
+        let visible: Vec<ColumnKind> = ColumnKind::ALL
+            .into_iter()
+            .zip(self.columns)
+            .filter_map(|(c, on)| on.then_some(c))
+            .collect();
 
         let mut table = TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
             .sense(egui::Sense::click())
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::auto().at_least(180.0).clip(true)) // 名前
-            .column(Column::initial(60.0).clip(true)) // PID
-            .column(Column::initial(64.0).clip(true)) // CPU
-            .column(Column::initial(88.0).clip(true)) // メモリ
-            .column(Column::initial(92.0).clip(true)) // ネット受信
-            .column(Column::initial(92.0).clip(true)) // ネット送信
-            .column(Column::initial(88.0).clip(true)) // I/O 読取
-            .column(Column::initial(88.0).clip(true)); // I/O 書込
-        if detail {
-            table = table
-                .column(Column::initial(110.0).clip(true)) // ユーザー
-                .column(Column::initial(126.0).clip(true)) // 開始時刻
-                .column(Column::auto().at_least(220.0).clip(true)) // パス
-                .column(Column::auto().at_least(260.0).clip(true)); // コマンドライン
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center));
+        for &c in &visible {
+            table = table.column(c.spec());
         }
 
         table
             .header(24.0, |mut header| {
-                let base: [(SortCol, &str); 8] = [
-                    (SortCol::Name, "名前"),
-                    (SortCol::Pid, "PID"),
-                    (SortCol::Cpu, "CPU"),
-                    (SortCol::Mem, "メモリ"),
-                    (SortCol::NetRecv, "ネット受信"),
-                    (SortCol::NetSent, "ネット送信"),
-                    (SortCol::IoRead, "I/O 読取"),
-                    (SortCol::IoWrite, "I/O 書込"),
-                ];
-                for (col, label) in base {
+                for &c in &visible {
                     header.col(|ui| {
-                        self.sort_header(ui, col, label);
+                        self.sort_header(ui, c);
                     });
-                }
-                if detail {
-                    for (col, label) in [
-                        (SortCol::User, "ユーザー"),
-                        (SortCol::Start, "開始時刻"),
-                        (SortCol::Exe, "パス"),
-                        (SortCol::Cmd, "コマンドライン"),
-                    ] {
-                        header.col(|ui| {
-                            self.sort_header(ui, col, label);
-                        });
-                    }
                 }
             })
             .body(|mut body| {
                 for row in view {
                     body.row(20.0, |mut table_row| {
                         table_row.set_selected(self.selected == Some(row.pid));
-                        table_row.col(|ui| {
-                            ui.label(&row.name);
-                        });
-                        table_row.col(|ui| {
-                            util::num_cell(ui, row.pid.to_string(), None);
-                        });
-                        table_row.col(|ui| {
-                            util::num_cell(
-                                ui,
-                                format!("{:.1}%", row.cpu),
-                                util::cpu_color(row.cpu),
-                            );
-                        });
-                        table_row.col(|ui| {
-                            util::num_cell(ui, util::fmt_bytes(row.mem), None);
-                        });
-                        table_row.col(|ui| {
-                            util::num_cell(
-                                ui,
-                                util::fmt_rate(row.net_recv),
-                                (row.net_recv > 0).then_some(MEM_COLOR),
-                            );
-                        });
-                        table_row.col(|ui| {
-                            util::num_cell(
-                                ui,
-                                util::fmt_rate(row.net_sent),
-                                (row.net_sent > 0).then_some(CPU_COLOR),
-                            );
-                        });
-                        table_row.col(|ui| {
-                            util::num_cell(ui, util::fmt_rate(row.io_read), None);
-                        });
-                        table_row.col(|ui| {
-                            util::num_cell(ui, util::fmt_rate(row.io_write), None);
-                        });
-                        if detail {
-                            table_row.col(|ui| {
-                                ui.label(&row.user);
-                            });
-                            table_row.col(|ui| {
-                                ui.label(RichText::new(util::fmt_time(row.start_time)).monospace().size(12.0));
-                            });
-                            table_row.col(|ui| {
-                                ui.label(RichText::new(&row.exe).size(12.0));
-                            });
-                            table_row.col(|ui| {
-                                ui.label(RichText::new(&row.cmd).size(12.0));
-                            });
+                        for &c in &visible {
+                            table_row.col(|ui| c.render(ui, &row));
                         }
-
                         let resp = table_row.response();
                         if resp.clicked() {
                             self.selected = Some(row.pid);
@@ -447,6 +500,97 @@ impl MiniTaskApp {
                     });
                 }
             });
+    }
+
+    /// 1 メトリクスのグラフ行 (左: 値 / 右: 折れ線)。
+    fn perf_graph(
+        ui: &mut egui::Ui,
+        title: &str,
+        value: f32,
+        hist: &VecDeque<f32>,
+        color: Color32,
+        subtitle: &str,
+    ) {
+        ui.add_space(4.0);
+        ui.group(|ui| {
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(180.0, 0.0),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        ui.label(RichText::new(title).strong().size(15.0).color(color));
+                        ui.label(
+                            RichText::new(format!("{value:.0}%"))
+                                .strong()
+                                .monospace()
+                                .size(27.0)
+                                .color(color),
+                        );
+                        ui.label(
+                            RichText::new(subtitle)
+                                .small()
+                                .color(Color32::from_gray(140)),
+                        );
+                    },
+                );
+                let width = (ui.available_width() - 8.0).max(120.0);
+                util::sparkline(ui, hist, 100.0, color, Vec2::new(width, 84.0));
+            });
+        });
+    }
+
+    fn performance_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("システム全体の使用率").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new("過去 120 サンプル / 0〜100%")
+                        .size(12.0)
+                        .color(Color32::from_gray(120)),
+                );
+            });
+        });
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let mem_pct = if self.load.mem_total > 0 {
+                self.load.mem_used as f32 / self.load.mem_total as f32 * 100.0
+            } else {
+                0.0
+            };
+            let total_gb = self.load.mem_total as f64 / (1024.0 * 1024.0 * 1024.0);
+            let used_gb = self.load.mem_used as f64 / (1024.0 * 1024.0 * 1024.0);
+
+            Self::perf_graph(ui, "CPU", self.load.cpu, &self.cpu_hist, CPU_COLOR, "プロセッサ");
+            Self::perf_graph(
+                ui,
+                "RAM (メモリ)",
+                mem_pct,
+                &self.mem_hist,
+                MEM_COLOR,
+                &format!("{used_gb:.1} / {total_gb:.1} GB"),
+            );
+            Self::perf_graph(
+                ui,
+                "ROM (ストレージ)",
+                self.load.rom,
+                &self.rom_hist,
+                ROM_COLOR,
+                "C: ドライブ使用率",
+            );
+            Self::perf_graph(
+                ui,
+                "GPU",
+                self.load.gpu,
+                &self.gpu_hist,
+                GPU_COLOR,
+                "グラフィックエンジン",
+            );
+            let npu_sub = if self.load.npu_available {
+                "NPU エンジン"
+            } else {
+                "NPU 非搭載 / 取得不可"
+            };
+            Self::perf_graph(ui, "NPU", self.load.npu, &self.npu_hist, NPU_COLOR, npu_sub);
+        });
     }
 
     fn startup_tab(&mut self, ui: &mut egui::Ui) {
