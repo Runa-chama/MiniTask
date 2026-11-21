@@ -851,25 +851,41 @@ impl MiniTaskApp {
     ) {
         let painter = ui.painter();
         let x = rect.left() + 106.0;
+        let wrap_width = (rect.right() - x - 8.0).max(40.0);
         painter.text(
-            egui::pos2(x, rect.top() + 10.0),
+            egui::pos2(x, rect.top() + 8.0),
             egui::Align2::LEFT_TOP,
             label,
             egui::FontId::proportional(14.0),
             ui.visuals().text_color(),
         );
+        let mut value_y = rect.top() + 50.0;
         if !detail.is_empty() {
-            painter.text(
-                egui::pos2(x, rect.top() + 31.0),
-                egui::Align2::LEFT_TOP,
-                detail,
+            // 長い GPU / NPU 名は最大 2 行で折り返し、それ以上は「…」で省略
+            let mut job = egui::text::LayoutJob::simple(
+                detail.to_owned(),
                 egui::FontId::proportional(11.0),
                 Color32::from_gray(145),
+                wrap_width,
             );
+            job.wrap = egui::text::TextWrapping {
+                max_width: wrap_width,
+                max_rows: 2,
+                overflow_character: Some('…'),
+                ..Default::default()
+            };
+            let galley = painter.layout_job(job);
+            let detail_y = rect.top() + 27.0;
+            painter.galley(
+                egui::pos2(x, detail_y),
+                galley.clone(),
+                Color32::from_gray(145),
+            );
+            value_y = (detail_y + galley.size().y + 3.0).max(value_y);
         }
         if !value.is_empty() {
             painter.text(
-                egui::pos2(x, rect.top() + 50.0),
+                egui::pos2(x, value_y.min(rect.bottom() - 15.0)),
                 egui::Align2::LEFT_TOP,
                 value,
                 egui::FontId::proportional(13.0),
@@ -1142,8 +1158,15 @@ impl MiniTaskApp {
         // 入る前に実ビューポート高さを記録し、グラフ高さの計算に使う。
         // これにより通常サイズでは収まり、極端に小さい場合だけスクロールする。
         let viewport_h = ui.available_height().clamp(0.0, 4000.0);
-        // 右側の内容は縦にはみ出したらスクロールできるようにする
-        // (ウィンドウが小さくても詳細情報までアクセス可能)
+        // 右側の内容は四周に余白を取り、縦にはみ出したらスクロールできるようにする
+        egui::Frame::default()
+            .inner_margin(egui::Margin {
+                left: 16,
+                right: 16,
+                top: 12,
+                bottom: 12,
+            })
+            .show(ui, |ui| {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -1291,10 +1314,10 @@ impl MiniTaskApp {
                 );
             });
         });
-        ui.add_space(4.0);
-        // ヘッダー・ラベル・詳細情報 (最大 6 行)・区切り線の予約分 ~285px
+        ui.add_space(10.0);
+        // ヘッダー・ラベル・詳細情報 (最大 6 行)・区切り線・余白の予約分 ~320px
         let avail_h = viewport_h;
-        let gh = (avail_h * 0.52).min(avail_h - 285.0).clamp(80.0, 340.0);
+        let gh = (avail_h * 0.52).min(avail_h - 320.0).clamp(80.0, 340.0);
         let gw = ui.available_width().clamp(60.0, 4000.0);
 
         if self.perf_sel == PerfSel::Cpu && self.cpu_graph_mode == CpuGraphMode::PerCore {
@@ -1521,7 +1544,7 @@ impl MiniTaskApp {
                 }
             }
         }
-        ui.add_space(6.0);
+        ui.add_space(10.0);
         ui.separator();
 
         // 詳細情報 (2 列) — 本家タスクマネージャーと同じ文言
@@ -1737,6 +1760,7 @@ impl MiniTaskApp {
                     }
                 }
             });
+        });
         });
         });
     }
