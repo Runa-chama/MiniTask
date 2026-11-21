@@ -182,6 +182,14 @@ pub struct MiniTaskApp {
     perf_sel: PerfSel,
     cpu_graph_mode: CpuGraphMode,
     core_hist: Vec<VecDeque<f32>>,
+    /// GPU エンジン種別ごとの履歴 (キーは engtype の小文字)
+    gpu_engine_hist: Vec<(String, VecDeque<f32>)>,
+    /// NPU エンジン種別ごとの履歴
+    npu_engine_hist: Vec<(String, VecDeque<f32>)>,
+    /// GPU 大グラフに表示する種別 (None = 全体的な使用率)
+    gpu_sel: Option<String>,
+    /// NPU 大グラフに表示する種別
+    npu_sel: Option<String>,
     search: String,
     sort_col: ColumnKind,
     sort_desc: bool,
@@ -220,14 +228,24 @@ impl MiniTaskApp {
             npu_hist: VecDeque::new(),
             net,
             net_err,
-            tab: if std::env::var("MINITASK_TAB").as_deref() == Ok("performance") {
-                Tab::Performance
-            } else {
-                Tab::Processes
+            // MINITASK_TAB: processes / performance / cpu / ram / rom / gpu / npu
+            tab: match std::env::var("MINITASK_TAB").as_deref() {
+                Ok("processes") | Err(_) => Tab::Processes,
+                Ok(_) => Tab::Performance,
             },
-            perf_sel: PerfSel::Cpu,
+            perf_sel: match std::env::var("MINITASK_TAB").as_deref() {
+                Ok("ram") | Ok("memory") => PerfSel::Ram,
+                Ok("rom") | Ok("disk") => PerfSel::Rom,
+                Ok("gpu") => PerfSel::Gpu,
+                Ok("npu") => PerfSel::Npu,
+                _ => PerfSel::Cpu,
+            },
             cpu_graph_mode: CpuGraphMode::Overall,
             core_hist: Vec::new(),
+            gpu_engine_hist: Vec::new(),
+            npu_engine_hist: Vec::new(),
+            gpu_sel: None,
+            npu_sel: None,
             search: String::new(),
             sort_col: ColumnKind::Cpu,
             sort_desc: true,
@@ -276,6 +294,27 @@ impl MiniTaskApp {
             self.rom_hist.push_back(load.rom);
             self.gpu_hist.push_back(load.gpu);
             self.npu_hist.push_back(load.npu);
+            // エンジン種別ごとの履歴 (GPU/NPU の「グラフの変更」用)
+            for (hists, engines) in [
+                (&mut self.gpu_engine_hist, &load.gpu_engines),
+                (&mut self.npu_engine_hist, &load.npu_engines),
+            ] {
+                for (key, val) in engines.iter() {
+                    let hist = match hists.iter_mut().find(|(k, _)| k == key) {
+                        Some((_, h)) => h,
+                        None => {
+                            hists.push((key.clone(), VecDeque::new()));
+                            &mut hists.last_mut().unwrap().1
+                        }
+                    };
+                    hist.push_back(*val);
+                    while hist.len() > HISTORY_LEN {
+                        hist.pop_front();
+                    }
+                }
+                // 使われなくなった種別の履歴を破棄
+                hists.retain(|(k, _)| engines.iter().any(|(k2, _)| k2 == k));
+            }
             self.load = load;
             // コア別履歴
             if self.core_hist.len() != self.load.core_usage.len() {
@@ -662,6 +701,30 @@ impl MiniTaskApp {
         }
     }
 
+    /// GPU / NPU グラフの右クリックメニュー (本家の「グラフの変更」と同じ方式:
+    /// 全体的な使用率 + エンジン種別ごとのグラフ)。
+    fn engine_graph_menu(
+        ui: &mut egui::Ui,
+        sel: &mut Option<String>,
+        engines: &[(String, f32)],
+    ) {
+        ui.label(RichText::new("グラフの変更").strong());
+        ui.separator();
+        let mark = if sel.is_none() { "✓ " } else { "   " };
+        if ui.button(format!("{mark}全体的な使用率")).clicked() {
+            *sel = None;
+            ui.close();
+        }
+        for (key, _) in engines {
+            let name = crate::perf::engine_display_name(key);
+            let mark = if sel.as_deref() == Some(key.as_str()) { "✓ " } else { "   " };
+            if ui.button(format!("{mark}{name}")).clicked() {
+                *sel = Some(key.clone());
+                ui.close();
+            }
+        }
+    }
+
     fn performance_tab(&mut self, ui: &mut egui::Ui) {
         let mem_pct = if self.load.mem_total > 0 {
             self.load.mem_used as f32 / self.load.mem_total as f32 * 100.0
@@ -692,9 +755,10 @@ impl MiniTaskApp {
             });
 
         // --- 中央: 選択中メトリクスの大きなグラフと詳細 ---
-        let (title, subtitle, value, hist, color) = match self.perf_sel {
+        // GPU/NPU はエンジン種別が選択されていればそのグラフを表示する
+        let (title, subtitle, value, hist, color, _is_engine_sel) = match self.perf_sel {
             PerfSel::Cpu => (
-                "CPU",
+                "CPU".to_owned(),
                 if self.load.cpu_brand.is_empty() {
                     "プロセッサ".to_owned()
                 } else {
@@ -703,39 +767,119 @@ impl MiniTaskApp {
                 format!("{:.0}%", self.load.cpu),
                 &self.cpu_hist,
                 CPU_COLOR,
+                false,
             ),
             PerfSel::Ram => (
-                "メモリ",
+                "メモリ".to_owned(),
                 "物理メモリ (RAM)".to_owned(),
                 format!("{mem_pct:.0}%"),
                 &self.mem_hist,
                 MEM_COLOR,
+                false,
             ),
             PerfSel::Rom => (
-                "ディスク (C:)",
+                "ディスク (C:)".to_owned(),
                 "ストレージ (ROM)".to_owned(),
                 format!("{:.0}%", self.load.rom),
                 &self.rom_hist,
                 ROM_COLOR,
+                false,
             ),
-            PerfSel::Gpu => (
-                "GPU",
-                self.load.gpu_model.clone(),
-                format!("{:.0}%", self.load.gpu),
-                &self.gpu_hist,
-                GPU_COLOR,
-            ),
-            PerfSel::Npu => (
-                "NPU",
-                if self.load.npu_available {
+            PerfSel::Gpu => {
+                if let Some(key) = self.gpu_sel.clone() {
+                    let name = crate::perf::engine_display_name(&key);
+                    let hist = self
+                        .gpu_engine_hist
+                        .iter()
+                        .find(|(k, _)| *k == key)
+                        .map(|(_, h)| h);
+                    let cur = self
+                        .load
+                        .gpu_engines
+                        .iter()
+                        .find(|(k, _)| *k == key)
+                        .map(|(_, v)| *v)
+                        .unwrap_or(0.0);
+                    if let Some(h) = hist {
+                        (
+                            format!("GPU — {name}"),
+                            self.load.gpu_model.clone(),
+                            format!("{cur:.0}%"),
+                            h,
+                            GPU_COLOR,
+                            true,
+                        )
+                    } else {
+                        (
+                            "GPU".to_owned(),
+                            self.load.gpu_model.clone(),
+                            format!("{:.0}%", self.load.gpu),
+                            &self.gpu_hist,
+                            GPU_COLOR,
+                            false,
+                        )
+                    }
+                } else {
+                    (
+                        "GPU".to_owned(),
+                        self.load.gpu_model.clone(),
+                        format!("{:.0}%", self.load.gpu),
+                        &self.gpu_hist,
+                        GPU_COLOR,
+                        false,
+                    )
+                }
+            }
+            PerfSel::Npu => {
+                let npu_sub = if self.load.npu_available {
                     "NPU エンジン".to_owned()
                 } else {
                     "NPU 非搭載 / 取得不可".to_owned()
-                },
-                format!("{:.0}%", self.load.npu),
-                &self.npu_hist,
-                NPU_COLOR,
-            ),
+                };
+                if let Some(key) = self.npu_sel.clone() {
+                    let name = crate::perf::engine_display_name(&key);
+                    let hist = self
+                        .npu_engine_hist
+                        .iter()
+                        .find(|(k, _)| *k == key)
+                        .map(|(_, h)| h);
+                    let cur = self
+                        .load
+                        .npu_engines
+                        .iter()
+                        .find(|(k, _)| *k == key)
+                        .map(|(_, v)| *v)
+                        .unwrap_or(0.0);
+                    if let Some(h) = hist {
+                        (
+                            format!("NPU — {name}"),
+                            npu_sub,
+                            format!("{cur:.0}%"),
+                            h,
+                            NPU_COLOR,
+                            true,
+                        )
+                    } else {
+                        (
+                            "NPU".to_owned(),
+                            npu_sub,
+                            format!("{:.0}%", self.load.npu),
+                            &self.npu_hist,
+                            NPU_COLOR,
+                            false,
+                        )
+                    }
+                } else {
+                    (
+                        "NPU".to_owned(),
+                        npu_sub,
+                        format!("{:.0}%", self.load.npu),
+                        &self.npu_hist,
+                        NPU_COLOR,
+                        false,
+                    )
+                }
+            }
         };
 
         ui.add_space(2.0);
@@ -759,70 +903,94 @@ impl MiniTaskApp {
             });
         });
         ui.add_space(4.0);
-        let gh = (ui.available_height() * 0.56).clamp(140.0, 340.0);
-        let gw = ui.available_width().clamp(200.0, 4000.0);
+        // グラフ高さ: ヘッダー・詳細情報・区切り線 (~225px) が必ず収まるよう
+        // 利用可能高さから予約分を差し引いた値を上限にする (はみ出し防止)
+        let avail_h = ui.available_height().clamp(0.0, 1200.0);
+        let gh = (avail_h * 0.56).min(avail_h - 225.0).clamp(80.0, 340.0);
+        let gw = ui.available_width().clamp(60.0, 4000.0);
 
         if self.perf_sel == PerfSel::Cpu && self.cpu_graph_mode == CpuGraphMode::PerCore {
             // 論理プロセッサごとのグラフ (タスクマネージャーの「論理プロセッサ」表示)
             let n = self.core_hist.len().max(1);
             let rows = if n <= 4 { 1 } else { 2 };
             let cols = n.div_ceil(rows);
-            let ch = ((gh - (rows as f32 - 1.0) * 6.0) / rows as f32).max(50.0);
+            let ch = ((gh - (rows as f32 - 1.0) * 6.0) / rows as f32).max(36.0);
             for row in 0..rows {
-                let row_resp = ui
-                    .horizontal(|ui| {
-                        let w = ui.available_width();
-                        let cw = ((w - (cols as f32 - 1.0) * 6.0) / cols as f32).max(60.0);
-                        for col in 0..cols {
-                            let idx = row * cols + col;
-                            if idx >= self.core_hist.len() {
-                                break;
-                            }
-                            let (rect, _resp) =
-                                ui.allocate_exact_size(Vec2::new(cw, ch), egui::Sense::hover());
-                            let painter = ui.painter();
-                            painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
-                            let cur = self
-                                .load
-                                .core_usage
-                                .get(idx)
-                                .copied()
-                                .unwrap_or(0.0);
-                            painter.text(
-                                rect.left_top() + egui::vec2(8.0, 4.0),
-                                egui::Align2::LEFT_TOP,
-                                format!("CPU {idx}"),
-                                egui::FontId::proportional(11.0),
-                                Color32::from_gray(150),
-                            );
-                            painter.text(
-                                egui::pos2(rect.right() - 8.0, rect.top() + 4.0),
-                                egui::Align2::RIGHT_TOP,
-                                format!("{cur:.0}%"),
-                                egui::FontId::proportional(11.0),
-                                CPU_COLOR,
-                            );
-                            let graph_rect = egui::Rect::from_min_max(
-                                egui::pos2(rect.left() + 6.0, rect.top() + 20.0),
-                                egui::pos2(rect.right() - 6.0, rect.bottom() - 4.0),
-                            );
-                            util::paint_mini_graph(
-                                painter,
-                                graph_rect,
-                                &self.core_hist[idx],
-                                100.0,
-                                CPU_COLOR,
-                            );
+                ui.horizontal(|ui| {
+                    let w = ui.available_width();
+                    let cw = ((w - (cols as f32 - 1.0) * 6.0) / cols as f32).max(40.0);
+                    for col in 0..cols {
+                        let idx = row * cols + col;
+                        if idx >= self.core_hist.len() {
+                            break;
                         }
-                    })
-                    .response;
-                row_resp.context_menu(|ui| self.cpu_graph_menu(ui));
+                        // セル自体をクリック可能にする (右クリックメニュー用)
+                        let (rect, cell_resp) =
+                            ui.allocate_exact_size(Vec2::new(cw, ch), egui::Sense::click());
+                        let painter = ui.painter();
+                        painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+                        let cur = self
+                            .load
+                            .core_usage
+                            .get(idx)
+                            .copied()
+                            .unwrap_or(0.0);
+                        painter.text(
+                            rect.left_top() + egui::vec2(8.0, 4.0),
+                            egui::Align2::LEFT_TOP,
+                            format!("CPU {idx}"),
+                            egui::FontId::proportional(11.0),
+                            Color32::from_gray(150),
+                        );
+                        painter.text(
+                            egui::pos2(rect.right() - 8.0, rect.top() + 4.0),
+                            egui::Align2::RIGHT_TOP,
+                            format!("{cur:.0}%"),
+                            egui::FontId::proportional(11.0),
+                            CPU_COLOR,
+                        );
+                        let graph_rect = egui::Rect::from_min_max(
+                            egui::pos2(rect.left() + 6.0, rect.top() + 20.0),
+                            egui::pos2(rect.right() - 6.0, rect.bottom() - 4.0),
+                        );
+                        util::paint_mini_graph(
+                            painter,
+                            graph_rect,
+                            &self.core_hist[idx],
+                            100.0,
+                            CPU_COLOR,
+                        );
+                        // 論理プロセッサ表示でも右クリックで「全体的な使用率」に戻せる
+                        cell_resp.context_menu(|ui| self.cpu_graph_menu(ui));
+                    }
+                });
             }
         } else {
             let resp = util::perf_chart(ui, hist, 100.0, color, Vec2::new(gw, gh));
-            if self.perf_sel == PerfSel::Cpu {
-                resp.on_hover_text("右クリックでグラフの変更")
-                    .context_menu(|ui| self.cpu_graph_menu(ui));
+            match self.perf_sel {
+                PerfSel::Cpu => {
+                    resp.on_hover_text("右クリックでグラフの変更")
+                        .context_menu(|ui| self.cpu_graph_menu(ui));
+                }
+                PerfSel::Gpu => {
+                    resp.on_hover_text("右クリックでグラフの変更 (エンジン種別)")
+                        .context_menu(|ui| Self::engine_graph_menu(
+                            ui,
+                            &mut self.gpu_sel,
+                            &self.load.gpu_engines,
+                        ));
+                }
+                PerfSel::Npu => {
+                    if self.load.npu_available {
+                        resp.on_hover_text("右クリックでグラフの変更 (エンジン種別)")
+                            .context_menu(|ui| Self::engine_graph_menu(
+                                ui,
+                                &mut self.npu_sel,
+                                &self.load.npu_engines,
+                            ));
+                    }
+                }
+                _ => {}
             }
         }
         ui.add_space(6.0);
@@ -902,6 +1070,17 @@ impl MiniTaskApp {
                 }
                 PerfSel::Gpu => {
                     Self::detail_row(ui, "モデル", d.gpu_model.clone());
+                    let top = d.gpu_engines.first();
+                    Self::detail_row(
+                        ui,
+                        "最も使用された GPU エンジン",
+                        match top {
+                            Some((k, v)) => {
+                                format!("{} ({v:.1}%)", crate::perf::engine_display_name(k))
+                            }
+                            None => "—".to_owned(),
+                        },
+                    );
                 }
                 PerfSel::Npu => {
                     Self::detail_row(

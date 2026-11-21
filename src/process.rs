@@ -17,7 +17,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::net::{self, NetCounters};
-use crate::perf::NpuMeter;
+use crate::perf::{EngineMeter, GPU_ENGINE_COUNTER, NPU_ENGINE_COUNTER};
 
 /// UI に表示する 1 プロセス分の情報。
 #[derive(Clone, Debug)]
@@ -55,6 +55,10 @@ pub struct SysLoad {
     pub npu_available: bool,
     /// 論理プロセッサごとの使用率 (0..100)
     pub core_usage: Vec<f32>,
+    /// GPU エンジン種別ごとの使用率 (キーは engtype の小文字)
+    pub gpu_engines: Vec<(String, f32)>,
+    /// NPU エンジン種別ごとの使用率
+    pub npu_engines: Vec<(String, f32)>,
 
     // --- パフォーマンスタブ向けの詳細情報 ---
     pub cpu_brand: String,
@@ -99,7 +103,8 @@ pub struct ProcCollector {
     user_cache: HashMap<String, String>,
     disks: Disks,
     gpus: Gpus,
-    npu: NpuMeter,
+    npu: EngineMeter,
+    gpu_engine_meter: EngineMeter,
 }
 
 impl ProcCollector {
@@ -126,7 +131,8 @@ impl ProcCollector {
             user_cache: HashMap::new(),
             disks,
             gpus,
-            npu: NpuMeter::new(),
+            npu: EngineMeter::new(NPU_ENGINE_COUNTER),
+            gpu_engine_meter: EngineMeter::new(GPU_ENGINE_COUNTER),
         })
     }
 
@@ -189,7 +195,11 @@ impl ProcCollector {
 
         // --- NPU (非搭載機では 0) ---
         let npu_available = self.npu.available;
-        let npu = self.npu.usage().unwrap_or(0.0);
+        let npu = self.npu.total_usage().unwrap_or(0.0);
+        let npu_engines = self.npu.usage_by_type();
+
+        // --- GPU エンジン種別ごとの使用率 (タスクマネージャーの「グラフの変更」用) ---
+        let gpu_engines = self.gpu_engine_meter.usage_by_type();
 
         // --- CPU 詳細 ---
         let cpu_brand = self
@@ -264,6 +274,8 @@ impl ProcCollector {
             handles,
             uptime_secs,
             core_usage,
+            gpu_engines,
+            npu_engines,
         };
 
         let now_net = net::snapshot();

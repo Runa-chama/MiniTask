@@ -44,12 +44,17 @@ pub fn run() -> i32 {
             && (0.0..=100.0).contains(&load.gpu)
             && (0.0..=100.0).contains(&load.npu)
             && !load.core_usage.is_empty()
-            && load.core_usage.iter().all(|c| (0.0..=100.0).contains(c)),
+            && load.core_usage.iter().all(|c| (0.0..=100.0).contains(c))
+            && !load.gpu_engines.is_empty()
+            && load.gpu_engines.iter().all(|(_, v)| (0.0..=100.0).contains(v)),
         format!(
-            "cpu={:.1}%, rom={:.1}%, gpu={:.1}%, npu={:.1}%, cores={} (available={})",
-            load.cpu, load.rom, load.gpu, load.npu, load.core_usage.len(), load.npu_available
+            "cpu={:.1}%, rom={:.1}%, gpu={:.1}%, npu={:.1}%, cores={}, gpu_engines={} (available={})",
+            load.cpu, load.rom, load.gpu, load.npu, load.core_usage.len(), load.gpu_engines.len(), load.npu_available
         ),
     );
+    for (key, val) in load.gpu_engines.iter().take(8) {
+        println!("  GPU engine: {} = {:.1}%", crate::perf::engine_display_name(key), val);
+    }
     let self_row = rows.iter().find(|r| r.pid == std::process::id());
     check(
         "self process info",
