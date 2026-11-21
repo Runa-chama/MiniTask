@@ -62,7 +62,6 @@ Windows 10/11 用の軽量タスクマネージャー。Rust + egui 製。
   - 文言・レイアウトは本家 taskmgr.exe から抽出した日本語リソースに準拠
 - **プロセス別ネットワーク使用量** — ETW (Microsoft-Windows-Kernel-Network) による
   リアルタイム計測。TCP/UDP の送受信を PID 別に集計
-- **システム全体の負荷** — CPU / メモリ使用率のスパークライングラフ
 - **スタートアップ管理** — HKCU/HKLM Run キー・スタートアップフォルダーの
   有効/無効切替（本家と同じ StartupApproved 方式）と削除
 - **強制終了** — 確認ダイアログ付き TerminateProcess

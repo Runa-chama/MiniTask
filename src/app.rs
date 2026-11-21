@@ -639,26 +639,6 @@ impl MiniTaskApp {
                     .size(12.0)
                     .color(Color32::from_gray(140)),
             );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let total_gb = self.load.mem_total as f64 / (1024.0 * 1024.0 * 1024.0);
-                let used_gb = self.load.mem_used as f64 / (1024.0 * 1024.0 * 1024.0);
-                let mem_pct = if self.load.mem_total > 0 {
-                    self.load.mem_used as f32 / self.load.mem_total as f32 * 100.0
-                } else {
-                    0.0
-                };
-                ui.label(
-                    RichText::new(format!("メモリ {used_gb:.1}/{total_gb:.1} GB ({mem_pct:.0}%)"))
-                        .monospace()
-                        .size(12.0),
-                );
-                ui.add_space(14.0);
-                ui.label(
-                    RichText::new(format!("CPU {:>3.0}%", self.load.cpu))
-                        .monospace()
-                        .size(12.0),
-                );
-            });
         });
     }
 
