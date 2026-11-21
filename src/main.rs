@@ -14,6 +14,7 @@ mod netadapter;
 mod perf;
 mod process;
 mod selftest;
+mod settings;
 mod startup;
 mod util;
 

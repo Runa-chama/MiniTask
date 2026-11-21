@@ -9,6 +9,7 @@ use winreg::RegKey;
 
 use crate::net::NetSession;
 use crate::process::{self, ProcCollector};
+use crate::settings::AppSettings;
 use crate::startup;
 
 const RUN_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -50,6 +51,25 @@ pub fn run() -> i32 {
         format!(
             "cpu={:.1}%, rom={:.1}%, gpu={:.1}%, npu={:.1}%, cores={}, gpu_engines={} (counter={}, npu_device={})",
             load.cpu, load.rom, load.gpu, load.npu, load.core_usage.len(), load.gpu_engines.len(), load.npu_available, load.npu_device_present
+        ),
+    );
+    let settings = AppSettings::load();
+    check(
+        "settings persistence",
+        [500, 1000, 5000].contains(&settings.interval_ms)
+            && settings.sort_col < 14
+            && settings.tab <= 2
+            && settings.perf_kind <= 5
+            && settings.same(&AppSettings::load()),
+        format!(
+            "interval={}ms tab={} perf={}:{} cols={:014b} anim={} spline={}",
+            settings.interval_ms,
+            settings.tab,
+            settings.perf_kind,
+            settings.perf_id,
+            settings.columns_mask,
+            settings.graph_animation,
+            settings.graph_spline
         ),
     );
     check(

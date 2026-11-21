@@ -8,6 +8,7 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::net::NetSession;
 use crate::process::{self, FastMetrics, ProcCollector, ProcRow, SysLoad};
+use crate::settings::AppSettings;
 use crate::startup::{self, StartupEntry};
 use crate::util::{
     self, ACCENT, CPU_COLOR, DANGER, GPU_COLOR, HISTORY_LEN, MEM_COLOR, NET_RECV_COLOR,
@@ -269,6 +270,8 @@ pub struct MiniTaskApp {
 
     startup_entries: Vec<StartupEntry>,
     confirm_delete: Option<StartupEntry>,
+    /// 最後に保存した設定 (差分検出用)
+    saved_settings: AppSettings,
 }
 
 /// グラフ履歴へのサンプル反映に必要な値のまとまり。
@@ -347,6 +350,8 @@ impl PerfSample {
 
 impl MiniTaskApp {
     pub fn new() -> Self {
+        let settings = AppSettings::load();
+        let env_tab = std::env::var("MINITASK_TAB").ok();
         let collector = ProcCollector::new().ok();
         let (net, net_err) = if std::env::var("MINITASK_NO_ETW").is_ok() {
             (None, Some("MINITASK_NO_ETW により無効化".to_owned()))
@@ -373,22 +378,42 @@ impl MiniTaskApp {
             npu_mem_hist: VecDeque::new(),
             net,
             net_err,
-            // MINITASK_TAB: processes / performance / cpu / ram / rom / gpu / npu
-            tab: match std::env::var("MINITASK_TAB").as_deref() {
-                Ok("processes") | Err(_) => Tab::Processes,
-                Ok(_) => Tab::Performance,
+            // 環境変数 (検証用フック) は保存済み設定より優先する
+            tab: match env_tab.as_deref() {
+                Some("processes") => Tab::Processes,
+                Some(_) => Tab::Performance,
+                None => match settings.tab {
+                    1 => Tab::Performance,
+                    2 => Tab::Startup,
+                    _ => Tab::Processes,
+                },
             },
-            perf_sel: match std::env::var("MINITASK_TAB").as_deref() {
-                Ok("ram") | Ok("memory") => PerfSel::Ram,
-                Ok("rom") | Ok("disk") => PerfSel::Disk(String::new()),
-                Ok("gpu") => PerfSel::Gpu(String::new()),
-                Ok("npu") => PerfSel::Npu(String::new()),
-                Ok("net") | Ok("network") => PerfSel::Net(String::new()),
-                _ => PerfSel::Cpu,
+            perf_sel: match env_tab.as_deref() {
+                Some("ram") | Some("memory") => PerfSel::Ram,
+                Some("rom") | Some("disk") => PerfSel::Disk(String::new()),
+                Some("gpu") => PerfSel::Gpu(String::new()),
+                Some("npu") => PerfSel::Npu(String::new()),
+                Some("net") | Some("network") => PerfSel::Net(String::new()),
+                Some(_) => PerfSel::Cpu,
+                None => match settings.perf_kind {
+                    1 => PerfSel::Ram,
+                    2 => PerfSel::Disk(settings.perf_id.clone()),
+                    3 => PerfSel::Gpu(settings.perf_id.clone()),
+                    4 => PerfSel::Npu(settings.perf_id.clone()),
+                    5 => PerfSel::Net(settings.perf_id.clone()),
+                    _ => PerfSel::Cpu,
+                },
             },
-            cpu_graph_mode: match std::env::var("MINITASK_TAB").as_deref() {
-                Ok("percore") | Ok("logical") => CpuGraphMode::PerCore,
-                _ => CpuGraphMode::Overall,
+            cpu_graph_mode: match env_tab.as_deref() {
+                Some("percore") | Some("logical") => CpuGraphMode::PerCore,
+                Some(_) => CpuGraphMode::Overall,
+                None => {
+                    if settings.cpu_graph_mode {
+                        CpuGraphMode::PerCore
+                    } else {
+                        CpuGraphMode::Overall
+                    }
+                }
             },
             core_hist: Vec::new(),
             gpu_engine_hist: Vec::new(),
@@ -396,30 +421,33 @@ impl MiniTaskApp {
             gpu_sel: None,
             npu_sel: None,
             search: String::new(),
-            sort_col: ColumnKind::Cpu,
-            sort_desc: true,
+            sort_col: ColumnKind::ALL
+                .get(settings.sort_col as usize)
+                .copied()
+                .unwrap_or(ColumnKind::Cpu),
+            sort_desc: settings.sort_desc,
             selected: None,
-            // 既定はタスクマネージャーと同じ 7 列。残りはタブの右クリックで追加。
-            columns: [
-                true,  // 名前
-                true,  // 状態
-                false, // PID
-                true,  // CPU
-                true,  // メモリ
-                true,  // ネット受信
-                true,  // ネット送信
-                false, // I/O 読取
-                false, // I/O 書込
-                true,  // GPU
-                false, // ユーザー
-                false, // 開始時刻
-                false, // パス
-                false, // コマンドライン
-            ],
-            interval: 1.0,
+            // 列表示は保存済みビットマスクから復元 (既定はタスクマネージャーと同じ7列)
+            columns: {
+                let mut cols = [false; 14];
+                for (i, on) in cols.iter_mut().enumerate() {
+                    *on = settings.columns_mask & (1 << i) != 0;
+                }
+                cols[0] = true; // 名前列は常に表示
+                cols
+            },
+            interval: settings.interval_ms as f32 / 1000.0,
             paused: false,
-            graph_animation: std::env::var("MINITASK_ANIMATION").is_ok(),
-            graph_spline: std::env::var("MINITASK_SPLINE").is_ok(),
+            graph_animation: if std::env::var("MINITASK_ANIMATION").is_ok() {
+                true
+            } else {
+                settings.graph_animation
+            },
+            graph_spline: if std::env::var("MINITASK_SPLINE").is_ok() {
+                true
+            } else {
+                settings.graph_spline
+            },
             last_hist_tick: Instant::now() - Duration::from_secs(10),
             perf_overhead: 360.0,
             last_refresh: Instant::now() - Duration::from_secs(10),
@@ -428,6 +456,7 @@ impl MiniTaskApp {
             toast: None,
             startup_entries: startup::list(),
             confirm_delete: None,
+            saved_settings: settings.snapshot(),
         };
         app.refresh();
         app
@@ -741,6 +770,12 @@ impl eframe::App for MiniTaskApp {
         } else {
             ctx.request_repaint_after(interval.saturating_sub(elapsed));
         }
+        // 設定が変わっていれば保存 (差分検出なので各操作側の変更は不要)
+        let current = self.current_settings();
+        if !current.same(&self.saved_settings) {
+            current.save();
+            self.saved_settings = current;
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -771,6 +806,7 @@ impl eframe::App for MiniTaskApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.current_settings().save();
         if let Some(mut session) = self.net.take() {
             session.stop();
         }
@@ -778,6 +814,44 @@ impl eframe::App for MiniTaskApp {
 }
 
 impl MiniTaskApp {
+    /// 現在の設定を保存用の形にまとめる。
+    fn current_settings(&self) -> AppSettings {
+        let (perf_kind, perf_id) = match &self.perf_sel {
+            PerfSel::Cpu => (0, String::new()),
+            PerfSel::Ram => (1, String::new()),
+            PerfSel::Disk(id) => (2, id.clone()),
+            PerfSel::Gpu(id) => (3, id.clone()),
+            PerfSel::Npu(id) => (4, id.clone()),
+            PerfSel::Net(id) => (5, id.clone()),
+        };
+        let mut columns_mask = 0u32;
+        for (i, on) in self.columns.iter().enumerate() {
+            if *on {
+                columns_mask |= 1 << i;
+            }
+        }
+        let sort_col = ColumnKind::ALL
+            .iter()
+            .position(|c| *c == self.sort_col)
+            .unwrap_or(3) as u8;
+        AppSettings {
+            interval_ms: (self.interval * 1000.0) as u32,
+            graph_animation: self.graph_animation,
+            graph_spline: self.graph_spline,
+            columns_mask,
+            sort_col,
+            sort_desc: self.sort_desc,
+            tab: match self.tab {
+                Tab::Processes => 0,
+                Tab::Performance => 1,
+                Tab::Startup => 2,
+            },
+            perf_kind,
+            perf_id,
+            cpu_graph_mode: self.cpu_graph_mode == CpuGraphMode::PerCore,
+        }
+    }
+
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("MiniTask").size(20.0).strong().color(ACCENT));
