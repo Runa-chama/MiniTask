@@ -241,6 +241,8 @@ pub struct MiniTaskApp {
     paused: bool,
     /// グラフのなめらかなアニメーション補間 (更新の速度メニューから切替)
     graph_animation: bool,
+    /// 折れ線(false) / スプライン補間(true)
+    graph_spline: bool,
     /// パフォーマンス右側の詳細・余白の実測高さ (毎フレーム自動補正)
     perf_overhead: f32,
     last_refresh: Instant,
@@ -327,6 +329,7 @@ impl MiniTaskApp {
             interval: 1.0,
             paused: false,
             graph_animation: false,
+            graph_spline: std::env::var("MINITASK_SPLINE").is_ok(),
             perf_overhead: 360.0,
             last_refresh: Instant::now() - Duration::from_secs(10),
             confirm_kill: None,
@@ -771,13 +774,13 @@ impl MiniTaskApp {
         hist: &VecDeque<f32>,
         color: Color32,
         selected: bool,
-        phase: f32,
+        style: util::GraphStyle,
     ) -> egui::Response {
         let width = ui.available_width().clamp(80.0, 300.0);
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 84.0), egui::Sense::click());
         Self::paint_nav_background(ui, rect, resp.hovered(), selected, color, 84.0);
         let graph_rect = Self::nav_graph_rect(rect);
-        util::paint_mini_graph(ui.painter(), graph_rect, hist, 100.0, color, phase);
+        util::paint_mini_graph(ui.painter(), graph_rect, hist, 100.0, color, style);
         Self::paint_nav_text(ui, rect, label, detail, value, color);
         resp
     }
@@ -796,13 +799,13 @@ impl MiniTaskApp {
         read_color: Color32,
         write_color: Color32,
         selected: bool,
-        phase: f32,
+        style: util::GraphStyle,
     ) -> egui::Response {
         let width = ui.available_width().clamp(80.0, 300.0);
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 84.0), egui::Sense::click());
         Self::paint_nav_background(ui, rect, resp.hovered(), selected, color, 84.0);
         let graph_rect = Self::nav_graph_rect(rect);
-        util::paint_mini_dual_graph(ui.painter(), graph_rect, read, write, max, read_color, write_color, phase);
+        util::paint_mini_dual_graph(ui.painter(), graph_rect, read, write, max, read_color, write_color, style);
         Self::paint_nav_text(ui, rect, label, detail, value, color);
         resp
     }
@@ -940,6 +943,7 @@ impl MiniTaskApp {
             &mut self.interval,
             &mut self.paused,
             &mut self.graph_animation,
+            &mut self.graph_spline,
         );
     }
 
@@ -949,6 +953,7 @@ impl MiniTaskApp {
         interval: &mut f32,
         paused: &mut bool,
         animation: &mut bool,
+        spline: &mut bool,
     ) {
         ui.separator();
         ui.label(RichText::new("更新の速度").strong());
@@ -975,6 +980,7 @@ impl MiniTaskApp {
         }
         ui.separator();
         ui.checkbox(animation, "なめらかなアニメーション補間");
+        ui.checkbox(spline, "スプライン補間 (滑らかな曲線)");
     }
 
     /// GPU / NPU グラフの右クリックメニュー (本家の「グラフの変更」と同じ方式:
@@ -987,6 +993,7 @@ impl MiniTaskApp {
         interval: &mut f32,
         paused: &mut bool,
         animation: &mut bool,
+        spline: &mut bool,
     ) {
         ui.label(RichText::new("グラフの変更").strong());
         ui.separator();
@@ -1007,7 +1014,7 @@ impl MiniTaskApp {
                 ui.close();
             }
         }
-        Self::update_speed_menu(ui, interval, paused, animation);
+        Self::update_speed_menu(ui, interval, paused, animation, spline);
     }
 
     fn performance_tab(&mut self, ui: &mut egui::Ui) {
@@ -1021,6 +1028,10 @@ impl MiniTaskApp {
             (self.last_refresh.elapsed().as_secs_f32() / self.interval.max(0.05)).clamp(0.0, 1.0)
         } else {
             0.0
+        };
+        let style = util::GraphStyle {
+            phase,
+            spline: self.graph_spline,
         };
 
         // --- 左ナビ: 接続中のデバイスのみ表示 (切断時は自動的に消える) ---
@@ -1114,7 +1125,7 @@ impl MiniTaskApp {
                         hist,
                         color,
                         self.perf_sel == sel,
-                        phase,
+                        style,
                     );
                     if resp.clicked() {
                         clicked_sel = Some(sel);
@@ -1139,7 +1150,7 @@ impl MiniTaskApp {
                         CPU_COLOR,
                         ROM_COLOR,
                         self.perf_sel == sel,
-                        phase,
+                        style,
                     );
                     if resp.clicked() {
                         clicked_sel = Some(sel);
@@ -1165,7 +1176,7 @@ impl MiniTaskApp {
                         NET_RECV_COLOR,
                         NET_SEND_COLOR,
                         self.perf_sel == sel,
-                        phase,
+                        style,
                     );
                     if resp.clicked() {
                         clicked_sel = Some(sel);
@@ -1180,7 +1191,7 @@ impl MiniTaskApp {
                         hist,
                         color,
                         self.perf_sel == sel,
-                        phase,
+                        style,
                     );
                     if resp.clicked() {
                         clicked_sel = Some(sel);
@@ -1419,7 +1430,7 @@ impl MiniTaskApp {
                         &self.core_hist[idx],
                         100.0,
                         CPU_COLOR,
-                        phase,
+                        style,
                     );
                 }
                 // 論理プロセッサ表示でも右クリックで「全体的な使用率」に戻せる
@@ -1436,13 +1447,14 @@ impl MiniTaskApp {
                         .color(Color32::from_gray(150)),
                 );
             });
-            util::perf_chart(ui, &ah, 100.0, MEM_COLOR, Vec2::new(gw, main_h), phase)
+            util::perf_chart(ui, &ah, 100.0, MEM_COLOR, Vec2::new(gw, main_h), style)
                 .context_menu(|ui| {
                     Self::update_speed_menu(
                         ui,
                         &mut self.interval,
                         &mut self.paused,
                         &mut self.graph_animation,
+                        &mut self.graph_spline,
                     )
                 });
             ui.add_space(6.0);
@@ -1468,7 +1480,7 @@ impl MiniTaskApp {
                 CPU_COLOR,
                 ROM_COLOR,
                 Vec2::new(gw, (gh - main_h - 12.0).max(60.0)),
-                phase,
+                style,
             );
         } else if let Some((rh, sh, max)) = net_dual {
             // ネットワーク: 送信(黄) / 受信(緑) の 2 本線 (本家と同じ凡例付き)
@@ -1494,7 +1506,7 @@ impl MiniTaskApp {
                 NET_RECV_COLOR,
                 NET_SEND_COLOR,
                 Vec2::new(gw, gh),
-                phase,
+                style,
             )
             .context_menu(|ui| {
                 Self::update_speed_menu(
@@ -1502,6 +1514,7 @@ impl MiniTaskApp {
                     &mut self.interval,
                     &mut self.paused,
                     &mut self.graph_animation,
+                    &mut self.graph_spline,
                 )
             });
             ui.horizontal(|ui| {
@@ -1509,7 +1522,7 @@ impl MiniTaskApp {
                 ui.label(RichText::new("■ 受信").size(11.0).color(NET_RECV_COLOR));
             });
         } else {
-            let resp = util::perf_chart(ui, hist, 100.0, color, Vec2::new(gw, gh), phase);
+            let resp = util::perf_chart(ui, hist, 100.0, color, Vec2::new(gw, gh), style);
             match &self.perf_sel {
                 PerfSel::Cpu => {
                     resp.on_hover_text("右クリックでグラフの変更")
@@ -1527,6 +1540,7 @@ impl MiniTaskApp {
                     let interval = &mut self.interval;
                     let paused = &mut self.paused;
                     let animation = &mut self.graph_animation;
+                    let spline = &mut self.graph_spline;
                     resp.on_hover_text("右クリックでグラフの変更 (エンジン種別)")
                         .context_menu(move |ui| {
                             Self::engine_graph_menu(
@@ -1537,6 +1551,7 @@ impl MiniTaskApp {
                                 interval,
                                 paused,
                                 animation,
+                                spline,
                             )
                         });
                     // 本家 Win11 と同じ「専用 GPU メモリ」の第2グラフ
@@ -1565,7 +1580,7 @@ impl MiniTaskApp {
                         GPU_COLOR,
                         GPU_COLOR,
                         Vec2::new(gw, (gh * 0.3).max(50.0)),
-                        phase,
+                        style,
                     );
                 }
                 PerfSel::Npu(id) => {
@@ -1581,6 +1596,7 @@ impl MiniTaskApp {
                         let interval = &mut self.interval;
                         let paused = &mut self.paused;
                         let animation = &mut self.graph_animation;
+                        let spline = &mut self.graph_spline;
                         resp.on_hover_text("右クリックでグラフの変更 (エンジン種別)")
                             .context_menu(move |ui| {
                                 Self::engine_graph_menu(
@@ -1591,6 +1607,7 @@ impl MiniTaskApp {
                                     interval,
                                     paused,
                                     animation,
+                                    spline,
                                 )
                             });
                     }
@@ -1613,7 +1630,7 @@ impl MiniTaskApp {
                         NPU_COLOR,
                         NPU_COLOR,
                         Vec2::new(gw, (gh * 0.3).max(50.0)),
-                        phase,
+                        style,
                     );
                 }
                 _ => {
@@ -1623,6 +1640,7 @@ impl MiniTaskApp {
                             &mut self.interval,
                             &mut self.paused,
                             &mut self.graph_animation,
+                            &mut self.graph_spline,
                         )
                     });
                 }

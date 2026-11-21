@@ -131,6 +131,15 @@ pub fn fmt_time(unix_secs: u64) -> String {
 /// グラフ履歴の最大サンプル数。すべてのグラフで共有する。
 pub const HISTORY_LEN: usize = 120;
 
+/// グラフ描画オプション (アニメーション位相と補間方式)。
+#[derive(Clone, Copy, Default)]
+pub struct GraphStyle {
+    /// 更新間隔内の進み具合 (0..1)。折れ線全体を左へずらす
+    pub phase: f32,
+    /// true = Catmull-Rom スプライン、false = 折れ線
+    pub spline: bool,
+}
+
 /// 折れ線グラフの共通描画処理 (矩形内に曲線を描く。塗りつぶしなし)。
 ///
 /// タスクマネージャーと同じ挙動: サンプル数が最大に満たない間は
@@ -143,7 +152,7 @@ fn paint_curve(
     max: f32,
     color: Color32,
     stroke_width: f32,
-    phase: f32,
+    style: GraphStyle,
 ) {
     let n = values.len();
     if n < 2 {
@@ -156,13 +165,48 @@ fn paint_curve(
         .enumerate()
         .map(|(i, v)| {
             // phase (0..1) だけ左へずらすことで、更新間隔の間も滑らかに流れる
-            let x = rect.left() + 2.0 + i as f32 * slot - phase * slot;
+            let x = rect.left() + 2.0 + i as f32 * slot - style.phase * slot;
             let y = rect.bottom() - 2.0 - (v / max).clamp(0.0, 1.0) * inner_h;
             Pos2::new(x, y)
         })
         .collect();
+    let pts = if style.spline && pts.len() >= 3 {
+        catmull_rom(&pts, 8)
+    } else {
+        pts
+    };
     let painter = painter.with_clip_rect(rect);
     painter.add(egui::Shape::line(pts, egui::Stroke::new(stroke_width, color)));
+}
+
+/// Catmull-Rom 補間でサンプル点間を滑らかな曲線にする。
+fn catmull_rom(points: &[Pos2], steps: usize) -> Vec<Pos2> {
+    let last = points.len() - 1;
+    let mut out = Vec::with_capacity(last * steps + 1);
+    out.push(points[0]);
+    for i in 0..last {
+        let p0 = points[i.saturating_sub(1)];
+        let p1 = points[i];
+        let p2 = points[i + 1];
+        let p3 = points[(i + 2).min(last)];
+        for s in 1..=steps {
+            let t = s as f32 / steps as f32;
+            let t2 = t * t;
+            let t3 = t2 * t;
+            let interpolate = |a: f32, b: f32, c: f32, d: f32| {
+                0.5
+                    * (2.0 * b
+                        + (-a + c) * t
+                        + (2.0 * a - 5.0 * b + 4.0 * c - d) * t2
+                        + (-a + 3.0 * b - 3.0 * c + d) * t3)
+            };
+            out.push(Pos2::new(
+                interpolate(p0.x, p1.x, p2.x, p3.x),
+                interpolate(p0.y, p1.y, p2.y, p3.y),
+            ));
+        }
+    }
+    out
 }
 
 /// 2 本の折れ線を同じスケールで重ねて描く (ディスクの読み取り/書き込み)。
@@ -174,10 +218,10 @@ pub fn paint_dual_curve(
     max: f32,
     read_color: Color32,
     write_color: Color32,
-    phase: f32,
+    style: GraphStyle,
 ) {
-    paint_curve(painter, rect, read, max, read_color, 1.6, phase);
-    paint_curve(painter, rect, write, max, write_color, 1.6, phase);
+    paint_curve(painter, rect, read, max, read_color, 1.6, style);
+    paint_curve(painter, rect, write, max, write_color, 1.6, style);
 }
 
 /// 既に確保済みの矩形内に読み取り/書き込みグラフを描く。
@@ -189,9 +233,9 @@ pub fn paint_mini_dual_graph(
     max: f32,
     read_color: Color32,
     write_color: Color32,
-    phase: f32,
+    style: GraphStyle,
 ) {
-    paint_dual_curve(painter, rect, read, write, max, read_color, write_color, phase);
+    paint_dual_curve(painter, rect, read, write, max, read_color, write_color, style);
 }
 
 /// 2 本線の大きなグラフ。25/50/75% のグリッド線付き。
@@ -203,7 +247,7 @@ pub fn perf_dual_chart(
     read_color: Color32,
     write_color: Color32,
     size: Vec2,
-    phase: f32,
+    style: GraphStyle,
 ) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     if ui.is_rect_visible(rect) {
@@ -217,8 +261,8 @@ pub fn perf_dual_chart(
                 egui::Stroke::new(1.0, grid),
             );
         }
-        paint_curve(painter, rect, read, max, read_color, 2.0, phase);
-        paint_curve(painter, rect, write, max, write_color, 2.0, phase);
+        paint_curve(painter, rect, read, max, read_color, 2.0, style);
+        paint_curve(painter, rect, write, max, write_color, 2.0, style);
         let stamp = Color32::from_gray(110);
         let font = egui::FontId::proportional(10.0);
         painter.text(
@@ -266,9 +310,9 @@ pub fn paint_mini_graph(
     values: &VecDeque<f32>,
     max: f32,
     color: Color32,
-    phase: f32,
+    style: GraphStyle,
 ) {
-    paint_curve(painter, rect, values, max, color, 1.2, phase);
+    paint_curve(painter, rect, values, max, color, 1.2, style);
 }
 
 /// 大きな使用率グラフ (パフォーマンスタブ用)。25/50/75% のグリッド線付き。
@@ -279,7 +323,7 @@ pub fn perf_chart(
     max: f32,
     color: Color32,
     size: Vec2,
-    phase: f32,
+    style: GraphStyle,
 ) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     if ui.is_rect_visible(rect) {
@@ -294,7 +338,7 @@ pub fn perf_chart(
                 egui::Stroke::new(1.0, grid),
             );
         }
-        paint_curve(painter, rect, values, max, color, 2.0, phase);
+        paint_curve(painter, rect, values, max, color, 2.0, style);
         // 本家と同じスケール表示 (グラフ右上)
         painter.text(
             egui::pos2(rect.right() - 5.0, rect.top() + 2.0),
