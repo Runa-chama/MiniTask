@@ -39,6 +39,7 @@ pub struct AdapterSample {
     pub recv_bps: u64,
     pub sent_bps: u64,
     pub ipv4: Vec<String>,
+    #[allow(dead_code)]
     pub ipv6: Vec<String>,
     pub ipv4_global: Vec<String>,
     pub ipv4_local: Vec<String>,
@@ -85,6 +86,18 @@ impl WifiInfo {
     fn signal_dbm(&self) -> i32 {
         -100 + (self.signal_pct.min(100) as i32) / 2
     }
+}
+
+/// 説明文から規格名を推測する (PHY タイプが取得できない環境向け)。
+fn standard_from_description(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    for suffix in ["be", "ax", "ac", "n", "g", "b", "a"] {
+        let needle = format!("802.11{suffix}");
+        if lower.contains(&needle) {
+            return Some(needle);
+        }
+    }
+    None
 }
 
 /// 802.11 PHY タイプを規格名に変換する。
@@ -205,6 +218,9 @@ impl NetAdapterMeter {
                         .filter(|s| !s.is_empty())
                         .unwrap_or_else(|| name.clone());
                     let sent = sent_map.get(&name).copied().unwrap_or(0.0);
+                    let wifi_standard = wifi
+                        .and_then(|w| w.standard.clone())
+                        .or_else(|| standard_from_description(&description));
                     Some(AdapterSample {
                         id: name,
                         label,
@@ -224,7 +240,7 @@ impl NetAdapterMeter {
                             .unwrap_or_else(|| "不明".to_owned()),
                         ssid: wifi.map(|w| w.ssid.clone()).unwrap_or_default(),
                         signal_pct: wifi.map(|w| w.signal_pct).unwrap_or(0),
-                        wifi_standard: wifi.and_then(|w| w.standard.clone()),
+                        wifi_standard,
                         signal_dbm: wifi.map(|w| w.signal_dbm()),
                     })
                 })

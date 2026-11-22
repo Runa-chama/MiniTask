@@ -2347,7 +2347,9 @@ impl MiniTaskApp {
         let mut smart_open: Option<String> = None;
         if !self.graph_solo {
         let pal = self.palette;
-        ui.columns(2, |cols| {
+        // CPU は情報量が多いため 3 列に分散して縦長を抑える
+        let cpu_columns = self.perf_sel == PerfSel::Cpu;
+        ui.columns(if cpu_columns { 3 } else { 2 }, |cols| {
             let (l, rest) = cols.split_first_mut().unwrap();
             let r = rest.first_mut().unwrap();
             l.vertical(|ui| match &self.perf_sel {
@@ -2382,10 +2384,6 @@ impl MiniTaskApp {
                     for (label, bytes) in &d.cpu_caches {
                         Self::detail_row(ui, label, util::fmt_bytes(*bytes));
                     }
-                    // プロセス数 / スレッド数 / ハンドル数は同じ列に連続して表示する
-                    Self::detail_row(ui, "プロセス数", d.processes.to_string());
-                    Self::detail_row(ui, "スレッド数", d.threads.to_string());
-                    Self::detail_row(ui, "ハンドル数", d.handles.to_string());
                 }
                 PerfSel::Ram => {
                     Self::detail_row(ui, "使用中", gb(d.mem_used));
@@ -2505,13 +2503,32 @@ impl MiniTaskApp {
                 }
                 PerfSel::Net(id) => {
                     if let Some(a) = d.adapters.iter().find(|x| &x.id == id) {
-                        Self::detail_row(ui, "送信", util::fmt_rate(a.sent_bps));
-                        Self::detail_row(ui, "受信", util::fmt_rate(a.recv_bps));
+                        Self::detail_row(ui, "アダプター名", a.label.clone());
+                        Self::detail_row(ui, "説明", a.description.clone());
+                        let speed = a.link_speed_bps as f64 / 1_000_000.0;
+                        Self::detail_row(
+                            ui,
+                            "帯域幅",
+                            if speed >= 1000.0 {
+                                format!("{:.1} Gbps", speed / 1000.0)
+                            } else {
+                                format!("{speed:.1} Mbps")
+                            },
+                        );
                         if a.is_wifi {
                             Self::detail_row(
                                 ui,
-                                "信号の品質",
-                                format!("{}%", a.signal_pct),
+                                "SSID",
+                                if a.ssid.is_empty() {
+                                    "—".to_owned()
+                                } else {
+                                    a.ssid.clone()
+                                },
+                            );
+                            Self::detail_row(
+                                ui,
+                                "規格",
+                                a.wifi_standard.clone().unwrap_or_else(|| "—".to_owned()),
                             );
                             Self::detail_row(
                                 ui,
@@ -2523,24 +2540,17 @@ impl MiniTaskApp {
                             );
                             Self::detail_row(
                                 ui,
-                                "規格",
-                                a.wifi_standard.clone().unwrap_or_else(|| "—".to_owned()),
+                                "信号品質",
+                                format!("{}%", a.signal_pct),
                             );
+                        } else {
+                            Self::detail_row(ui, "状態", a.status.clone());
                         }
                     }
                 }
             });
             r.vertical(|ui| match &self.perf_sel {
-                PerfSel::Cpu => {
-                    let s = d.uptime_secs;
-                    Self::detail_row(
-                        ui,
-                        "稼働時間",
-                        format!("{}:{:02}:{:02}:{:02}", s / 86400, s / 3600 % 24, s / 60 % 60, s % 60),
-                    );
-                    Self::detail_row(ui, "論理プロセッサ数", d.logical_cores.to_string());
-                    Self::detail_row(ui, "更新間隔", format!("{} 秒", self.interval));
-                }
+                PerfSel::Cpu => {}
                 PerfSel::Ram => {
                     Self::detail_row(ui, "合計 (物理)", gb(d.mem_total));
                     Self::detail_row(ui, "プロセス数", d.processes.to_string());
@@ -2601,25 +2611,9 @@ impl MiniTaskApp {
                 }
                 PerfSel::Net(id) => {
                     if let Some(a) = d.adapters.iter().find(|x| &x.id == id) {
-                        Self::detail_row(ui, "アダプター名", a.label.clone());
-                        Self::detail_row(
-                            ui,
-                            "IPv4 アドレス",
-                            if a.ipv4.is_empty() {
-                                "—".to_owned()
-                            } else {
-                                a.ipv4.join(", ")
-                            },
-                        );
-                        Self::detail_row(
-                            ui,
-                            "IPv6 アドレス",
-                            if a.ipv6.is_empty() {
-                                "—".to_owned()
-                            } else {
-                                a.ipv6.join(", ")
-                            },
-                        );
+                        Self::detail_row(ui, "送信", util::fmt_rate(a.sent_bps));
+                        Self::detail_row(ui, "受信", util::fmt_rate(a.recv_bps));
+                        Self::detail_row(ui, "状態", a.status.clone());
                         Self::detail_row(
                             ui,
                             "ローカル IPv4",
@@ -2656,32 +2650,29 @@ impl MiniTaskApp {
                                 a.ipv6_global.join(", ")
                             },
                         );
-                        let speed = a.link_speed_bps as f64 / 1_000_000.0;
-                        Self::detail_row(
-                            ui,
-                            "帯域幅",
-                            if speed >= 1000.0 {
-                                format!("{:.1} Gbps", speed / 1000.0)
-                            } else {
-                                format!("{speed:.1} Mbps")
-                            },
-                        );
-                        Self::detail_row(ui, "状態", a.status.clone());
-                        if a.is_wifi {
-                            Self::detail_row(
-                                ui,
-                                "SSID",
-                                if a.ssid.is_empty() {
-                                    "—".to_owned()
-                                } else {
-                                    a.ssid.clone()
-                                },
-                            );
-                        }
-                        Self::detail_row(ui, "説明", a.description.clone());
+
                     }
                 }
             });
+            if cpu_columns && rest.len() > 1 {
+                rest[1].vertical(|ui| {
+                    Self::detail_row(ui, "プロセス数", d.processes.to_string());
+                    Self::detail_row(ui, "スレッド数", d.threads.to_string());
+                    Self::detail_row(ui, "ハンドル数", d.handles.to_string());
+                    let s = d.uptime_secs;
+                    Self::detail_row(
+                        ui,
+                        "稼働時間",
+                        format!(
+                            "{}:{:02}:{:02}:{:02}",
+                            s / 86400,
+                            s / 3600 % 24,
+                            s / 60 % 60,
+                            s % 60
+                        ),
+                    );
+                });
+            }
         });
         }
         if let Some(id) = smart_open {
