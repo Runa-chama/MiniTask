@@ -1009,7 +1009,7 @@ impl MiniTaskApp {
                     .color(ui.visuals().weak_text_color()),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("⚙ 設定").on_hover_text("設定").clicked() {
+                if ui.button("設定").clicked() {
                     self.settings_open = true;
                 }
                 if self.replace_taskmgr {
@@ -1018,7 +1018,7 @@ impl MiniTaskApp {
                             egui::Image::from_texture(tex).fit_to_exact_size(Vec2::splat(18.0)),
                         )
                     } else {
-                        egui::Button::new("📋")
+                        egui::Button::new("TM")
                     };
                     if ui
                         .add(button)
@@ -1325,6 +1325,24 @@ impl MiniTaskApp {
             );
             ui.add_space((170.0 - resp.rect.width()).max(10.0));
             ui.label(RichText::new(value).size(13.0).monospace());
+        });
+    }
+
+    /// 色付きの値を持つ詳細行 (SMART の健康状態・温度など)。
+    fn detail_row_colored(
+        ui: &mut egui::Ui,
+        label: &str,
+        value: impl Into<String>,
+        color: egui::Color32,
+    ) {
+        ui.horizontal(|ui| {
+            let resp = ui.label(
+                RichText::new(label)
+                    .size(12.0)
+                    .color(ui.visuals().weak_text_color()),
+            );
+            ui.add_space((170.0 - resp.rect.width()).max(10.0));
+            ui.label(RichText::new(value.into()).size(13.0).monospace().color(color));
         });
     }
 
@@ -2111,17 +2129,11 @@ impl MiniTaskApp {
                                 SmartStatus::Bad => pal.danger,
                                 SmartStatus::Unknown => ui.visuals().weak_text_color(),
                             };
-                            let resp = ui.label(
-                                RichText::new("健康状態")
-                                    .size(12.0)
-                                    .color(ui.visuals().weak_text_color()),
-                            );
-                            ui.add_space((170.0 - resp.rect.width()).max(10.0));
-                            ui.label(
-                                RichText::new(smart.status_text())
-                                    .size(13.0)
-                                    .monospace()
-                                    .color(health_color),
+                            Self::detail_row_colored(
+                                ui,
+                                "健康状態",
+                                smart.status_text(),
+                                health_color,
                             );
                             if let Some(temp) = smart.temperature_c {
                                 let temp_color = if temp >= 70 {
@@ -2131,17 +2143,11 @@ impl MiniTaskApp {
                                 } else {
                                     pal.cpu
                                 };
-                                let resp = ui.label(
-                                    RichText::new("温度")
-                                        .size(12.0)
-                                        .color(ui.visuals().weak_text_color()),
-                                );
-                                ui.add_space((170.0 - resp.rect.width()).max(10.0));
-                                ui.label(
-                                    RichText::new(format!("{temp} °C"))
-                                        .size(13.0)
-                                        .monospace()
-                                        .color(temp_color),
+                                Self::detail_row_colored(
+                                    ui,
+                                    "温度",
+                                    format!("{temp} °C"),
+                                    temp_color,
                                 );
                             }
                             if ui.button("SMART 詳細...").clicked() {
@@ -2811,6 +2817,8 @@ impl MiniTaskApp {
                 .default_size([640.0, 520.0])
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
+                    // 項目が多い場合もはみ出さないようスクロール可能にする
+                    egui::ScrollArea::vertical().show(ui, |ui| {
                     if let Some(smart) = &smart {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("健康状態").strong());
@@ -2923,6 +2931,7 @@ impl MiniTaskApp {
                     } else {
                         ui.label("このディスクの SMART 情報を取得できませんでした。");
                     }
+                    });
                 });
             if !open {
                 self.smart_dialog_disk = None;

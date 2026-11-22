@@ -13,9 +13,22 @@ use windows_sys::Win32::System::Ioctl::{
     IOCTL_STORAGE_PREDICT_FAILURE, IOCTL_STORAGE_QUERY_PROPERTY, NVMeDataTypeLogPage,
     PropertyStandardQuery, ProtocolTypeNvme, SENDCMDINPARAMS, SENDCMDOUTPARAMS, SMART_RCV_DRIVE_DATA,
     STORAGE_DEVICE_DESCRIPTOR, STORAGE_PREDICT_FAILURE, STORAGE_PROTOCOL_DATA_DESCRIPTOR,
-    STORAGE_PROTOCOL_SPECIFIC_DATA, STORAGE_PROPERTY_QUERY, StorageAdapterProtocolSpecificProperty,
+    STORAGE_PROTOCOL_SPECIFIC_DATA, STORAGE_PROPERTY_QUERY, STORAGE_TEMPERATURE_DATA_DESCRIPTOR,
+    StorageAdapterProtocolSpecificProperty,
     StorageDeviceProtocolSpecificProperty, StorageDeviceProperty, StorageDeviceTemperatureProperty,
 };
+
+/// MINITASK_DEBUG_SMART=1 のときだけ %TEMP% に取得経過を書き出す。
+fn smart_log(msg: &str) {
+    if std::env::var_os("MINITASK_DEBUG_SMART").is_none() {
+        return;
+    }
+    use std::io::Write;
+    let path = std::env::temp_dir().join("minitask_smart.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{msg}");
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SmartStatus {
@@ -227,8 +240,9 @@ pub fn parse_nvme_health(log: &[u8]) -> Option<(i16, u8, u8, u8, f64, f64)> {
 }
 
 unsafe fn open_drive(disk_id: &str) -> Option<*mut std::ffi::c_void> { unsafe {
-    let path: Vec<u16> = format!("\\\\.\\PhysicalDrive{}\\0", disk_id)
+    let path: Vec<u16> = format!("\\\\.\\PhysicalDrive{}", disk_id)
         .encode_utf16()
+        .chain(std::iter::once(0))
         .collect();
     let h = CreateFileW(
         path.as_ptr(),
@@ -275,6 +289,10 @@ unsafe fn device_info(handle: *mut std::ffi::c_void) -> (String, String, String,
     ) == 0
         || (bytes as usize) < std::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>()
     {
+        let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        smart_log(&format!(
+            "[SMART] device_info ioctl FAILED err={err} bytes={bytes}"
+        ));
         return Default::default();
     }
     let d = std::ptr::read_unaligned(buf.as_ptr().cast::<STORAGE_DEVICE_DESCRIPTOR>());
@@ -306,79 +324,109 @@ unsafe fn device_info(handle: *mut std::ffi::c_void) -> (String, String, String,
 }}
 
 unsafe fn query_nvme(handle: *mut std::ffi::c_void, info: &mut SmartInfo) -> bool { unsafe {
-    let spec = STORAGE_PROTOCOL_SPECIFIC_DATA {
-        ProtocolType: ProtocolTypeNvme,
-        DataType: NVMeDataTypeLogPage as u32,
-        ProtocolDataRequestValue: 0x02, // SMART / Health Information Log Page
-        ProtocolDataRequestSubValue: 0,
-        ProtocolDataOffset: (std::mem::size_of::<STORAGE_PROPERTY_QUERY>()
-            + std::mem::size_of::<STORAGE_PROTOCOL_SPECIFIC_DATA>()) as u32,
-        ProtocolDataLength: 512,
-        FixedProtocolReturnData: 0,
-        ProtocolDataRequestSubValue2: 0,
-        ProtocolDataRequestSubValue3: 0,
-        ProtocolDataRequestSubValue4: 0,
-    };
-    let mut in_buf = [0u8; 1024];
-    let q = in_buf.as_mut_ptr().cast::<STORAGE_PROPERTY_QUERY>();
-    *q = STORAGE_PROPERTY_QUERY {
-        PropertyId: StorageDeviceProtocolSpecificProperty,
-        QueryType: PropertyStandardQuery,
-        AdditionalParameters: [0],
-    };
-    let s = in_buf
-        .as_mut_ptr()
-        .add(std::mem::size_of::<STORAGE_PROPERTY_QUERY>())
-        .cast::<STORAGE_PROTOCOL_SPECIFIC_DATA>();
-    *s = spec;
-    let mut out = [0u8; 2048];
-    let mut bytes = 0u32;
-    let ok = DeviceIoControl(
-        handle,
-        IOCTL_STORAGE_QUERY_PROPERTY,
-        in_buf.as_ptr().cast(),
-        (std::mem::size_of::<STORAGE_PROPERTY_QUERY>()
-            + std::mem::size_of::<STORAGE_PROTOCOL_SPECIFIC_DATA>()) as u32,
-        out.as_mut_ptr().cast(),
-        out.len() as u32,
-        &mut bytes,
-        std::ptr::null_mut(),
-    );
-    if ok == 0 {
-        // アダプター要求に切り替えて再試行
-        (*q).PropertyId = StorageAdapterProtocolSpecificProperty;
-        bytes = 0;
-        if DeviceIoControl(
+    // MSDN 標準の呼び出し: STORAGE_PROTOCOL_SPECIFIC_DATA は
+    // STORAGE_PROPERTY_QUERY::AdditionalParameters の位置 (オフセット 8) に置き、
+    // ログ領域まで含めた 1 つのバッファを入出力両方に渡す。
+    // sizeof(STORAGE_PROPERTY_QUERY)=12 の位置に置くとドライバが
+    // ERROR_INVALID_PARAMETER (87) を返す。
+    const PARAM_OFF: usize = 8;
+    const SPEC_SZ: usize = std::mem::size_of::<STORAGE_PROTOCOL_SPECIFIC_DATA>();
+    const LOG_SZ: usize = 512;
+    const TOTAL: usize = PARAM_OFF + SPEC_SZ + LOG_SZ;
+
+    for prop_id in [
+        StorageDeviceProtocolSpecificProperty,
+        StorageAdapterProtocolSpecificProperty,
+    ] {
+        let mut buf = [0u8; 1024];
+        let q = buf.as_mut_ptr().cast::<STORAGE_PROPERTY_QUERY>();
+        *q = STORAGE_PROPERTY_QUERY {
+            PropertyId: prop_id,
+            QueryType: PropertyStandardQuery,
+            AdditionalParameters: [0],
+        };
+        let s = buf
+            .as_mut_ptr()
+            .add(PARAM_OFF)
+            .cast::<STORAGE_PROTOCOL_SPECIFIC_DATA>();
+        *s = STORAGE_PROTOCOL_SPECIFIC_DATA {
+            ProtocolType: ProtocolTypeNvme,
+            DataType: NVMeDataTypeLogPage as u32,
+            ProtocolDataRequestValue: 0x02, // SMART / Health Information Log Page
+            ProtocolDataRequestSubValue: 0,
+            // プロトコルデータ構造体の先頭からの相対オフセット (MSDN 標準)
+            ProtocolDataOffset: SPEC_SZ as u32,
+            ProtocolDataLength: LOG_SZ as u32,
+            FixedProtocolReturnData: 0,
+            ProtocolDataRequestSubValue2: 0,
+            ProtocolDataRequestSubValue3: 0,
+            ProtocolDataRequestSubValue4: 0,
+        };
+        let mut bytes = 0u32;
+        let ok = DeviceIoControl(
             handle,
             IOCTL_STORAGE_QUERY_PROPERTY,
-            in_buf.as_ptr().cast(),
-            (std::mem::size_of::<STORAGE_PROPERTY_QUERY>()
-                + std::mem::size_of::<STORAGE_PROTOCOL_SPECIFIC_DATA>()) as u32,
-            out.as_mut_ptr().cast(),
-            out.len() as u32,
+            buf.as_ptr().cast(),
+            TOTAL as u32,
+            buf.as_mut_ptr().cast(),
+            TOTAL as u32,
             &mut bytes,
             std::ptr::null_mut(),
-        ) == 0
-        {
-            return false;
+        );
+        if ok == 0 {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            smart_log(&format!("[NVMe] ioctl prop={prop_id} FAILED err={err}"));
+            continue;
         }
-    }
-    if (bytes as usize) < std::mem::size_of::<STORAGE_PROTOCOL_DATA_DESCRIPTOR>() {
-        return false;
-    }
-    let desc = std::ptr::read_unaligned(out.as_ptr().cast::<STORAGE_PROTOCOL_DATA_DESCRIPTOR>());
-    let off = desc.ProtocolSpecificData.ProtocolDataOffset as usize;
-    let len = desc.ProtocolSpecificData.ProtocolDataLength as usize;
-    if off == 0 || off + len > out.len() || len < std::mem::size_of::<NvmeHealthLog>() {
-        return false;
-    }
-    let Some((temp, health, spare, spare_th, read_gb, write_gb)) =
-        parse_nvme_health(&out[off..off + len])
-    else {
-        return false;
-    };
-    let log = &out[off..off + len];
-    let h = std::ptr::read_unaligned(log.as_ptr().cast::<NvmeHealthLog>());
+        if (bytes as usize) < std::mem::size_of::<STORAGE_PROTOCOL_DATA_DESCRIPTOR>() {
+            smart_log(&format!(
+                "[NVMe] ioctl prop={prop_id} short output bytes={bytes}"
+            ));
+            continue;
+        }
+        let desc =
+            std::ptr::read_unaligned(buf.as_ptr().cast::<STORAGE_PROTOCOL_DATA_DESCRIPTOR>());
+        let ret_off = desc.ProtocolSpecificData.ProtocolDataOffset as usize;
+        let ret_len = desc.ProtocolSpecificData.ProtocolDataLength as usize;
+        smart_log(&format!(
+            "[NVMe] ioctl prop={prop_id} OK bytes={bytes} ret_off={ret_off} ret_len={ret_len} size={}",
+            desc.Size
+        ));
+
+        // ドライバによって戻りオフセットの基準が異なるため複数の解釈を試す
+        let mut candidates = vec![ret_off + PARAM_OFF, ret_off, PARAM_OFF + SPEC_SZ];
+        candidates.dedup();
+        let len = if ret_len >= std::mem::size_of::<NvmeHealthLog>() {
+            ret_len
+        } else {
+            LOG_SZ
+        };
+        let mut parsed = None;
+        for off in candidates {
+            if off + len > buf.len() {
+                continue;
+            }
+            let Some(v) = parse_nvme_health(&buf[off..off + len]) else {
+                continue;
+            };
+            let (temp, _health, spare, spare_th, _, _) = v;
+            if !(0..=110).contains(&temp) || spare > 100 || spare_th > 100 {
+                smart_log(&format!(
+                    "[NVMe] candidate off={off} implausible temp={temp} spare={spare}/{spare_th}"
+                ));
+                continue;
+            }
+            smart_log(&format!(
+                "[NVMe] candidate off={off} accepted temp={temp} spare={spare}/{spare_th}"
+            ));
+            parsed = Some((off, len, v));
+            break;
+        }
+        let Some((off, len, (temp, health, spare, spare_th, read_gb, write_gb))) = parsed else {
+            continue;
+        };
+        let log = &buf[off..off + len];
+        let h = std::ptr::read_unaligned(log.as_ptr().cast::<NvmeHealthLog>());
     info.available = true;
     info.temperature_c = Some(temp);
     info.health_pct = Some(health);
@@ -406,7 +454,9 @@ unsafe fn query_nvme(handle: *mut std::ffi::c_void, info: &mut SmartInfo) -> boo
         ("危険温度時間", format!("{} 分", h.critical_temp_time)),
     ];
     info.extra.extend(values.into_iter().map(|(k, v)| (k.to_owned(), v)));
-    true
+    return true;
+    }
+    false
 }}
 
 unsafe fn smart_read(handle: *mut std::ffi::c_void, feature: u8, cyl_low: u8, cyl_high: u8) -> Option<[u8; 512]> { unsafe {
@@ -502,7 +552,7 @@ unsafe fn query_temperature(handle: *mut std::ffi::c_void, info: &mut SmartInfo)
     };
     let mut buf = [0u8; 256];
     let mut bytes = 0u32;
-    if DeviceIoControl(
+    let ok = DeviceIoControl(
         handle,
         IOCTL_STORAGE_QUERY_PROPERTY,
         &query as *const _ as *const std::ffi::c_void,
@@ -511,13 +561,19 @@ unsafe fn query_temperature(handle: *mut std::ffi::c_void, info: &mut SmartInfo)
         buf.len() as u32,
         &mut bytes,
         std::ptr::null_mut(),
-    ) != 0
-        && bytes >= 8
-    {
-        let kelvin = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as i32;
-        if (200..=500).contains(&kelvin) {
-            info.temperature_c = Some((kelvin - 273) as i16);
+    );
+    let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    smart_log(&format!(
+        "[SMART] temperature ioctl ok={} err={err} bytes={bytes}",
+        ok != 0
+    ));
+    if ok != 0 && (bytes as usize) >= std::mem::size_of::<STORAGE_TEMPERATURE_DATA_DESCRIPTOR>() {
+        let desc = std::ptr::read_unaligned(buf.as_ptr().cast::<STORAGE_TEMPERATURE_DATA_DESCRIPTOR>());
+        let temp = desc.TemperatureInfo[0].Temperature;
+        if (0..=110).contains(&temp) {
+            info.temperature_c = Some(temp);
         }
+        smart_log(&format!("[SMART] temperature parsed={temp} info_count={}", desc.InfoCount));
     }
 }}
 
@@ -553,13 +609,19 @@ pub fn query(disk_id: &str) -> SmartInfo {
         ..Default::default()
     };
     if disk_id.is_empty() || !disk_id.bytes().all(|b| b.is_ascii_digit()) {
+        smart_log(&format!("[SMART] disk={disk_id} invalid id"));
         return info;
     }
     unsafe {
         let Some(handle) = open_drive(disk_id) else {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            smart_log(&format!("[SMART] disk={disk_id} CreateFile failed err={err}"));
             return info;
         };
         let (model, serial, firmware, iface) = device_info(handle);
+        smart_log(&format!(
+            "[SMART] disk={disk_id} iface={iface} model={model} serial={serial}"
+        ));
         info.model = model;
         info.serial = serial;
         info.firmware = firmware;
@@ -569,15 +631,22 @@ pub fn query(disk_id: &str) -> SmartInfo {
         } else {
             false
         };
+        smart_log(&format!("[SMART] disk={disk_id} nvme={ok}"));
         if !ok {
             // ATA / SATA / USB (SAT) は SMART_RCV_DRIVE_DATA を試す
             let ata = query_ata(handle, &mut info);
-            if !ata && !query_predict(handle, &mut info) {
+            let pred = if !ata { query_predict(handle, &mut info) } else { false };
+            smart_log(&format!("[SMART] disk={disk_id} ata={ata} predict={pred}"));
+            if !ata && !pred {
                 info.available = false;
                 info.status = SmartStatus::Unknown;
             }
         }
         query_temperature(handle, &mut info);
+        smart_log(&format!(
+            "[SMART] disk={disk_id} final status={:?} health={:?} temp={:?}",
+            info.status, info.health_pct, info.temperature_c
+        ));
         CloseHandle(handle);
     }
     info
