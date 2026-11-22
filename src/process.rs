@@ -134,6 +134,10 @@ pub struct SysLoad {
     pub cpu_brand: String,
     pub cpu_freq_mhz: u64,
     pub logical_cores: usize,
+    pub cpu_base_mhz: Option<u32>,
+    pub cpu_physical_cores: Option<u32>,
+    pub cpu_virtualization: Option<bool>,
+    pub cpu_caches: Vec<(String, u64)>,
     pub mem_available: u64,
     pub commit_used: u64,
     pub commit_limit: u64,
@@ -176,6 +180,8 @@ pub struct ProcCollector {
     npu_recheck: u32,
     /// SMART 情報のキャッシュ (60秒TTL)
     smart_cache: HashMap<String, (Instant, Arc<SmartInfo>)>,
+    /// CPU の静的情報 (起動時に一度だけ取得)
+    cpu_info: crate::cpuinfo::CpuInfo,
 }
 
 /// グラフ描画用の軽量メトリック (高速ティック用)。
@@ -217,6 +223,8 @@ impl ProcCollector {
         sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind());
         let disks = Disks::new_with_refreshed_list().unwrap_or_else(|_| Disks::new().unwrap());
         let gpus = Gpus::new_with_refreshed_list().unwrap_or_else(|_| Gpus::new().unwrap());
+        let mut cpu_info = crate::cpuinfo::query();
+        cpu_info.physical_cores = System::physical_core_count().ok().map(|n| n as u32);
         Ok(Self {
             sys,
             cpu_count,
@@ -233,6 +241,7 @@ impl ProcCollector {
             npu_device_present: crate::perf::npu_device_present(),
             npu_recheck: 0,
             smart_cache: HashMap::new(),
+            cpu_info,
         })
     }
 
@@ -553,6 +562,10 @@ impl ProcCollector {
             cpu_brand,
             cpu_freq_mhz,
             logical_cores,
+            cpu_base_mhz: self.cpu_info.base_mhz,
+            cpu_physical_cores: self.cpu_info.physical_cores,
+            cpu_virtualization: self.cpu_info.virtualization,
+            cpu_caches: self.cpu_info.caches.clone(),
             mem_available,
             commit_used,
             commit_limit,

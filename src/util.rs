@@ -173,6 +173,15 @@ pub fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// 摂氏の温度を設定された単位の表示文字列に変換する (0=°C, 1=°F)。
+pub fn format_temp(celsius: f32, unit: u8) -> String {
+    if unit == 1 {
+        format!("{:.0} °F", celsius * 9.0 / 5.0 + 32.0)
+    } else {
+        format!("{celsius:.0} °C")
+    }
+}
+
 /// テーマを適用する (ダーク / ホワイト + ユーザー配色)。
 pub fn setup_theme(ctx: &egui::Context, dark: bool, pal: &Palette) {
     ctx.set_theme(if dark {

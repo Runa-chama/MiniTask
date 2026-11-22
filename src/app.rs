@@ -315,6 +315,11 @@ pub struct MiniTaskApp {
     update_msg: Option<String>,
     last_update_check: u64,
 
+    // --- 表示設定 / モード ---
+    temp_unit: u8,
+    graph_solo: bool,
+    fullscreen: bool,
+
     // --- アイコン / SMART ---
     icon_cache: IconCache,
     smart_dialog_disk: Option<String>,
@@ -582,6 +587,9 @@ impl MiniTaskApp {
             update_busy: false,
             update_msg: None,
             last_update_check: settings.last_update_check,
+            temp_unit: settings.temp_unit,
+            graph_solo: false,
+            fullscreen: false,
             icon_cache: IconCache::default(),
             smart_dialog_disk: None,
         };
@@ -911,6 +919,11 @@ impl eframe::App for MiniTaskApp {
             ));
             self.theme_dirty = false;
         }
+        // F11 でフルスクリーン切替
+        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            self.fullscreen = !self.fullscreen;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
         // トレイアイコンからのメッセージ
         if let Some(rx) = &self.tray_rx {
             while let Ok(msg) = rx.try_recv() {
@@ -1135,6 +1148,7 @@ impl MiniTaskApp {
             close_to_tray: self.close_to_tray,
             minimize_to_tray: self.minimize_to_tray,
             tray_usage_tip: self.tray_usage_tip,
+            temp_unit: self.temp_unit,
             last_update_check: self.last_update_check,
         }
     }
@@ -1479,7 +1493,8 @@ impl MiniTaskApp {
                     .color(ui.visuals().weak_text_color()),
             );
             ui.add_space((170.0 - resp.rect.width()).max(10.0));
-            ui.label(RichText::new(value).size(13.0).monospace());
+            // 長い説明・IPv6 等は折り返して表示し、画面外にはみ出さないようにする
+            ui.add(egui::Label::new(RichText::new(value).size(13.0).monospace()).wrap());
         });
     }
 
@@ -1526,7 +1541,10 @@ impl MiniTaskApp {
                     .color(ui.visuals().weak_text_color()),
             );
             ui.add_space((170.0 - resp.rect.width()).max(10.0));
-            ui.label(RichText::new(value.into()).size(13.0).monospace().color(color));
+            ui.add(
+                egui::Label::new(RichText::new(value.into()).size(13.0).monospace().color(color))
+                    .wrap(),
+            );
         });
     }
 
@@ -1713,6 +1731,8 @@ impl MiniTaskApp {
             ));
         }
         let mut clicked_sel: Option<PerfSel> = None;
+        // グラフ単独表示モードでは左ナビを隠す
+        if !self.graph_solo {
         egui::Panel::left("perf_nav")
             .exact_size(280.0)
             .resizable(false)
@@ -1810,6 +1830,7 @@ impl MiniTaskApp {
                 }
                     });
             });
+        }
         if let Some(sel) = clicked_sel {
             self.perf_sel = sel;
             self.gpu_sel = None;
@@ -1981,8 +2002,14 @@ impl MiniTaskApp {
         ui.add_space(10.0);
         // ヘッダー・ラベル・詳細情報 (最大 6 行)・区切り線・余白の予約分 ~320px
         let avail_h = viewport_h;
-        let gh = (avail_h * 0.52).min(avail_h - overhead).clamp(80.0, 340.0);
+        let gh = if self.graph_solo {
+            (avail_h - 60.0).clamp(120.0, 2000.0)
+        } else {
+            (avail_h * 0.52).min(avail_h - overhead).clamp(80.0, 340.0)
+        };
         let gw = ui.available_width().clamp(60.0, 4000.0);
+        // グラフのダブルクリックで単独表示を切り替える
+        let mut graph_double_clicked = false;
 
         if self.perf_sel == PerfSel::Cpu && self.cpu_graph_mode == CpuGraphMode::PerCore {
             // 論理プロセッサごとのグラフ
@@ -2000,6 +2027,7 @@ impl MiniTaskApp {
                 let w = ui.available_width().clamp(0.0, 8000.0);
                 let (row_rect, row_resp) =
                     ui.allocate_exact_size(Vec2::new(w, ch), egui::Sense::click());
+                graph_double_clicked |= row_resp.double_clicked();
                 let cw = ((w - (cols as f32 - 1.0) * CELL_GAP) / cols as f32).max(24.0);
                 for col in 0..cols {
                     let idx = row * cols + col;
@@ -2058,8 +2086,9 @@ impl MiniTaskApp {
                         .color(ui.visuals().weak_text_color()),
                 );
             });
-            util::perf_chart(ui, &ah, 100.0, self.palette.mem, Vec2::new(gw, main_h), style)
-                .context_menu(|ui| {
+            let resp = util::perf_chart(ui, &ah, 100.0, self.palette.mem, Vec2::new(gw, main_h), style);
+            graph_double_clicked |= resp.double_clicked();
+            resp.context_menu(|ui| {
                     Self::update_speed_menu(
                         ui,
                         &mut self.interval,
@@ -2083,7 +2112,7 @@ impl MiniTaskApp {
                     );
                 });
             });
-            util::perf_dual_chart(
+            let r = util::perf_dual_chart(
                 ui,
                 &rh,
                 &wh,
@@ -2093,6 +2122,7 @@ impl MiniTaskApp {
                 Vec2::new(gw, (gh - main_h - 12.0).max(60.0)),
                 style,
             );
+            graph_double_clicked |= r.double_clicked();
         } else if let Some((rh, sh, max)) = net_dual {
             // ネットワーク: 送信(黄) / 受信(緑) の 2 本線 (凡例付き)
             ui.horizontal(|ui| {
@@ -2109,7 +2139,7 @@ impl MiniTaskApp {
                     );
                 });
             });
-            util::perf_dual_chart(
+            let r = util::perf_dual_chart(
                 ui,
                 &rh,
                 &sh,
@@ -2118,8 +2148,9 @@ impl MiniTaskApp {
                 self.palette.net_send,
                 Vec2::new(gw, gh),
                 style,
-            )
-            .context_menu(|ui| {
+            );
+            graph_double_clicked |= r.double_clicked();
+            r.context_menu(|ui| {
                 Self::update_speed_menu(
                     ui,
                     &mut self.interval,
@@ -2134,6 +2165,7 @@ impl MiniTaskApp {
             });
         } else {
             let resp = util::perf_chart(ui, hist, 100.0, color, Vec2::new(gw, gh), style);
+            graph_double_clicked |= resp.double_clicked();
             match &self.perf_sel {
                 PerfSel::Cpu => {
                     resp.on_hover_text("右クリックでグラフの変更")
@@ -2183,7 +2215,7 @@ impl MiniTaskApp {
                             );
                         });
                     });
-                    util::perf_dual_chart(
+                    let r = util::perf_dual_chart(
                         ui,
                         &mem_hist,
                         &mem_hist,
@@ -2193,6 +2225,7 @@ impl MiniTaskApp {
                         Vec2::new(gw, (gh * 0.3).max(50.0)),
                         style,
                     );
+                    graph_double_clicked |= r.double_clicked();
                 }
                 PerfSel::Npu(id) => {
                     let engines = self
@@ -2233,7 +2266,7 @@ impl MiniTaskApp {
                                 .color(ui.visuals().weak_text_color()),
                         );
                     });
-                    util::perf_dual_chart(
+                    let r = util::perf_dual_chart(
                         ui,
                         &mem_hist,
                         &mem_hist,
@@ -2243,6 +2276,7 @@ impl MiniTaskApp {
                         Vec2::new(gw, (gh * 0.3).max(50.0)),
                         style,
                     );
+                    graph_double_clicked |= r.double_clicked();
                 }
                 _ => {
                     resp.context_menu(|ui| {
@@ -2263,8 +2297,12 @@ impl MiniTaskApp {
         // 詳細情報 (2 列)
         let d = &self.load;
         let gb = util::fmt_bytes;
-        let pal = self.palette;
+        if graph_double_clicked {
+            self.graph_solo = !self.graph_solo;
+        }
         let mut smart_open: Option<String> = None;
+        if !self.graph_solo {
+        let pal = self.palette;
         ui.columns(2, |cols| {
             let (l, rest) = cols.split_first_mut().unwrap();
             let r = rest.first_mut().unwrap();
@@ -2276,7 +2314,25 @@ impl MiniTaskApp {
                         "速度",
                         format!("{:.2} GHz", d.cpu_freq_mhz as f64 / 1000.0),
                     );
+                    if let Some(mhz) = d.cpu_base_mhz {
+                        Self::detail_row(ui, "基本速度", format!("{:.2} GHz", mhz as f64 / 1000.0));
+                    }
+                    if let Some(cores) = d.cpu_physical_cores {
+                        Self::detail_row(ui, "コア数", cores.to_string());
+                    }
+                    if let Some(v) = d.cpu_virtualization {
+                        Self::detail_row(
+                            ui,
+                            "仮想化",
+                            if v { "有効" } else { "無効" }.to_owned(),
+                        );
+                    }
+                    for (label, bytes) in &d.cpu_caches {
+                        Self::detail_row(ui, label, util::fmt_bytes(*bytes));
+                    }
+                    // プロセス数 / スレッド数 / ハンドル数は同じ列に連続して表示する
                     Self::detail_row(ui, "プロセス数", d.processes.to_string());
+                    Self::detail_row(ui, "スレッド数", d.threads.to_string());
                     Self::detail_row(ui, "ハンドル数", d.handles.to_string());
                 }
                 PerfSel::Ram => {
@@ -2330,7 +2386,7 @@ impl MiniTaskApp {
                                 Self::detail_row_colored(
                                     ui,
                                     "温度",
-                                    format!("{temp} °C"),
+                                    util::format_temp(temp as f32, self.temp_unit),
                                     temp_color,
                                 );
                             }
@@ -2393,7 +2449,6 @@ impl MiniTaskApp {
             });
             r.vertical(|ui| match &self.perf_sel {
                 PerfSel::Cpu => {
-                    Self::detail_row(ui, "スレッド数", d.threads.to_string());
                     let s = d.uptime_secs;
                     Self::detail_row(
                         ui,
@@ -2509,6 +2564,7 @@ impl MiniTaskApp {
                 }
             });
         });
+        }
         if let Some(id) = smart_open {
             // 開いた瞬間の最新 SMART を取得してから表示する
             self.refresh_smart(&id);
@@ -2805,6 +2861,7 @@ impl MiniTaskApp {
             let mut close_to_tray = self.close_to_tray;
             let mut minimize_to_tray = self.minimize_to_tray;
             let mut tray_usage_tip = self.tray_usage_tip;
+            let mut temp_unit = self.temp_unit;
             let mut interval = self.interval;
             let mut anim = self.graph_animation;
             let mut spline = self.graph_spline;
@@ -2896,6 +2953,11 @@ impl MiniTaskApp {
                             ui.checkbox(&mut confirm, "タスク終了時に確認ダイアログを表示");
                             ui.checkbox(&mut minimize_to_tray, "最小化ボタンでもトレイに格納する")
                                 .on_hover_text("タスクトレイアイコンが有効な場合に限ります");
+                            ui.label(RichText::new("温度の単位").strong());
+                            ui.horizontal(|ui| {
+                                ui.radio_value(&mut temp_unit, 0, "摂氏 (°C)");
+                                ui.radio_value(&mut temp_unit, 1, "華氏 (°F)");
+                            });
                         }
                         _ => {
                             ui.checkbox(&mut replace, "タスクマネージャーの代わりにMiniTaskを起動")
@@ -3033,6 +3095,7 @@ impl MiniTaskApp {
                 self.last_tray_tip.clear();
             }
             self.tray_usage_tip = tray_usage_tip;
+            self.temp_unit = temp_unit;
             if tray_icon != self.tray_icon {
                 let exe = std::env::current_exe()
                     .map(|e| e.to_string_lossy().to_string())
@@ -3124,25 +3187,22 @@ impl MiniTaskApp {
                                 } else {
                                     self.palette.cpu
                                 };
-                                ui.label(RichText::new(format!("{t} °C")).size(22.0).strong().color(temp_color));
+                                ui.label(RichText::new(util::format_temp(t as f32, self.temp_unit)).size(22.0).strong().color(temp_color));
                             } else {
                                 ui.label(RichText::new("—").size(22.0).strong());
                             }
                         });
                         ui.separator();
+                        let temp_text = smart
+                            .temperature_c
+                            .map(|t| util::format_temp(t as f32, self.temp_unit))
+                            .unwrap_or_else(|| "—".to_owned());
                         for (label, value) in [
                             ("モデル", smart.model.as_str()),
                             ("シリアル番号", smart.serial.as_str()),
                             ("ファームウェア", smart.firmware.as_str()),
                             ("インターフェース", smart.interface.as_str()),
-                            (
-                                "温度",
-                                smart
-                                    .temperature_c
-                                    .map(|t| format!("{t} °C"))
-                                    .as_deref()
-                                    .unwrap_or("—"),
-                            ),
+                            ("温度", temp_text.as_str()),
                             (
                                 "電源投入時間",
                                 smart

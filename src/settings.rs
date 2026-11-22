@@ -49,6 +49,8 @@ pub struct AppSettings {
     pub minimize_to_tray: bool,
     /// トレイアイコンのツールチップに CPU / メモリ使用率を表示する
     pub tray_usage_tip: bool,
+    /// 温度の単位 (0=摂氏, 1=華氏)
+    pub temp_unit: u8,
     /// 最後に GitHub Releases をチェックした時刻 (Unix 秒)
     pub last_update_check: u64,
 }
@@ -88,6 +90,7 @@ impl Default for AppSettings {
             close_to_tray: true,
             minimize_to_tray: false,
             tray_usage_tip: true,
+            temp_unit: 0,
             last_update_check: 0,
         }
     }
@@ -177,6 +180,11 @@ impl AppSettings {
         s.close_to_tray = read_bool(&key, "CloseToTray", true);
         s.minimize_to_tray = read_bool(&key, "MinimizeToTray", false);
         s.tray_usage_tip = read_bool(&key, "TrayUsageTip", true);
+        if let Ok(v) = key.get_value::<u32, _>("TempUnit") {
+            if v <= 1 {
+                s.temp_unit = v as u8;
+            }
+        }
         if let Ok(v) = key.get_value::<u64, _>("LastUpdateCheck") {
             s.last_update_check = v;
         }
@@ -211,6 +219,7 @@ impl AppSettings {
         let _ = key.set_value("CloseToTray", &(self.close_to_tray as u32));
         let _ = key.set_value("MinimizeToTray", &(self.minimize_to_tray as u32));
         let _ = key.set_value("TrayUsageTip", &(self.tray_usage_tip as u32));
+        let _ = key.set_value("TempUnit", &(self.temp_unit as u32));
         let _ = key.set_value("LastUpdateCheck", &self.last_update_check);
         // 旧設定・旧注入フックの残骸を掃除
         let _ = key.delete_value("TaskbarMenu");
@@ -248,6 +257,7 @@ impl AppSettings {
             && self.close_to_tray == other.close_to_tray
             && self.minimize_to_tray == other.minimize_to_tray
             && self.tray_usage_tip == other.tray_usage_tip
+            && self.temp_unit == other.temp_unit
             && self.last_update_check == other.last_update_check
     }
 
