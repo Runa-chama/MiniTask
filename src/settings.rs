@@ -39,7 +39,7 @@ pub struct AppSettings {
     pub confirm_kill: bool,
 
     // --- システム統合 ---
-    /// Ctrl+Shift+Esc でタスクマネージャーの代わりに MiniTask を起動
+    /// Ctrl+Shift+Esc の起動置換を有効にする
     pub replace_taskmgr: bool,
     /// タスクトレイにアイコンを常駐させる
     pub tray_icon: bool,

@@ -1,4 +1,4 @@
-//! ネットワーク アダプター別の送受信速度と詳細情報 (タスクマネージャー相当)。
+//! ネットワーク アダプター別の送受信速度と詳細情報。
 //!
 //! - PDH `\Network Interface(*)\Bytes Received/sec` / `Bytes Sent/sec` で
 //!   アダプターごとの送受信速度を取得
@@ -42,7 +42,7 @@ pub struct AdapterSample {
     pub ipv6: Vec<String>,
     /// リンク速度 (bits/sec)
     pub link_speed_bps: u64,
-    /// 状態 (本家文言)
+    /// 状態
     pub status: String,
     /// Wi-Fi の接続先 SSID
     pub ssid: String,
@@ -164,7 +164,7 @@ impl NetAdapterMeter {
                     })
                 })
                 .collect();
-            // 同じ表示名のアダプターには連番 (本家の「イーサネット 2」相当)
+            // 同じ表示名のアダプターには連番を付与
             let mut counts: HashMap<String, usize> = HashMap::new();
             for s in &mut samples {
                 let n = counts.entry(s.label.clone()).or_insert(0);

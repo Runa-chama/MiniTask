@@ -1,4 +1,4 @@
-//! OS 連携: タスクマネージャー置換 (IFEO) / シェルメニュー / ウィンドウ操作。
+//! OS 連携: 起動置換 (IFEO) / シェルメニュー / ウィンドウ操作。
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows_sys::Win32::Security::{

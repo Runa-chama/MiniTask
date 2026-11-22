@@ -1,12 +1,12 @@
 //! GPU / NPU エンジン使用率計測 (PDH パフォーマンスカウンタ)。
 //!
-//! タスクマネージャーと同じ仕組み:
+//! パフォーマンス情報の取得元と計算方法:
 //! `\GPU Engine(*)\Utilization Percentage` / `\NPU Engine(*)\Utilization Percentage`
 //! の各カウンタ インスタンス名は
 //! `pid_X_luid_..._eng_N_engtype_3d` の形式で、末尾の `engtype_X` が
 //! エンジン種別 (3D / Copy / Video Decode など) を表す。
 //! 種別ごとに Utilization Percentage を合計すると
-//! 「項目ごとの使用率グラフ」が得られる (本家の「グラフの変更」の内部動作)。
+//! 「項目ごとの使用率グラフ」が得られる。
 
 use std::collections::{HashMap, HashSet};
 
@@ -32,7 +32,7 @@ pub struct DiskSample {
     pub letters: Vec<String>,
     pub read_bps: f64,
     pub write_bps: f64,
-    /// アクティブな時間 (%) — 本家のメイン グラフ
+    /// アクティブな時間 (%) — メイン グラフ
     pub active_pct: f32,
     /// 平均応答時間 (ミリ秒)
     pub response_ms: f32,
@@ -41,7 +41,7 @@ pub struct DiskSample {
 /// `\PhysicalDisk(*)` から物理ディスクごとの使用率・転送速度を取得する。
 /// インスタンス名は `1 c:` / `2 d: e:` のように物理ディスク番号と
 /// ドライブレターが含まれ、同じ物理ディスクの複数パーティションは
-/// 1 インスタンスにまとまる (本家タスクマネージャーと同じ区分)。
+/// 1 インスタンスにまとまる。
 pub struct DiskMeter {
     query: PDH_HQUERY,
     counters: Vec<PDH_HCOUNTER>,
@@ -373,7 +373,7 @@ impl EngineMeter {
 
     /// 全インスタンスを収集し (LUID, エンジン種別, 使用率) のリストを返す。
     /// Windows 11 では NPU も `\GPU Engine(*)` カウンタに含まれ、
-    /// NPU アダプタ固有の LUID で列挙される (本家タスクマネージャーも
+    /// NPU アダプタ固有の LUID で列挙される。
     /// この LUID で NPU と GPU を分けて表示している)。
     fn collect(&mut self) -> Option<Vec<(String, String, f64)>> {
         if !self.available {
@@ -516,7 +516,7 @@ pub(crate) unsafe fn wide_ptr_to_string(p: windows_sys::core::PWSTR) -> String {
 
 /// ドライブレターからストレージの種類を取得する。
 /// IOCTL_STORAGE_QUERY_PROPERTY でバス種別とリムーバブルMediaを判定し、
-/// 本家タスクマネージャーの「種類」列 (SSD (NVMe) / リムーバブル (USB) 等) に合わせる。
+/// 「種類」列の表記 (SSD (NVMe) / リムーバブル (USB) 等)。
 pub fn disk_type_label(letter: &str) -> String {
     use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::IO::DeviceIoControl;
@@ -610,7 +610,7 @@ pub fn npu_device_present() -> bool {
     }
 }
 
-/// NPU のエンジン名 (本家タスクマネージャーは NPU の compute を
+/// NPU のエンジン名。
 /// 「Compute」と表示する)。
 pub fn npu_engine_display_name(engtype: &str) -> String {
     match engtype {
@@ -620,7 +620,7 @@ pub fn npu_engine_display_name(engtype: &str) -> String {
 }
 
 /// エンジン種別の内部キー (英語小文字) を日本語表示名にする。
-/// 本家タスクマネージャーの文言に準拠。末尾の " N" は番号として保持する。
+/// 末尾の " N" は番号として保持する。
 pub fn engine_display_name(engtype: &str) -> String {
     // "compute 0" → base "compute" + 番号 0
     let (base, num) = match engtype.rsplit_once(' ') {

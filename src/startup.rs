@@ -2,7 +2,7 @@
 //!
 //! 対象: HKCU/HKLM の Run キー、HKLM の WOW6432Node\Run、
 //! ユーザー/共通スタートアップフォルダー。
-//! 有効/無効はタスクマネージャーと同じ `Explorer\StartupApproved` キー方式。
+//! 有効/無効は `Explorer\StartupApproved` キー方式。
 
 use std::borrow::Cow;
 

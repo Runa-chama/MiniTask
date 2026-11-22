@@ -13,9 +13,9 @@ pub const MEM_COLOR: Color32 = Color32::from_rgb(108, 203, 95);
 pub const ROM_COLOR: Color32 = Color32::from_rgb(230, 170, 110);
 pub const GPU_COLOR: Color32 = Color32::from_rgb(170, 145, 255);
 pub const NPU_COLOR: Color32 = Color32::from_rgb(255, 150, 185);
-/// ネットワーク受信 (本家の緑)
+/// ネットワーク受信 (緑)
 pub const NET_RECV_COLOR: Color32 = Color32::from_rgb(108, 203, 95);
-/// ネットワーク送信 (本家の黄)
+/// ネットワーク送信 (黄)
 pub const NET_SEND_COLOR: Color32 = Color32::from_rgb(230, 200, 90);
 pub const WARN: Color32 = Color32::from_rgb(255, 190, 90);
 pub const DANGER: Color32 = Color32::from_rgb(255, 120, 100);
@@ -261,7 +261,7 @@ pub fn fmt_bytes(bytes: u64) -> String {
 }
 
 /// 転送速度 (bytes/sec) を見やすい単位に。0 は "—"。
-/// タスクマネージャーと同じ「KB/秒」表記。
+/// 「KB/秒」表記。
 pub fn fmt_rate(bps: u64) -> String {
     if bps == 0 {
         return "—".to_owned();
@@ -308,7 +308,7 @@ pub struct GraphStyle {
 
 /// 折れ線グラフの共通描画処理 (矩形内に曲線を描く。塗りつぶしなし)。
 ///
-/// タスクマネージャーと同じ挙動: 最新サンプルは常に右端にあり、
+/// 最新サンプルは常に右端にあり、
 /// 履歴は左へ流れていく。サンプルが溜まる間は右端から左へ線が伸び、
 /// 左端に到達した後は全体が左へスクロールする (全体に引き伸ばさない)。
 fn paint_curve(
@@ -527,7 +527,7 @@ pub fn perf_chart(
             );
         }
         paint_curve(painter, rect, values, max, color, 2.0, style);
-        // 本家と同じスケール表示 (グラフ右上)
+        // スケール表示 (グラフ右上)
         painter.text(
             egui::pos2(rect.right() - 5.0, rect.top() + 2.0),
             egui::Align2::RIGHT_TOP,
@@ -535,7 +535,7 @@ pub fn perf_chart(
             egui::FontId::proportional(11.0),
             ui.visuals().weak_text_color(),
         );
-        // 本家と同じ時間目盛り (左 = 30 秒前、右 = 現在)
+        // 時間目盛り (左 = 30 秒前、右 = 現在)
         let stamp = ui.visuals().weak_text_color();
         let font = egui::FontId::proportional(10.0);
         painter.text(

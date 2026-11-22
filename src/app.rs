@@ -46,7 +46,7 @@ enum PerfSel {
     Net(String),
 }
 
-/// CPU グラフの表示モード (タスクマネージャーの「グラフの変更」)。
+/// CPU グラフの表示モード (グラフ種別の切替)。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CpuGraphMode {
     Overall,
@@ -526,7 +526,7 @@ impl MiniTaskApp {
                 .unwrap_or(ColumnKind::Cpu),
             sort_desc: settings.sort_desc,
             selected: None,
-            // 列表示は保存済みビットマスクから復元 (既定はタスクマネージャーと同じ7列)
+            // 列表示は保存済みビットマスクから復元 (既定はよく使う7列)
             columns: {
                 let mut cols = [false; 14];
                 for (i, on) in cols.iter_mut().enumerate() {
@@ -893,7 +893,7 @@ impl MiniTaskApp {
                 self.sort_desc = col.is_numeric();
             }
         }
-        // 本家と同じく列見出しの右クリックでも列選択メニューを開く
+        // 列見出しの右クリックでも列選択メニューを開く
         resp.context_menu(|ui| self.column_menu(ui));
     }
 }
@@ -1000,7 +1000,7 @@ impl eframe::App for MiniTaskApp {
                 }
             }
         }
-        // 純正タスクマネージャー起動後の IFEO 復元
+        // 起動置換の一時解除後の IFEO 復元
         if let Some((_, at)) = &self.ifeo_restore {
             if at.elapsed() >= Duration::from_millis(500) {
                 if let Some((old, _)) = self.ifeo_restore.take() {
@@ -1321,7 +1321,7 @@ impl MiniTaskApp {
             });
     }
 
-    /// パフォーマンスタブの左ナビ 1 項目 (本家タスクマネージャー風:
+    /// パフォーマンスタブの左ナビ 1 項目 (ミニグラフ付き:
     /// 左にミニグラフ、右に名前・補足・値の 3 行)。
     fn perf_nav_item(
         ui: &mut egui::Ui,
@@ -1388,7 +1388,7 @@ impl MiniTaskApp {
         let painter = ui.painter();
         if selected {
             painter.rect_filled(rect, 4.0, ui.visuals().faint_bg_color);
-            // 本家のような選択枠
+            // 選択枠
             painter.rect_stroke(
                 rect.shrink(1.0),
                 3.0,
@@ -1470,7 +1470,7 @@ impl MiniTaskApp {
         }
     }
 
-    /// 詳細情報の 1 行 (ラベル左・値は固定幅の右側、本家風)。
+    /// 詳細情報の 1 行 (ラベル左・値は固定幅の右側)。
     fn detail_row(ui: &mut egui::Ui, label: &str, value: impl Into<String>) {
         ui.horizontal(|ui| {
             let resp = ui.label(
@@ -1530,7 +1530,7 @@ impl MiniTaskApp {
         });
     }
 
-    /// CPU グラフの右クリックメニュー (タスクマネージャーの「グラフの変更」)。
+    /// CPU グラフの右クリックメニュー (グラフ種別の切替)。
     fn cpu_graph_menu(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("グラフの変更").strong());
         ui.separator();
@@ -1554,7 +1554,7 @@ impl MiniTaskApp {
         );
     }
 
-    /// 本家の「更新の速度」メニュー (高/通常/低/一時停止)。
+    /// 「更新の速度」メニュー (高/通常/低/一時停止)。
     fn update_speed_menu(
         ui: &mut egui::Ui,
         interval: &mut f32,
@@ -1590,7 +1590,7 @@ impl MiniTaskApp {
         ui.checkbox(spline, "スプライン補間 (滑らかな曲線)");
     }
 
-    /// GPU / NPU グラフの右クリックメニュー (本家の「グラフの変更」と同じ方式:
+    /// GPU / NPU グラフの右クリックメニュー (種別グラフへの切替:
     /// 全体的な使用率 + エンジン種別ごとのグラフ)。
     fn engine_graph_menu(
         ui: &mut egui::Ui,
@@ -1985,7 +1985,7 @@ impl MiniTaskApp {
         let gw = ui.available_width().clamp(60.0, 4000.0);
 
         if self.perf_sel == PerfSel::Cpu && self.cpu_graph_mode == CpuGraphMode::PerCore {
-            // 論理プロセッサごとのグラフ (タスクマネージャーの「論理プロセッサ」表示)
+            // 論理プロセッサごとのグラフ
             let n = self.core_hist.len().max(1);
             let rows = if n <= 4 { 1 } else { 2 };
             let cols = n.div_ceil(rows);
@@ -2048,7 +2048,7 @@ impl MiniTaskApp {
                 row_resp.context_menu(|ui| self.cpu_graph_menu(ui));
             }
         } else if let Some((ah, rh, wh, max)) = disk_dual {
-            // 本家タスクマネージャーと同じ 2 段構成:
+            // 2 段構成:
             // 上 = アクティブな時間 (%)、下 = ディスクの転送速度 (読み取り/書き込み)
             let main_h = (gh * 0.62).max(80.0);
             ui.horizontal(|ui| {
@@ -2094,7 +2094,7 @@ impl MiniTaskApp {
                 style,
             );
         } else if let Some((rh, sh, max)) = net_dual {
-            // ネットワーク: 送信(黄) / 受信(緑) の 2 本線 (本家と同じ凡例付き)
+            // ネットワーク: 送信(黄) / 受信(緑) の 2 本線 (凡例付き)
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("送信 / 受信")
@@ -2165,7 +2165,7 @@ impl MiniTaskApp {
                                 spline,
                             )
                         });
-                    // 本家 Win11 と同じ「専用 GPU メモリ」の第2グラフ
+                    // 「専用 GPU メモリ」の第2グラフ
                     let mem_hist = self.gpu_mem_hist.clone();
                     let mem_max = util::nice_max(&mem_hist, &mem_hist);
                     ui.add_space(6.0);
@@ -2260,7 +2260,7 @@ impl MiniTaskApp {
         ui.add_space(10.0);
         ui.separator();
 
-        // 詳細情報 (2 列) — 本家タスクマネージャーと同じ文言
+        // 詳細情報 (2 列)
         let d = &self.load;
         let gb = util::fmt_bytes;
         let pal = self.palette;
@@ -3104,7 +3104,7 @@ impl MiniTaskApp {
                         });
                         ui.separator();
                     if let Some(smart) = &smart {
-                        // 健康状態・温度を大きく強調 (CrystalDiskInfo 風)
+                        // 健康状態・温度を大きく強調
                         let health_color = match smart.status {
                             crate::smart::SmartStatus::Good => self.palette.mem,
                             crate::smart::SmartStatus::Caution => self.palette.warn,

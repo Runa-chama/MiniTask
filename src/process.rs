@@ -30,7 +30,7 @@ pub struct ProcRow {
     pub name: String,
     /// 実行状態 ("実行中" など)
     pub status: String,
-    /// マシン全体に対する CPU 使用率 (0..100, タスクマネージャー準拠)
+    /// マシン全体に対する CPU 使用率 (0..100)
     pub cpu: f32,
     /// ワーキングセット (バイト)
     pub mem: u64,
@@ -444,7 +444,7 @@ impl ProcCollector {
         // --- GPU / NPU エンジン使用率 ---
         // Windows 11 では NPU も \GPU Engine(*) カウンタに含まれ、NPU 固有の
         // LUID で列挙される。3D/Copy/Video 系エンジンを持つ LUID = GPU、
-        // compute 系のみの LUID = NPU として分離する (本家と同じ判定)。
+        // compute 系のみの LUID = NPU として分離する。
         let snapshot = self.gpu_engine_meter.read_split().unwrap_or_default();
         let gpu_engines = snapshot.gpu_engines.clone();
         let gpu_mem = self.gpu_memory_meter.read(&snapshot.gpu_luids);
@@ -660,7 +660,7 @@ pub fn kill(pid: u32) -> Result<(), String> {
 }
 
 /// プロセス ツリー (対象とその子孫すべて) を強制終了する。
-/// タスクマネージャーの「プロセス ツリーの終了」相当。
+/// プロセス ツリーの終了。
 pub fn kill_tree(pid: u32, rows: &[ProcRow]) -> Result<(), String> {
     // 親子関係から子孫を収集
     let mut victims = vec![pid];
