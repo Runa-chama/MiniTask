@@ -1341,9 +1341,12 @@ impl MiniTaskApp {
         let screen = ctx.content_rect();
         egui::Area::new(egui::Id::unique("minitask_modal_backdrop"))
             .order(egui::Order::Foreground)
+            // 非インタラクティブにしないとクリックで move_to_top され、
+            // backdrop がダイアログより上に来て操作不能になる
+            .interactable(false)
             .fixed_pos(screen.min)
             .show(ctx, |ui| {
-                let _ = ui.allocate_rect(screen, egui::Sense::click());
+                let _ = ui.allocate_rect(screen, egui::Sense::hover());
                 ui.painter().rect_filled(
                     screen,
                     egui::CornerRadius::ZERO,
