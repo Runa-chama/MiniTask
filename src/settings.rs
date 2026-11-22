@@ -45,6 +45,10 @@ pub struct AppSettings {
     pub tray_icon: bool,
     /// 閉じるボタンで終了せずトレイに格納する
     pub close_to_tray: bool,
+    /// 最小化ボタンでもトレイに格納する
+    pub minimize_to_tray: bool,
+    /// トレイアイコンのツールチップに CPU / メモリ使用率を表示する
+    pub tray_usage_tip: bool,
 }
 
 impl Default for AppSettings {
@@ -80,6 +84,8 @@ impl Default for AppSettings {
             replace_taskmgr: false,
             tray_icon: true,
             close_to_tray: true,
+            minimize_to_tray: false,
+            tray_usage_tip: true,
         }
     }
 }
@@ -166,6 +172,8 @@ impl AppSettings {
         s.replace_taskmgr = read_bool(&key, "ReplaceTaskmgr", false);
         s.tray_icon = read_bool(&key, "TrayIcon", true);
         s.close_to_tray = read_bool(&key, "CloseToTray", true);
+        s.minimize_to_tray = read_bool(&key, "MinimizeToTray", false);
+        s.tray_usage_tip = read_bool(&key, "TrayUsageTip", true);
         s
     }
 
@@ -195,6 +203,8 @@ impl AppSettings {
         let _ = key.set_value("ReplaceTaskmgr", &(self.replace_taskmgr as u32));
         let _ = key.set_value("TrayIcon", &(self.tray_icon as u32));
         let _ = key.set_value("CloseToTray", &(self.close_to_tray as u32));
+        let _ = key.set_value("MinimizeToTray", &(self.minimize_to_tray as u32));
+        let _ = key.set_value("TrayUsageTip", &(self.tray_usage_tip as u32));
         // 旧設定・旧注入フックの残骸を掃除
         let _ = key.delete_value("TaskbarMenu");
         let _ = key.delete_value("HookInstalled");
@@ -229,6 +239,8 @@ impl AppSettings {
             && self.replace_taskmgr == other.replace_taskmgr
             && self.tray_icon == other.tray_icon
             && self.close_to_tray == other.close_to_tray
+            && self.minimize_to_tray == other.minimize_to_tray
+            && self.tray_usage_tip == other.tray_usage_tip
     }
 
     /// 現在のモードに対応するパレット。

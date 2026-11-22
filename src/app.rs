@@ -1,7 +1,8 @@
 //! アプリ本体: 状態管理と UI 描画。
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc::Receiver, Arc};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText, Vec2};
@@ -287,6 +288,11 @@ pub struct MiniTaskApp {
     replace_taskmgr: bool,
     tray_icon: bool,
     close_to_tray: bool,
+    minimize_to_tray: bool,
+    minimize_flag: Arc<AtomicBool>,
+    tray_usage_tip: bool,
+    last_tray_tip: String,
+    last_tray_check: Instant,
     tray_handle: Option<crate::tray::TrayHandle>,
     tray_rx: Option<Receiver<crate::tray::TrayMsg>>,
     ifeo_restore: Option<(String, Instant)>,
@@ -374,6 +380,20 @@ impl PerfSample {
 impl MiniTaskApp {
     pub fn new(ctx: &egui::Context) -> Self {
         let settings = AppSettings::load();
+        // 最小化中は egui の update が止まるため、別スレッドで最小化を監視して
+        // トレイへ格納する (フラグは設定画面から即時に反映される)。
+        let minimize_flag = Arc::new(AtomicBool::new(
+            settings.minimize_to_tray && settings.tray_icon,
+        ));
+        {
+            let flag = Arc::clone(&minimize_flag);
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(250));
+                if flag.load(Ordering::Relaxed) {
+                    integration::try_hide_minimized_window();
+                }
+            });
+        }
         let env_tab = std::env::var("MINITASK_TAB").ok();
         let collector = ProcCollector::new().ok();
 
@@ -520,6 +540,11 @@ impl MiniTaskApp {
             replace_taskmgr: settings.replace_taskmgr,
             tray_icon: settings.tray_icon,
             close_to_tray: settings.close_to_tray,
+            minimize_to_tray: settings.minimize_to_tray,
+            minimize_flag,
+            tray_usage_tip: settings.tray_usage_tip,
+            last_tray_tip: String::new(),
+            last_tray_check: Instant::now() - Duration::from_secs(1),
             tray_handle,
             tray_rx,
             ifeo_restore: None,
@@ -529,6 +554,16 @@ impl MiniTaskApp {
         };
         app.refresh();
         app
+    }
+
+    /// 指定ディスクの SMART をキャッシュ無視で再取得し、表示データに反映する。
+    fn refresh_smart(&mut self, id: &str) {
+        let Some(info) = self.collector.as_mut().and_then(|c| c.refresh_smart(id)) else {
+            return;
+        };
+        if let Some(disk) = self.load.disks.iter_mut().find(|d| d.id == id) {
+            disk.smart = Some(info);
+        }
     }
 
     fn refresh(&mut self) {
@@ -866,6 +901,29 @@ impl eframe::App for MiniTaskApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
+        // トレイのツールチップ更新と、最小化→トレイ格納 (0.5 秒ごとに判定)
+        if self.tray_icon && self.last_tray_check.elapsed() >= Duration::from_millis(500) {
+            self.last_tray_check = Instant::now();
+            if let Some(handle) = self.tray_handle.as_ref() {
+                let tip = if self.tray_usage_tip {
+                    let mem_pct = if self.load.mem_total > 0 {
+                        self.load.mem_used as f32 / self.load.mem_total as f32 * 100.0
+                    } else {
+                        0.0
+                    };
+                    format!(
+                        "MiniTask\nCPU {:.0}%   メモリ {:.0}%",
+                        self.load.cpu, mem_pct
+                    )
+                } else {
+                    "MiniTask — 軽量タスクマネージャー".to_owned()
+                };
+                if tip != self.last_tray_tip {
+                    crate::tray::set_tip(handle.hwnd(), &tip);
+                    self.last_tray_tip = tip;
+                }
+            }
+        }
         // 純正タスクマネージャー起動後の IFEO 復元
         if let Some((_, at)) = &self.ifeo_restore {
             if at.elapsed() >= Duration::from_millis(500) {
@@ -900,7 +958,7 @@ impl eframe::App for MiniTaskApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // モーダル表示中は背面をグレー化して操作できないようにする
-        let modal = self.settings_open || self.smart_dialog_disk.is_some();
+        let modal = self.any_modal();
         ui.scope(|ui| {
             if modal {
                 ui.disable();
@@ -999,6 +1057,8 @@ impl MiniTaskApp {
             replace_taskmgr: self.replace_taskmgr,
             tray_icon: self.tray_icon,
             close_to_tray: self.close_to_tray,
+            minimize_to_tray: self.minimize_to_tray,
+            tray_usage_tip: self.tray_usage_tip,
         }
     }
 
@@ -1333,6 +1393,15 @@ impl MiniTaskApp {
             ui.add_space((170.0 - resp.rect.width()).max(10.0));
             ui.label(RichText::new(value).size(13.0).monospace());
         });
+    }
+
+    /// いずれかのモーダルダイアログが開いているか。
+    fn any_modal(&self) -> bool {
+        self.settings_open
+            || self.smart_dialog_disk.is_some()
+            || self.confirm_kill.is_some()
+            || self.confirm_kill_tree.is_some()
+            || self.confirm_delete.is_some()
     }
 
     /// モーダルダイアログ表示中用の背景オーバーレイ。
@@ -2353,6 +2422,8 @@ impl MiniTaskApp {
             });
         });
         if let Some(id) = smart_open {
+            // 開いた瞬間の最新 SMART を取得してから表示する
+            self.refresh_smart(&id);
             self.smart_dialog_disk = Some(id);
         }
         content_h = ui.min_rect().height();
@@ -2516,18 +2587,22 @@ impl MiniTaskApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
-        // 設定 / SMART 詳細はモーダル: 背景をグレーアウトし、Esc で閉じる
-        if self.settings_open || self.smart_dialog_disk.is_some() {
+        // すべてのダイアログをモーダル化: 背景をグレーアウトし、Esc で閉じる
+        if self.any_modal() {
             Self::modal_backdrop(ctx);
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.settings_open = false;
                 self.smart_dialog_disk = None;
+                self.confirm_kill = None;
+                self.confirm_kill_tree = None;
+                self.confirm_delete = None;
             }
         }
         if let Some((pid, name)) = self.confirm_kill.clone() {
             egui::Window::new("タスクの終了")
                 .collapsible(false)
                 .resizable(false)
+                .order(egui::Order::Foreground)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.set_min_width(320.0);
@@ -2562,6 +2637,7 @@ impl MiniTaskApp {
             egui::Window::new("プロセス ツリーの終了")
                 .collapsible(false)
                 .resizable(false)
+                .order(egui::Order::Foreground)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.set_min_width(340.0);
@@ -2597,6 +2673,7 @@ impl MiniTaskApp {
             egui::Window::new("スタートアップから削除")
                 .collapsible(false)
                 .resizable(false)
+                .order(egui::Order::Foreground)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.set_min_width(340.0);
@@ -2638,6 +2715,8 @@ impl MiniTaskApp {
             let mut replace = self.replace_taskmgr;
             let mut tray_icon = self.tray_icon;
             let mut close_to_tray = self.close_to_tray;
+            let mut minimize_to_tray = self.minimize_to_tray;
+            let mut tray_usage_tip = self.tray_usage_tip;
             let mut interval = self.interval;
             let mut anim = self.graph_animation;
             let mut spline = self.graph_spline;
@@ -2727,6 +2806,8 @@ impl MiniTaskApp {
                             ui.radio_value(&mut tab_mode, 2, "常にパフォーマンス");
                             ui.add_space(8.0);
                             ui.checkbox(&mut confirm, "タスク終了時に確認ダイアログを表示");
+                            ui.checkbox(&mut minimize_to_tray, "最小化ボタンでもトレイに格納する")
+                                .on_hover_text("タスクトレイアイコンが有効な場合に限ります");
                         }
                         _ => {
                             ui.checkbox(&mut replace, "Ctrl+Shift+Esc で MiniTask を開く");
@@ -2747,6 +2828,10 @@ impl MiniTaskApp {
                             ui.checkbox(&mut tray_icon, "タスクトレイにアイコンを常駐する");
                             ui.checkbox(&mut close_to_tray, "閉じるボタンでトレイに格納する")
                                 .on_hover_text("有効時、×ボタンは終了せずトレイへ格納します。完全終了はトレイアイコンの右クリックメニューから行います。");
+                            ui.checkbox(
+                                &mut tray_usage_tip,
+                                "トレイアイコンのツールチップに CPU/メモリ使用率を表示",
+                            );
                             ui.label(
                                 RichText::new(format!(
                                     "トレイアイコン: {}",
@@ -2814,6 +2899,14 @@ impl MiniTaskApp {
                 }
             }
             self.close_to_tray = close_to_tray;
+            self.minimize_to_tray = minimize_to_tray;
+            self.minimize_flag
+                .store(minimize_to_tray && tray_icon, Ordering::Relaxed);
+            if tray_usage_tip != self.tray_usage_tip {
+                // 次回のツールチップ更新で即時に反映されるようにする
+                self.last_tray_tip.clear();
+            }
+            self.tray_usage_tip = tray_usage_tip;
             if tray_icon != self.tray_icon {
                 let exe = std::env::current_exe()
                     .map(|e| e.to_string_lossy().to_string())
@@ -3009,7 +3102,14 @@ impl MiniTaskApp {
                 .as_ref()
                 .map(|id| disks.iter().any(|d| &d.id == id))
                 .unwrap_or(false);
-            self.smart_dialog_disk = if open && valid { selected } else { None };
+            let next = if open && valid { selected } else { None };
+            if let Some(sid) = &next {
+                if sid != &id {
+                    // ダイアログ内でディスクを切り替えたら即時再取得
+                    self.refresh_smart(sid);
+                }
+            }
+            self.smart_dialog_disk = next;
         }
 
     }

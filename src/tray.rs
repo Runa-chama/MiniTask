@@ -8,7 +8,8 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::ExtractIconExW;
 use windows_sys::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CW_USEDEFAULT, ChangeWindowMessageFilterEx, CreatePopupMenu,
@@ -91,6 +92,24 @@ fn add_icon(hwnd: HWND, icon: HICON) {
         let n = tip.len().min(nid.szTip.len());
         nid.szTip[..n].copy_from_slice(&tip[..n]);
         let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+    }
+}
+
+/// ツールチップを更新する (アプリ側スレッドから呼び出し可)。
+pub fn set_tip(hwnd: isize, tip: &str) {
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = hwnd as HWND;
+        nid.uID = 1;
+        nid.uFlags = NIF_TIP;
+        let text = to_wide(tip);
+        let n = text.len().min(nid.szTip.len());
+        nid.szTip[..n].copy_from_slice(&text[..n]);
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
 }
 
@@ -224,6 +243,10 @@ pub struct TrayHandle {
 }
 
 impl TrayHandle {
+    pub fn hwnd(&self) -> isize {
+        self.hwnd
+    }
+
     pub fn stop(&mut self) {
         if self.hwnd != 0 {
             unsafe {

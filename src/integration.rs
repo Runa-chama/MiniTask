@@ -11,8 +11,9 @@ use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ASFW_ANY, AllowSetForegroundWindow, EnumWindows, FLASHW_ALL, FLASHW_TIMERNOFG, FLASHWINFO,
     FindWindowW, FlashWindowEx, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IsIconic, PostMessageW,
-    SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+    GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IsIconic, IsWindowVisible,
+    PostMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_SHOWWINDOW,
     SetForegroundWindow, SetWindowPos, ShowWindow, SwitchToThisWindow,
 };
 use winreg::RegKey;
@@ -353,6 +354,31 @@ pub fn focus_existing_instance() -> bool {
         notify_tray_show();
     }
     found
+}
+
+/// メインウィンドウが最小化されていたらトレイへ格納する。
+/// 最小化中は egui の update が呼ばれないため、常駐スレッドから直接実行する。
+pub fn try_hide_minimized_window() {
+    unsafe extern "system" fn proc(hwnd: Handle, _lparam: isize) -> i32 {
+        unsafe {
+            let len = GetWindowTextLengthW(hwnd);
+            if len > 0 {
+                let mut title = vec![0u16; (len + 1) as usize];
+                GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+                let text = String::from_utf16_lossy(&title);
+                if text.contains("MiniTask") && text.contains("軽量タスクマネージャー") {
+                    if IsIconic(hwnd) != 0 && IsWindowVisible(hwnd) != 0 {
+                        ShowWindow(hwnd, SW_HIDE);
+                    }
+                    return 0;
+                }
+            }
+            1
+        }
+    }
+    unsafe {
+        EnumWindows(Some(proc), 0);
+    }
 }
 
 #[cfg(test)]

@@ -8,8 +8,10 @@ use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleDC, DeleteDC, DeleteObject, GetDIBits, GetObjectW, BITMAP, BITMAPINFO,
     BITMAPINFOHEADER, DIB_RGB_COLORS,
 };
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 use windows_sys::Win32::UI::Shell::{
-    ExtractIconExW, SHGetFileInfoW, SHGFI_ICON, SHGFI_SMALLICON, SHFILEINFOW,
+    ExtractIconExW, SHGetFileInfoW, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES,
+    SHFILEINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, ICONINFO};
 
@@ -153,6 +155,28 @@ pub fn extract_icon(path: &str, large: bool) -> Option<Rgba> {
 }
 
 pub fn default_exe_icon() -> Option<Rgba> {
+    unsafe {
+        // 実在しない .exe に対して SHGFI_USEFILEATTRIBUTES を使うと、
+        // Windows の汎用実行ファイルアイコンが得られる。
+        let dummy: Vec<u16> = "dummy.exe\0".encode_utf16().collect();
+        let mut sfi: SHFILEINFOW = std::mem::zeroed();
+        let flags = SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES;
+        let result = SHGetFileInfoW(
+            dummy.as_ptr(),
+            FILE_ATTRIBUTE_NORMAL,
+            &mut sfi,
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            flags,
+        );
+        if result != 0 && !sfi.hIcon.is_null() {
+            let image = icon_to_rgba(sfi.hIcon, 16);
+            let _ = DestroyIcon(sfi.hIcon);
+            if image.is_some() {
+                return image;
+            }
+        }
+    }
+    // フォールバック: shell32.dll のアイコン
     let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_owned());
     extract_icon(&format!("{windir}\\System32\\shell32.dll"), false)
 }

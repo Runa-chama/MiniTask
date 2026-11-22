@@ -299,6 +299,12 @@ impl ProcCollector {
         }
     }
 
+    /// キャッシュを破棄して SMART 情報を即時再取得する (ダイアログを開いた時など)。
+    pub fn refresh_smart(&mut self, id: &str) -> Option<Arc<SmartInfo>> {
+        self.smart_cache.remove(id);
+        self.smart_for(id)
+    }
+
     /// SMART 情報を 60 秒ごとに更新して返す。
     fn smart_for(&mut self, id: &str) -> Option<Arc<SmartInfo>> {
         if let Some((at, info)) = self.smart_cache.get(id) {
