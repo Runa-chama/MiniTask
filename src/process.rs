@@ -138,6 +138,12 @@ pub struct SysLoad {
     pub cpu_physical_cores: Option<u32>,
     pub cpu_virtualization: Option<bool>,
     pub cpu_caches: Vec<(String, u64)>,
+    pub mem_form_factor: Option<String>,
+    pub mem_slots_used: Option<u16>,
+    pub mem_slots_total: Option<u16>,
+    pub cpu_temp_c: Option<f32>,
+    /// GPU ごとの温度 (gpus と同じ順序)
+    pub gpu_temps: Vec<Option<f32>>,
     pub mem_available: u64,
     pub commit_used: u64,
     pub commit_limit: u64,
@@ -182,6 +188,10 @@ pub struct ProcCollector {
     smart_cache: HashMap<String, (Instant, Arc<SmartInfo>)>,
     /// CPU の静的情報 (起動時に一度だけ取得)
     cpu_info: crate::cpuinfo::CpuInfo,
+    /// メモリの静的情報 (起動時に一度だけ取得)
+    mem_info: crate::memoryinfo::MemoryInfo,
+    /// CPU 温度の PDH プローブ
+    cpu_temp_probe: crate::temperature::CpuTempProbe,
 }
 
 /// グラフ描画用の軽量メトリック (高速ティック用)。
@@ -242,6 +252,8 @@ impl ProcCollector {
             npu_recheck: 0,
             smart_cache: HashMap::new(),
             cpu_info,
+            mem_info: crate::memoryinfo::query(),
+            cpu_temp_probe: crate::temperature::CpuTempProbe::new(),
         })
     }
 
@@ -566,6 +578,11 @@ impl ProcCollector {
             cpu_physical_cores: self.cpu_info.physical_cores,
             cpu_virtualization: self.cpu_info.virtualization,
             cpu_caches: self.cpu_info.caches.clone(),
+            mem_form_factor: self.mem_info.form_factor.clone(),
+            mem_slots_used: self.mem_info.slots_used,
+            mem_slots_total: self.mem_info.slots_total,
+            cpu_temp_c: self.cpu_temp_probe.read(),
+            gpu_temps: crate::temperature::gpu_temps(),
             mem_available,
             commit_used,
             commit_limit,

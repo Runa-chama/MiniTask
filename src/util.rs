@@ -512,6 +512,30 @@ pub fn paint_mini_graph(
     paint_curve(painter, rect, values, max, color, 1.2, style);
 }
 
+/// 温度の推移を既存グラフに重ねて表示する (右端が現在)。
+pub fn paint_temp_overlay(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    values: &VecDeque<f32>,
+    color: Color32,
+    style: GraphStyle,
+    label: &str,
+) {
+    if values.is_empty() {
+        return;
+    }
+    let max = values.iter().copied().fold(20.0, f32::max).ceil().max(20.0);
+    let painter = ui.painter();
+    paint_curve(painter, rect, values, max, color, 1.5, style);
+    painter.text(
+        egui::pos2(rect.left() + 5.0, rect.top() + 2.0),
+        egui::Align2::LEFT_TOP,
+        label.to_owned(),
+        egui::FontId::proportional(11.0),
+        color,
+    );
+}
+
 /// 大きな使用率グラフ (パフォーマンスタブ用)。25/50/75% のグリッド線付き。
 /// 右クリックメニュー用にクリック可能な応答を返す。
 pub fn perf_chart(

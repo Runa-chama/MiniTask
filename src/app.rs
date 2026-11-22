@@ -228,12 +228,16 @@ pub struct MiniTaskApp {
     rows: Vec<ProcRow>,
     load: SysLoad,
     cpu_hist: VecDeque<f32>,
+    /// CPU 温度の推移 (摂氏)
+    cpu_temp_hist: VecDeque<f32>,
     mem_hist: VecDeque<f32>,
     /// 物理ディスクごとの読み取り/書き込み履歴 (切断時に自動で破棄)
     disk_active_hist: Vec<(String, VecDeque<f32>)>,
     disk_read_hist: Vec<(String, VecDeque<f32>)>,
     disk_write_hist: Vec<(String, VecDeque<f32>)>,
     gpu_hist: Vec<(String, VecDeque<f32>)>,
+    /// GPU 温度の推移 (ID ごと・摂氏)
+    gpu_temp_hist: Vec<(String, VecDeque<f32>)>,
     npu_hist: Vec<(String, VecDeque<f32>)>,
     /// ネットワークアダプターごとの受信/送信履歴
     net_recv_hist: Vec<(String, VecDeque<f32>)>,
@@ -470,11 +474,13 @@ impl MiniTaskApp {
             rows: Vec::new(),
             load: SysLoad::default(),
             cpu_hist: VecDeque::new(),
+            cpu_temp_hist: VecDeque::new(),
             mem_hist: VecDeque::new(),
             disk_active_hist: Vec::new(),
             disk_read_hist: Vec::new(),
             disk_write_hist: Vec::new(),
             gpu_hist: Vec::new(),
+            gpu_temp_hist: Vec::new(),
             npu_hist: Vec::new(),
             net_recv_hist: Vec::new(),
             net_sent_hist: Vec::new(),
@@ -620,6 +626,18 @@ impl MiniTaskApp {
             }
 
             self.load = load;
+            // 温度の推移を記録 (摂氏で保持し、表示時に単位を変換する)
+            if let Some(t) = self.load.cpu_temp_c {
+                self.cpu_temp_hist.push_back(t);
+                while self.cpu_temp_hist.len() > HISTORY_LEN {
+                    self.cpu_temp_hist.pop_front();
+                }
+            }
+            for (index, temp) in self.load.gpu_temps.iter().enumerate() {
+                if let (Some(t), Some(g)) = (temp, self.load.gpus.get(index)) {
+                    push_device_hist(&mut self.gpu_temp_hist, &g.id, *t, 1.0);
+                }
+            }
             self.normalize_selection();
             if let Some(pid) = self.selected {
                 if !self.rows.iter().any(|r| r.pid == pid) {
@@ -2166,6 +2184,32 @@ impl MiniTaskApp {
         } else {
             let resp = util::perf_chart(ui, hist, 100.0, color, Vec2::new(gw, gh), style);
             graph_double_clicked |= resp.double_clicked();
+            if self.perf_sel == PerfSel::Cpu {
+                let label = self
+                    .load
+                    .cpu_temp_c
+                    .map(|t| util::format_temp(t, self.temp_unit))
+                    .unwrap_or_else(|| "温度 —".to_owned());
+                util::paint_temp_overlay(
+                    ui,
+                    resp.rect,
+                    &self.cpu_temp_hist,
+                    self.palette.warn,
+                    style,
+                    &label,
+                );
+            } else if let PerfSel::Gpu(id) = &self.perf_sel {
+                let label = self
+                    .load
+                    .gpus
+                    .iter()
+                    .position(|g| &g.id == id)
+                    .and_then(|index| self.load.gpu_temps.get(index).copied().flatten())
+                    .map(|t| util::format_temp(t, self.temp_unit))
+                    .unwrap_or_else(|| "温度 —".to_owned());
+                let hist = find_hist(&self.gpu_temp_hist, id, &empty_hist);
+                util::paint_temp_overlay(ui, resp.rect, hist, self.palette.warn, style, &label);
+            }
             match &self.perf_sel {
                 PerfSel::Cpu => {
                     resp.on_hover_text("右クリックでグラフの変更")
@@ -2317,9 +2361,17 @@ impl MiniTaskApp {
                     if let Some(mhz) = d.cpu_base_mhz {
                         Self::detail_row(ui, "基本速度", format!("{:.2} GHz", mhz as f64 / 1000.0));
                     }
+                    Self::detail_row(
+                        ui,
+                        "温度",
+                        d.cpu_temp_c
+                            .map(|t| util::format_temp(t, self.temp_unit))
+                            .unwrap_or_else(|| "—".to_owned()),
+                    );
                     if let Some(cores) = d.cpu_physical_cores {
                         Self::detail_row(ui, "コア数", cores.to_string());
                     }
+                    Self::detail_row(ui, "論理プロセッサ数", d.logical_cores.to_string());
                     if let Some(v) = d.cpu_virtualization {
                         Self::detail_row(
                             ui,
@@ -2338,6 +2390,12 @@ impl MiniTaskApp {
                 PerfSel::Ram => {
                     Self::detail_row(ui, "使用中", gb(d.mem_used));
                     Self::detail_row(ui, "利用可能", gb(d.mem_available));
+                    if let Some(factor) = &d.mem_form_factor {
+                        Self::detail_row(ui, "フォームファクタ", factor.clone());
+                    }
+                    if let (Some(used), Some(total)) = (d.mem_slots_used, d.mem_slots_total) {
+                        Self::detail_row(ui, "スロット", format!("{used}/{total}"));
+                    }
                     Self::detail_row(
                         ui,
                         "コミット済み",
@@ -2399,6 +2457,18 @@ impl MiniTaskApp {
                 PerfSel::Gpu(id) => {
                     if let Some(g) = d.gpus.iter().find(|x| &x.id == id) {
                         Self::detail_row(ui, "使用率", format!("{:.1}%", g.usage));
+                        let gpu_temp = d
+                            .gpus
+                            .iter()
+                            .position(|x| &x.id == id)
+                            .and_then(|index| d.gpu_temps.get(index).copied().flatten());
+                        Self::detail_row(
+                            ui,
+                            "温度",
+                            gpu_temp
+                                .map(|t| util::format_temp(t, self.temp_unit))
+                                .unwrap_or_else(|| "—".to_owned()),
+                        );
                         Self::detail_row(
                             ui,
                             "専用 GPU メモリ",
@@ -2442,6 +2512,19 @@ impl MiniTaskApp {
                                 ui,
                                 "信号の品質",
                                 format!("{}%", a.signal_pct),
+                            );
+                            Self::detail_row(
+                                ui,
+                                "信号強度",
+                                match a.signal_dbm {
+                                    Some(dbm) => format!("約 {dbm} dBm"),
+                                    None => "—".to_owned(),
+                                },
+                            );
+                            Self::detail_row(
+                                ui,
+                                "規格",
+                                a.wifi_standard.clone().unwrap_or_else(|| "—".to_owned()),
                             );
                         }
                     }
@@ -2535,6 +2618,42 @@ impl MiniTaskApp {
                                 "—".to_owned()
                             } else {
                                 a.ipv6.join(", ")
+                            },
+                        );
+                        Self::detail_row(
+                            ui,
+                            "ローカル IPv4",
+                            if a.ipv4_local.is_empty() {
+                                "—".to_owned()
+                            } else {
+                                a.ipv4_local.join(", ")
+                            },
+                        );
+                        Self::detail_row(
+                            ui,
+                            "グローバル IPv4",
+                            if a.ipv4_global.is_empty() {
+                                "—".to_owned()
+                            } else {
+                                a.ipv4_global.join(", ")
+                            },
+                        );
+                        Self::detail_row(
+                            ui,
+                            "ローカル IPv6",
+                            if a.ipv6_local.is_empty() {
+                                "—".to_owned()
+                            } else {
+                                a.ipv6_local.join(", ")
+                            },
+                        );
+                        Self::detail_row(
+                            ui,
+                            "グローバル IPv6",
+                            if a.ipv6_global.is_empty() {
+                                "—".to_owned()
+                            } else {
+                                a.ipv6_global.join(", ")
                             },
                         );
                         let speed = a.link_speed_bps as f64 / 1_000_000.0;

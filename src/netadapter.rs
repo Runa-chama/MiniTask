@@ -40,6 +40,10 @@ pub struct AdapterSample {
     pub sent_bps: u64,
     pub ipv4: Vec<String>,
     pub ipv6: Vec<String>,
+    pub ipv4_global: Vec<String>,
+    pub ipv4_local: Vec<String>,
+    pub ipv6_global: Vec<String>,
+    pub ipv6_local: Vec<String>,
     /// リンク速度 (bits/sec)
     pub link_speed_bps: u64,
     /// 状態
@@ -48,6 +52,10 @@ pub struct AdapterSample {
     pub ssid: String,
     /// Wi-Fi の信号の品質 (0..100)
     pub signal_pct: u32,
+    /// Wi-Fi の規格 (例: "802.11ax")
+    pub wifi_standard: Option<String>,
+    /// 推定 RSSI (dBm)
+    pub signal_dbm: Option<i32>,
 }
 
 #[derive(Clone, Default)]
@@ -57,6 +65,10 @@ struct IpInfo {
     is_wifi: bool,
     ipv4: Vec<String>,
     ipv6: Vec<String>,
+    ipv4_global: Vec<String>,
+    ipv4_local: Vec<String>,
+    ipv6_global: Vec<String>,
+    ipv6_local: Vec<String>,
     link_speed_bps: u64,
     status: String,
 }
@@ -65,6 +77,53 @@ struct IpInfo {
 struct WifiInfo {
     ssid: String,
     signal_pct: u32,
+    standard: Option<String>,
+}
+
+impl WifiInfo {
+    /// 信号品質からおおよその RSSI を求める (100% ≈ -50 dBm)。
+    fn signal_dbm(&self) -> i32 {
+        -100 + (self.signal_pct.min(100) as i32) / 2
+    }
+}
+
+/// 802.11 PHY タイプを規格名に変換する。
+fn phy_type_name(value: i32) -> Option<&'static str> {
+    match value {
+        1 => Some("802.11b"),
+        2 => Some("802.11a"),
+        3 => Some("802.11g"),
+        4 => Some("802.11n"),
+        5 => Some("802.11ac"),
+        6 => Some("802.11ax"),
+        7 => Some("802.11be"),
+        _ => None,
+    }
+}
+
+/// IPv4 がローカル (私用/リンクローカル) かどうか。
+fn ipv4_is_local(text: &str) -> bool {
+    let parts: Vec<u8> = text.split('.').filter_map(|p| p.parse().ok()).collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    let (a, b) = (parts[0], parts[1]);
+    a == 10
+        || a == 127
+        || a == 0
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 168)
+        || (a == 169 && b == 254)
+}
+
+/// IPv6 がローカル (リンクローカル/一意ローカル/ループバック) かどうか。
+fn ipv6_is_local(text: &str) -> bool {
+    let s = text.to_ascii_lowercase();
+    s.starts_with("fe80:")
+        || s.starts_with("fc")
+        || s.starts_with("fd")
+        || s.starts_with("::1")
+        || s == "::"
 }
 
 /// PDH + iphlpapi + wlanapi をまとめるメータ。
@@ -155,12 +214,18 @@ impl NetAdapterMeter {
                         sent_bps: sent.max(0.0) as u64,
                         ipv4: info.map(|i| i.ipv4.clone()).unwrap_or_default(),
                         ipv6: info.map(|i| i.ipv6.clone()).unwrap_or_default(),
+                        ipv4_global: info.map(|i| i.ipv4_global.clone()).unwrap_or_default(),
+                        ipv4_local: info.map(|i| i.ipv4_local.clone()).unwrap_or_default(),
+                        ipv6_global: info.map(|i| i.ipv6_global.clone()).unwrap_or_default(),
+                        ipv6_local: info.map(|i| i.ipv6_local.clone()).unwrap_or_default(),
                         link_speed_bps: info.map(|i| i.link_speed_bps).unwrap_or(0),
                         status: info
                             .map(|i| i.status.clone())
                             .unwrap_or_else(|| "不明".to_owned()),
                         ssid: wifi.map(|w| w.ssid.clone()).unwrap_or_default(),
                         signal_pct: wifi.map(|w| w.signal_pct).unwrap_or(0),
+                        wifi_standard: wifi.and_then(|w| w.standard.clone()),
+                        signal_dbm: wifi.map(|w| w.signal_dbm()),
                     })
                 })
                 .collect();
@@ -217,6 +282,10 @@ fn ip_adapters() -> HashMap<String, IpInfo> {
             let description = crate::perf::wide_ptr_to_string(a.Description);
             let mut ipv4 = Vec::new();
             let mut ipv6 = Vec::new();
+            let mut ipv4_global = Vec::new();
+            let mut ipv4_local = Vec::new();
+            let mut ipv6_global = Vec::new();
+            let mut ipv6_local = Vec::new();
             let mut addr = a.FirstUnicastAddress;
             while !addr.is_null() {
                 let u = &*addr;
@@ -233,8 +302,18 @@ fn ip_adapters() -> HashMap<String, IpInfo> {
                     };
                     if !name.is_empty() {
                         if family == AF_INET {
+                            if ipv4_is_local(&name) {
+                                ipv4_local.push(name.clone());
+                            } else {
+                                ipv4_global.push(name.clone());
+                            }
                             ipv4.push(name);
                         } else {
+                            if ipv6_is_local(&name) {
+                                ipv6_local.push(name.clone());
+                            } else {
+                                ipv6_global.push(name.clone());
+                            }
                             ipv6.push(name);
                         }
                     }
@@ -247,6 +326,10 @@ fn ip_adapters() -> HashMap<String, IpInfo> {
                 is_wifi: a.IfType == IF_TYPE_IEEE80211,
                 ipv4,
                 ipv6,
+                ipv4_global,
+                ipv4_local,
+                ipv6_global,
+                ipv6_local,
                 link_speed_bps: a.TransmitLinkSpeed.max(a.ReceiveLinkSpeed),
                 status: if a.OperStatus == 1 {
                     "稼働中".to_owned()
@@ -312,6 +395,10 @@ fn wifi_adapters() -> HashMap<String, WifiInfo> {
                     WifiInfo {
                         ssid: u16_array(&conn.strProfileName),
                         signal_pct: conn.wlanAssociationAttributes.wlanSignalQuality,
+                        standard: phy_type_name(
+                            conn.wlanAssociationAttributes.dot11PhyType as i32,
+                        )
+                        .map(str::to_owned),
                     },
                 );
                 WlanFreeMemory(data);
