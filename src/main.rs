@@ -21,6 +21,7 @@ mod settings;
 mod smart;
 mod startup;
 mod tray;
+mod update;
 mod util;
 
 fn main() -> eframe::Result {

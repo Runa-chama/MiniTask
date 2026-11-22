@@ -2,7 +2,10 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc::Receiver, Arc};
+use std::sync::{
+    mpsc::{self, Receiver, Sender},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText, Vec2};
@@ -21,6 +24,12 @@ enum Tab {
     Processes,
     Performance,
     Startup,
+}
+
+/// 更新チェック / ダウンロードの結果を UI スレッドへ渡す。
+enum UpdateMsg {
+    Check(Option<crate::update::UpdateInfo>),
+    Download(Result<std::path::PathBuf, String>),
 }
 
 /// パフォーマンスタブで選択中のメトリクス。
@@ -298,6 +307,14 @@ pub struct MiniTaskApp {
     ifeo_restore: Option<(String, Instant)>,
     taskmgr_icon: Option<egui::TextureHandle>,
 
+    // --- アップデート ---
+    update_rx: Receiver<UpdateMsg>,
+    update_tx: Sender<UpdateMsg>,
+    update_info: Option<crate::update::UpdateInfo>,
+    update_busy: bool,
+    update_msg: Option<String>,
+    last_update_check: u64,
+
     // --- アイコン / SMART ---
     icon_cache: IconCache,
     smart_dialog_disk: Option<String>,
@@ -392,6 +409,16 @@ impl MiniTaskApp {
                 if flag.load(Ordering::Relaxed) {
                     integration::try_hide_minimized_window();
                 }
+            });
+        }
+        // GitHub Releases を 1 日 1 回チェック (結果はチャネルで受け取る)
+        let (update_tx, update_rx) = mpsc::channel::<UpdateMsg>();
+        if crate::update::now_secs().saturating_sub(settings.last_update_check)
+            >= crate::update::CHECK_INTERVAL_SECS
+        {
+            let tx = update_tx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(UpdateMsg::Check(crate::update::check_latest()));
             });
         }
         let env_tab = std::env::var("MINITASK_TAB").ok();
@@ -549,6 +576,12 @@ impl MiniTaskApp {
             tray_rx,
             ifeo_restore: None,
             taskmgr_icon,
+            update_rx,
+            update_tx,
+            update_info: None,
+            update_busy: false,
+            update_msg: None,
+            last_update_check: settings.last_update_check,
             icon_cache: IconCache::default(),
             smart_dialog_disk: None,
         };
@@ -896,6 +929,49 @@ impl eframe::App for MiniTaskApp {
                 }
             }
         }
+        // GitHub Releases の更新チェック / ダウンロード結果
+        while let Ok(msg) = self.update_rx.try_recv() {
+            match msg {
+                UpdateMsg::Check(info) => {
+                    self.update_busy = false;
+                    self.last_update_check = crate::update::now_secs();
+                    match info {
+                        Some(i)
+                            if crate::update::is_newer(&i.version, env!("CARGO_PKG_VERSION")) =>
+                        {
+                            self.update_msg = Some(format!("{} が利用可能", i.version));
+                            self.toast = Some((
+                                format!("MiniTask {} が利用可能", i.version),
+                                Instant::now(),
+                            ));
+                            self.update_info = Some(i);
+                        }
+                        Some(_) => {
+                            self.update_info = None;
+                            self.update_msg = Some("最新バージョンです".to_owned());
+                        }
+                        None => {
+                            self.update_msg = Some("更新情報を取得できませんでした".to_owned());
+                        }
+                    }
+                }
+                UpdateMsg::Download(Ok(path)) => {
+                    self.update_busy = false;
+                    if crate::update::apply_update(&path).is_ok() {
+                        // デタッチしたヘルパーがインストール→再起動を行う。
+                        // アプリは設定を保存してから正常終了する。
+                        self.close_to_tray = false;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    } else {
+                        self.update_msg = Some("更新の適用に失敗しました".to_owned());
+                    }
+                }
+                UpdateMsg::Download(Err(e)) => {
+                    self.update_busy = false;
+                    self.update_msg = Some(format!("ダウンロード失敗: {e}"));
+                }
+            }
+        }
         // 閉じるボタンでトレイに格納
         if self.tray_icon && self.close_to_tray && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1059,6 +1135,7 @@ impl MiniTaskApp {
             close_to_tray: self.close_to_tray,
             minimize_to_tray: self.minimize_to_tray,
             tray_usage_tip: self.tray_usage_tip,
+            last_update_check: self.last_update_check,
         }
     }
 
@@ -1076,6 +1153,17 @@ impl MiniTaskApp {
                     .color(ui.visuals().weak_text_color()),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some(info) = &self.update_info {
+                    let label = format!("更新あり ({})", info.version);
+                    if ui
+                        .button(RichText::new(label).color(self.palette.warn))
+                        .on_hover_text("クリックして設定から更新できます")
+                        .clicked()
+                    {
+                        self.settings_open = true;
+                        self.settings_page = 3;
+                    }
+                }
                 if ui.button("設定").clicked() {
                     self.settings_open = true;
                 }
@@ -2846,6 +2934,46 @@ impl MiniTaskApp {
                                 .small()
                                 .color(self.palette.warn),
                             );
+                            ui.separator();
+                            ui.label(RichText::new("アップデート").strong());
+                            ui.label(
+                                RichText::new(format!(
+                                    "現在のバージョン: {}",
+                                    env!("CARGO_PKG_VERSION")
+                                ))
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                            );
+                            if self.update_busy {
+                                ui.label("確認中 / ダウンロード中...");
+                            } else if let Some(info) = self.update_info.clone() {
+                                ui.label(
+                                    RichText::new(format!("{} が利用可能", info.version))
+                                        .color(self.palette.warn),
+                                );
+                                if ui.button("更新してインストール").clicked() {
+                                    self.update_busy = true;
+                                    let tx = self.update_tx.clone();
+                                    std::thread::spawn(move || {
+                                        let _ = tx.send(UpdateMsg::Download(
+                                            crate::update::download(&info),
+                                        ));
+                                    });
+                                }
+                            } else if ui.button("今すぐ更新を確認").clicked() {
+                                self.update_busy = true;
+                                let tx = self.update_tx.clone();
+                                std::thread::spawn(move || {
+                                    let _ = tx.send(UpdateMsg::Check(crate::update::check_latest()));
+                                });
+                            }
+                            if let Some(msg) = &self.update_msg {
+                                ui.label(
+                                    RichText::new(msg)
+                                        .small()
+                                        .color(ui.visuals().weak_text_color()),
+                                );
+                            }
                         }
                     });
                 });

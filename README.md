@@ -133,6 +133,17 @@ IFEO (`HKLM\...\taskmgr.exe`) を登録します（初期状態はオフ）。
 アンインストール時は、自分が登録した IFEO / シェルメニューのみ削除し、
 設定 (`HKCU\Software\MiniTask`) は残します。
 
+## アップデート
+
+起動時に GitHub Releases (`Runa-chama/MiniTask`) を 1 日 1 回確認し、新しい
+バージョンがあればトーストと「更新あり」ボタンで通知します。
+設定 → システム統合 →「今すぐ更新を確認」から手動でも確認できます。
+「更新してインストール」を押すと Setup.exe をダウンロードし、サイレントに
+インストールして MiniTask を自動再起動します。
+
+リリース手順: `vX.Y.Z` のタグを push すると GitHub Actions がインストーラを
+ビルドし、`MiniTask-X.Y.Z-setup.exe` をリリースへ添付します。
+
 ## 使い方
 
 1. `minitask.exe` を実行（UAC を承認）
@@ -150,6 +161,8 @@ IFEO (`HKLM\...\taskmgr.exe`) を登録します（初期状態はオフ）。
 | `MINITASK_SPLINE=1` | スプライン補間を有効にして起動 (検証用) |
 | `MINITASK_ANIMATION=1` | なめらかアニメーション補間を有効にして起動 (検証用) |
 | `MINITASK_TAB=performance` | パフォーマンスタブを開いて起動 (`cpu` / `ram` / `rom` / `gpu` / `npu` / `percore` も指定可) |
+| `MINITASK_DEBUG_UPDATE=1` | 更新チェックの経過を `%TEMP%\minitask_update.log` に出力 |
+| `MINITASK_UPDATE_URL=...` | 更新チェック先の API URL を差し替え (検証用) |
 
 ## 設定の保存
 
