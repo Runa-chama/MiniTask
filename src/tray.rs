@@ -6,26 +6,27 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
-};
 use windows_sys::Win32::UI::Shell::ExtractIconExW;
+use windows_sys::Win32::UI::Shell::{
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, PostMessageW,
-    PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow,
-    SetWindowLongPtrW, TrackPopupMenu, TranslateMessage, CREATESTRUCTW, CW_USEDEFAULT,
-    GWLP_USERDATA, HICON, HMENU, MF_STRING, MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
-    WM_NULL, WM_RBUTTONUP, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    AppendMenuW, CREATESTRUCTW, CW_USEDEFAULT, ChangeWindowMessageFilterEx, CreatePopupMenu,
+    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
+    GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, HICON, HMENU, MF_STRING, MSG,
+    MSGFLT_ALLOW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
+    SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY,
+    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::integration;
 
 const WM_TRAYICON: u32 = 0x0400 + 1; // WM_APP + 1
+pub const WM_TRAY_SHOW: u32 = 0x0400 + 2; // 他プロセスからの「表示して」要求
 const ID_OPEN: usize = 0x4D54_0001;
 const ID_EXIT: usize = 0x4D54_0002;
-const CLASS_NAME: &str = "MiniTaskTrayNotify\0";
+pub const CLASS_NAME: &str = "MiniTaskTrayNotify\0";
 
 #[derive(Debug)]
 pub enum TrayMsg {
@@ -144,7 +145,12 @@ fn show_context_menu(hwnd: HWND, tx: &Sender<TrayMsg>) {
     }
 }
 
-unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     unsafe {
         if msg == WM_CREATE {
             let cs = &*(lparam as *const CREATESTRUCTW);
@@ -176,6 +182,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         if msg == state.taskbar_created && state.taskbar_created != 0 {
             // explorer 再起動後にアイコンを再登録
             add_icon(hwnd, state.icon);
+            return 0;
+        }
+
+        if msg == WM_TRAY_SHOW {
+            let _ = state.tx.send(TrayMsg::Open);
+            integration::focus_window();
             return 0;
         }
 
@@ -280,6 +292,10 @@ pub fn start() -> (TrayHandle, Receiver<TrayMsg>) {
                 state_ptr.cast(),
             );
 
+            if !hwnd.is_null() {
+                // 非昇格プロセスからの「表示して」要求を許可する (UIPI 対策)
+                ChangeWindowMessageFilterEx(hwnd, WM_TRAY_SHOW, MSGFLT_ALLOW, std::ptr::null_mut());
+            }
             let _ = ready_tx.send(hwnd as isize);
 
             if hwnd.is_null() {
@@ -306,5 +322,11 @@ pub fn start() -> (TrayHandle, Receiver<TrayMsg>) {
     });
 
     let hwnd = ready_rx.recv().unwrap_or(0);
-    (TrayHandle { thread: Some(thread), hwnd }, rx)
+    (
+        TrayHandle {
+            thread: Some(thread),
+            hwnd,
+        },
+        rx,
+    )
 }

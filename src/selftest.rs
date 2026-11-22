@@ -16,6 +16,13 @@ const RUN_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const TEST_NAME: &str = "MiniTaskSelfTest";
 
 pub fn run() -> i32 {
+    if !crate::integration::is_elevated() {
+        println!(
+            "[FAIL] 管理者権限で実行してください。昇格したターミナルから MINITASK_SELFTEST=1 を設定して起動してください。"
+        );
+        return 1;
+    }
+
     let mut failed = 0;
     let mut check = |name: &str, ok: bool, detail: String| {
         println!("[{}] {name}: {detail}", if ok { "PASS" } else { "FAIL" });

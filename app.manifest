@@ -5,7 +5,10 @@
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+        <!-- IFEO (Ctrl+Shift+Esc) は CreateProcess で起動するため、
+             requireAdministrator だと error 740 で起動できない。
+             asInvoker で起動し、main() で必要時に自己昇格する。 -->
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
       </requestedPrivileges>
     </security>
   </trustInfo>

@@ -1,11 +1,24 @@
 //! OS 連携: タスクマネージャー置換 (IFEO) / シェルメニュー / ウィンドウ操作。
 
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowTextLengthW, GetWindowTextW, IsIconic, SetForegroundWindow, ShowWindow,
-    SW_RESTORE, SW_SHOW,
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+use windows_sys::Win32::Security::{
+    GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
 };
-use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, KEY_WOW64_64KEY};
+use windows_sys::Win32::System::Threading::{
+    AttachThreadInput, GetCurrentProcess, GetCurrentThreadId, OpenProcessToken,
+};
+use windows_sys::Win32::UI::Shell::ShellExecuteW;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    ASFW_ANY, AllowSetForegroundWindow, EnumWindows, FLASHW_ALL, FLASHW_TIMERNOFG, FLASHWINFO,
+    FindWindowW, FlashWindowEx, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IsIconic, PostMessageW,
+    SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+    SetForegroundWindow, SetWindowPos, ShowWindow, SwitchToThisWindow,
+};
 use winreg::RegKey;
+use winreg::enums::{
+    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, KEY_WOW64_64KEY,
+};
 
 type Handle = *mut std::ffi::c_void;
 
@@ -108,6 +121,104 @@ pub fn set_shell_menu(enable: bool, exe_path: &str) -> Result<(), String> {
 // ウィンドウ操作
 // ---------------------------------------------------------------------------
 
+fn focus_log(msg: &str) {
+    if std::env::var_os("MINITASK_DEBUG_FOCUS").is_none() {
+        return;
+    }
+    use std::io::Write;
+    let path = std::env::temp_dir().join("minitask_focus.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
+/// 非表示・最小化・フォアグラウンドロックを考慮してウィンドウを前面化する。
+unsafe fn bring_to_front(hwnd: HWND) {
+    unsafe {
+        ShowWindow(hwnd, SW_SHOW);
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+
+        // Z-order を最上位へ
+        let z = SetWindowPos(
+            hwnd,
+            HWND_TOP,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        );
+        SwitchToThisWindow(hwnd, 1);
+        let fg1 = SetForegroundWindow(hwnd);
+
+        // フォアグラウンドロック対策: 前面ウィンドウのスレッドに一時的に入力アタッチ
+        let fg = GetForegroundWindow();
+        let mut fg_thread = 0u32;
+        if !fg.is_null() {
+            fg_thread = GetWindowThreadProcessId(fg, std::ptr::null_mut());
+        }
+        let cur_thread = GetCurrentThreadId();
+        let attached = fg_thread != 0
+            && fg_thread != cur_thread
+            && AttachThreadInput(cur_thread, fg_thread, 1) != 0;
+        let fg2 = SetForegroundWindow(hwnd);
+        if attached {
+            let _ = AttachThreadInput(cur_thread, fg_thread, 0);
+        }
+
+        // それでも前に出ない場合のフォールバック。
+        // 昇格ウィンドウは非昇格の前面ウィンドウから SetForegroundWindow で
+        // アクティブ化できない (Windows の制限)。数秒だけ最前面に固定して
+        // ユーザーがクリックできるようにする。
+        let top = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        );
+        if top != 0 {
+            let hwnd_val = hwnd as isize;
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                let _ = SetWindowPos(
+                    hwnd_val as HWND,
+                    HWND_NOTOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE,
+                );
+            });
+        }
+        // タスクバーボタンを点滅させて気付かせる
+        let fwi = FLASHWINFO {
+            cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+            hwnd,
+            dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+            uCount: 0,
+            dwTimeout: 0,
+        };
+        let _ = FlashWindowEx(&fwi);
+
+        SwitchToThisWindow(hwnd, 1);
+        let fg3 = SetForegroundWindow(hwnd);
+
+        focus_log(&format!(
+            "hwnd={hwnd:?} fg_thread={fg_thread} attached={attached} z={z} fg1={fg1} fg2={fg2} top={top} fg3={fg3}"
+        ));
+    }
+}
+
 unsafe extern "system" fn enum_focus_proc(hwnd: Handle, _lparam: isize) -> i32 {
     unsafe {
         let len = GetWindowTextLengthW(hwnd);
@@ -116,16 +227,94 @@ unsafe extern "system" fn enum_focus_proc(hwnd: Handle, _lparam: isize) -> i32 {
             GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
             let text = String::from_utf16_lossy(&title);
             if text.contains("MiniTask") && text.contains("軽量タスクマネージャー") {
-                ShowWindow(hwnd, SW_SHOW);
-                if IsIconic(hwnd) != 0 {
-                    ShowWindow(hwnd, SW_RESTORE);
-                }
-                SetForegroundWindow(hwnd);
+                bring_to_front(hwnd);
                 return 0;
             }
         }
         1
     }
+}
+
+fn to_wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 現在のプロセスが管理者として昇格しているか。
+pub fn is_elevated() -> bool {
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut size = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elevation as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut size,
+        );
+        let _ = CloseHandle(token);
+        ok != 0 && elevation.TokenIsElevated != 0
+    }
+}
+
+/// 自分自身を UAC 昇格して起動し直す。
+pub fn relaunch_elevated() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe_w = to_wide(&exe.to_string_lossy());
+    let verb = to_wide("runas");
+    let params: Vec<String> = std::env::args().skip(1).collect();
+    let params_w = to_wide(&params.join(" "));
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            exe_w.as_ptr(),
+            params_w.as_ptr(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result as isize <= 32 {
+        Err(format!("昇格起動に失敗しました (code {})", result as isize))
+    } else {
+        Ok(())
+    }
+}
+
+fn notify_tray_show() -> bool {
+    // トレイ常駐プロセスの egui 側に Visible(true) を通知する
+    unsafe {
+        let class: Vec<u16> = crate::tray::CLASS_NAME.encode_utf16().collect();
+        let hwnd = FindWindowW(class.as_ptr(), std::ptr::null());
+        if hwnd.is_null() {
+            false
+        } else {
+            PostMessageW(hwnd, crate::tray::WM_TRAY_SHOW, 0, 0) != 0
+        }
+    }
+}
+
+/// 既存インスタンスに「表示して」と通知できたら true。
+pub fn notify_existing_instance() -> bool {
+    unsafe {
+        // ホットキー経由で起動された場合、このプロセスはフォアグラウンド権を
+        // 持っていることがある。既存の昇格プロセスが前面に出られるよう委譲する。
+        let allowed = AllowSetForegroundWindow(ASFW_ANY);
+        focus_log(&format!("allow_set_foreground={allowed}"));
+    }
+    // 通知側からも直接前面化を試みる (昇格先の SetForegroundWindow が
+    // フォアグラウンドロックで失敗する場合の保険)。
+    focus_window();
+    let posted = notify_tray_show();
+    if posted {
+        // AllowSetForegroundWindow の許可は呼び出し元の終了で失効するため、
+        // 既存側が前面化を終えるまで少しだけ待つ。
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+    }
+    posted
 }
 
 /// "MiniTask" を含むウィンドウを前面化する。
@@ -149,11 +338,7 @@ pub fn focus_existing_instance() -> bool {
             GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
             let text = String::from_utf16_lossy(&title);
             if text.contains("MiniTask") && text.contains("軽量タスクマネージャー") {
-                ShowWindow(hwnd, SW_SHOW);
-                if IsIconic(hwnd) != 0 {
-                    ShowWindow(hwnd, SW_RESTORE);
-                }
-                SetForegroundWindow(hwnd);
+                bring_to_front(hwnd);
                 *(found as *mut bool) = true;
                 return 0;
             }
@@ -163,6 +348,9 @@ pub fn focus_existing_instance() -> bool {
     let mut found = false;
     unsafe {
         EnumWindows(Some(proc), &mut found as *mut bool as isize);
+    }
+    if found {
+        notify_tray_show();
     }
     found
 }

@@ -4,7 +4,8 @@
 //! - CPU / メモリ / ディスク I/O / プロセス別ネットワーク使用量 (ETW)
 //! - スタートアップ管理
 //!
-//! 管理者権限で実行される (app.manifest の requireAdministrator)。
+//! app.manifest は asInvoker。起動時に管理者へ自己昇格する
+//! (IFEO の CreateProcess 起動でも error 740 にならないようにするため)。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -27,11 +28,23 @@ fn main() -> eframe::Result {
         std::process::exit(selftest::run());
     }
 
-    // 多重起動防止: 既存インスタンスがあれば前面化して終了
-    if std::env::var("MINITASK_ALLOW_MULTI").is_err() {
-        if integration::focus_existing_instance() {
+    let allow_multi = std::env::var("MINITASK_ALLOW_MULTI").is_ok();
+
+    // IFEO は CreateProcess で起動するため、requireAdministrator だと
+    // error 740 で何も起動しない。非昇格で起動した場合は必要に応じて自己昇格する。
+    // 既存インスタンスがあれば昇格せずに通知だけ行う (UAC を出さない)。
+    if !integration::is_elevated() {
+        if !allow_multi && integration::notify_existing_instance() {
             return Ok(());
         }
+        if integration::relaunch_elevated().is_ok() {
+            return Ok(());
+        }
+    }
+
+    // 多重起動防止: 既存インスタンスがあれば前面化して終了
+    if !allow_multi && integration::focus_existing_instance() {
+        return Ok(());
     }
 
     // 他ユーザープロセス等の照会・終了のため SeDebugPrivilege を有効化
@@ -59,6 +72,14 @@ fn main() -> eframe::Result {
         viewport,
         ..Default::default()
     };
+
+    // 起動直後にウィンドウを前面に出す。IFEO (Ctrl+Shift+Esc) 起動では
+    // 昇格の関係で自動フォーカスが効かない場合があるため、最前面表示と
+    // タスクバー点滅で気付けるようにする。
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        integration::focus_window();
+    });
 
     eframe::run_native(
         "MiniTask",
