@@ -2810,16 +2810,14 @@ impl MiniTaskApp {
                                 .on_hover_text("タスクトレイアイコンが有効な場合に限ります");
                         }
                         _ => {
-                            ui.checkbox(&mut replace, "Ctrl+Shift+Esc で MiniTask を開く");
+                            ui.checkbox(&mut replace, "タスクマネージャーの代わりにMiniTaskを起動")
+                                .on_hover_text(
+                                    "Ctrl+Shift+Esc やタスクバーからタスクマネージャーを開くと MiniTask が起動します",
+                                );
                             ui.label(
                                 RichText::new(format!(
-                                    "現在の状態: {} / Debugger: {}",
-                                    if ifeo_active { "有効" } else { "無効" },
-                                    if integration::debugger_value().is_some() {
-                                        "設定済み"
-                                    } else {
-                                        "未設定"
-                                    }
+                                    "現在の状態: {}",
+                                    if ifeo_active { "有効" } else { "無効" }
                                 ))
                                 .small()
                                 .color(ui.visuals().weak_text_color()),
@@ -2888,7 +2886,7 @@ impl MiniTaskApp {
                         Ok(()) => {
                             self.replace_taskmgr = replace;
                             self.notify(if replace {
-                                "Ctrl+Shift+Esc で MiniTask を開くようにしました"
+                                "タスクマネージャーの代わりに MiniTask を起動します"
                             } else {
                                 "タスクマネージャーの置換を解除しました"
                             });

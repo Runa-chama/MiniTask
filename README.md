@@ -82,9 +82,9 @@ Windows 10/11 用の軽量タスクマネージャー。Rust + egui 製。
   - **グラフと更新**: 更新間隔 (0.5 / 1 / 2 / 5 秒)、アニメーション補間、
     スプライン補間
   - **動作**: 常に手前に表示、起動時のタブ、終了確認ダイアログの表示
-  - **システム統合**: Ctrl+Shift+Esc で MiniTask を開く、
+  - **システム統合**: タスクマネージャーの代わりにMiniTaskを起動、
     タスクトレイアイコン常駐、閉じるボタンでトレイに格納
-- **Ctrl+Shift+Esc 置換** — 有効時、右上に純正タスクマネージャーアイコンの
+- **タスクマネージャーの置換** — 有効時、右上に純正タスクマネージャーアイコンの
   「タスクマネージャーを開く」ボタンを表示 (ホバーでツールチップ)。
   IFEO (`Image File Execution Options\taskmgr.exe`) で実現。
   未起動時は UAC 承認後に起動し、既存インスタンスがある場合は UAC なしで
@@ -117,6 +117,22 @@ cargo build --release
 - アイコンは `assets/make_icon.ps1` で再生成できます（`#2F9A9A` をアクセントにした
   タスクマネージャー風デザイン）
 
+## インストーラ
+
+Inno Setup 6 でインストーラを生成します。管理者権限で動作するアプリのため、
+インストール先は `C:\Program Files\MiniTask` です。
+
+```powershell
+winget install --id JRSoftware.InnoSetup
+powershell -ExecutionPolicy Bypass -File installer\build.ps1
+```
+
+`dist\MiniTask-<バージョン>-setup.exe` が生成されます。
+セットアップ中に「タスクマネージャーの代わりにMiniTaskを起動」を選ぶと
+IFEO (`HKLM\...\taskmgr.exe`) を登録します（初期状態はオフ）。
+アンインストール時は、自分が登録した IFEO / シェルメニューのみ削除し、
+設定 (`HKCU\Software\MiniTask`) は残します。
+
 ## 使い方
 
 1. `minitask.exe` を実行（UAC を承認）
@@ -139,7 +155,7 @@ cargo build --release
 
 すべての設定 (更新の速度 / グラフ補間 / 列表示 / ソート / 最後に開いたタブ /
 パフォーマンスの選択項目 / CPUグラフモード / テーマと各配色 / 常に手前 /
-起動時タブ / 終了確認 / Ctrl+Shift+Esc 置換 / トレイアイコン / トレイ格納 /
+起動時タブ / 終了確認 / タスクマネージャー置換 / トレイアイコン / トレイ格納 /
 最小化時トレイ格納 / トレイのツールチップ使用率表示) は
 `HKCU\Software\MiniTask` に保存され、再起動後に自動で復元されます
 (一時停止は保存対象外)。上記の `MINITASK_*` 環境変数は保存済み設定より
@@ -147,7 +163,7 @@ cargo build --release
 
 ### システム統合の注意
 
-- Ctrl+Shift+Esc 置換は `HKLM\...\Image File Execution Options\taskmgr.exe` の
+- タスクマネージャー置換は `HKLM\...\Image File Execution Options\taskmgr.exe` の
   `Debugger` 値を変更します (**書き込みには管理者権限が必要**)。
   設定をオフにすると値が削除されます。アンインストール前に必ずオフにしてください。
 - タスクトレイアイコンは既定で有効です。右クリックメニューの「終了」から
