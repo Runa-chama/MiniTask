@@ -110,8 +110,6 @@ cargo build --release
 `target/release/minitask.exe` ができます（約 6MB）。
 
 - 日本語表示には Windows 同梱の Meiryo / Yu Gothic / MS Gothic を実行時に読み込みます
-- アイコンは `assets/make_icon.ps1` で再生成できます（`#2F9A9A` をアクセントにした
-  タスクマネージャー風デザイン）
 
 ## インストーラ
 
