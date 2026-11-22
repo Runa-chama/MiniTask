@@ -19,11 +19,19 @@ mod selftest;
 mod settings;
 mod smart;
 mod startup;
+mod tray;
 mod util;
 
 fn main() -> eframe::Result {
     if std::env::var("MINITASK_SELFTEST").is_ok() {
         std::process::exit(selftest::run());
+    }
+
+    // 多重起動防止: 既存インスタンスがあれば前面化して終了
+    if std::env::var("MINITASK_ALLOW_MULTI").is_err() {
+        if integration::focus_existing_instance() {
+            return Ok(());
+        }
     }
 
     // 他ユーザープロセス等の照会・終了のため SeDebugPrivilege を有効化

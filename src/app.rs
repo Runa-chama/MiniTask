@@ -8,7 +8,7 @@ use egui::{Color32, RichText, Vec2};
 use egui_extras::{Column, TableBuilder};
 
 use crate::icon::{self, IconCache};
-use crate::integration::{self, TrayClick};
+use crate::integration;
 use crate::net::NetSession;
 use crate::process::{self, FastMetrics, ProcCollector, ProcRow, SysLoad};
 use crate::settings::AppSettings;
@@ -285,11 +285,10 @@ pub struct MiniTaskApp {
 
     // --- システム統合 ---
     replace_taskmgr: bool,
-    taskbar_menu: bool,
-    tray_rx: Option<Receiver<TrayClick>>,
-    tray_hook: Option<*mut std::ffi::c_void>,
-    tray_popup: Option<TrayClick>,
-    tray_popup_at: Option<Instant>,
+    tray_icon: bool,
+    close_to_tray: bool,
+    tray_handle: Option<crate::tray::TrayHandle>,
+    tray_rx: Option<Receiver<crate::tray::TrayMsg>>,
     ifeo_restore: Option<(String, Instant)>,
     taskmgr_icon: Option<egui::TextureHandle>,
 
@@ -384,15 +383,13 @@ impl MiniTaskApp {
             if settings.replace_taskmgr {
                 let _ = integration::set_replace_taskmgr(true, &exe);
             }
-            if settings.taskbar_menu {
+            if settings.tray_icon {
                 let _ = integration::set_shell_menu(true, &exe);
-                let _ = integration::inject_hook();
             }
         }
-        let (tray_rx, tray_hook): (Option<Receiver<TrayClick>>, Option<*mut std::ffi::c_void>) =
-            if settings.taskbar_menu {
-            let (rx, hook) = integration::start_tray_monitor();
-            (Some(rx), hook)
+        let (tray_handle, tray_rx) = if settings.tray_icon {
+            let (h, rx) = crate::tray::start();
+            (Some(h), Some(rx))
         } else {
             (None, None)
         };
@@ -521,11 +518,10 @@ impl MiniTaskApp {
             settings_open: false,
             settings_page: 0,
             replace_taskmgr: settings.replace_taskmgr,
-            taskbar_menu: settings.taskbar_menu,
+            tray_icon: settings.tray_icon,
+            close_to_tray: settings.close_to_tray,
+            tray_handle,
             tray_rx,
-            tray_hook,
-            tray_popup: None,
-            tray_popup_at: None,
             ifeo_restore: None,
             taskmgr_icon,
             icon_cache: IconCache::default(),
@@ -847,15 +843,28 @@ impl eframe::App for MiniTaskApp {
             ));
             self.theme_dirty = false;
         }
-        // タスクバー右クリックの通知を受け取る
+        // トレイアイコンからのメッセージ
         if let Some(rx) = &self.tray_rx {
-            while let Ok(click) = rx.try_recv() {
-                let (_, fired) = integration::hook_status();
-                if !fired {
-                    self.tray_popup = Some(click);
-                    self.tray_popup_at = Some(Instant::now());
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    crate::tray::TrayMsg::Open => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        integration::focus_window();
+                    }
+                    crate::tray::TrayMsg::Exit => {
+                        // トレイ格納中でも確実に終了させる
+                        self.close_to_tray = false;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
                 }
             }
+        }
+        // 閉じるボタンでトレイに格納
+        if self.tray_icon && self.close_to_tray && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
         // 純正タスクマネージャー起動後の IFEO 復元
         if let Some((_, at)) = &self.ifeo_restore {
@@ -918,11 +927,9 @@ impl eframe::App for MiniTaskApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.current_settings().save();
-        if self.taskbar_menu {
-            let _ = integration::uninject_hook();
-            let _ = integration::set_shell_menu(false, "");
+        if let Some(mut tray) = self.tray_handle.take() {
+            tray.stop();
         }
-        integration::stop_tray_monitor(self.tray_hook.take());
         if let Some((old, _)) = self.ifeo_restore.take() {
             integration::restore_ifeo(Some(old));
         }
@@ -983,7 +990,8 @@ impl MiniTaskApp {
             startup_tab_mode: self.startup_tab_mode,
             confirm_kill: self.confirm_kill_setting,
             replace_taskmgr: self.replace_taskmgr,
-            taskbar_menu: self.taskbar_menu,
+            tray_icon: self.tray_icon,
+            close_to_tray: self.close_to_tray,
         }
     }
 
@@ -2587,14 +2595,14 @@ impl MiniTaskApp {
             let mut tab_mode = self.startup_tab_mode;
             let mut confirm = self.confirm_kill_setting;
             let mut replace = self.replace_taskmgr;
-            let mut taskbar = self.taskbar_menu;
+            let mut tray_icon = self.tray_icon;
+            let mut close_to_tray = self.close_to_tray;
             let mut interval = self.interval;
             let mut anim = self.graph_animation;
             let mut spline = self.graph_spline;
             let mut page = self.settings_page;
             let mut dark_colors = self.saved_settings.dark_colors;
             let mut light_colors = self.saved_settings.light_colors;
-            let (hook_installed, hook_fired) = integration::hook_status();
             let ifeo_active = integration::is_replace_active();
 
             egui::Window::new("設定")
@@ -2693,17 +2701,14 @@ impl MiniTaskApp {
                                 .small()
                                 .color(ui.visuals().weak_text_color()),
                             );
-                            ui.add_space(6.0);
-                            ui.checkbox(&mut taskbar, "タスクバーの右クリックに MiniTask を追加");
+                            ui.add_space(8.0);
+                            ui.checkbox(&mut tray_icon, "タスクトレイにアイコンを常駐する");
+                            ui.checkbox(&mut close_to_tray, "閉じるボタンでトレイに格納する")
+                                .on_hover_text("有効時、×ボタンは終了せずトレイへ格納します。完全終了はトレイアイコンの右クリックメニューから行います。");
                             ui.label(
                                 RichText::new(format!(
-                                    "注入: {} / メニュー拡張: {}",
-                                    if hook_installed { "有効" } else { "無効" },
-                                    if hook_fired {
-                                        "有効"
-                                    } else {
-                                        "このOSでは非対応 (ポップアップを使用)"
-                                    }
+                                    "トレイアイコン: {}",
+                                    if self.tray_handle.is_some() { "有効" } else { "無効" }
                                 ))
                                 .small()
                                 .color(ui.visuals().weak_text_color()),
@@ -2766,28 +2771,26 @@ impl MiniTaskApp {
                     Err(e) => self.notify(e.to_string()),
                 }
             }
-            if taskbar != self.taskbar_menu {
+            self.close_to_tray = close_to_tray;
+            if tray_icon != self.tray_icon {
                 let exe = std::env::current_exe()
                     .map(|e| e.to_string_lossy().to_string())
                     .unwrap_or_default();
-                if taskbar {
+                if tray_icon {
                     let _ = integration::set_shell_menu(true, &exe);
-                    match integration::inject_hook() {
-                        Ok(()) => self.notify("タスクバーメニューを有効にしました"),
-                        Err(e) => self.notify(format!("注入に失敗 (ポップアップで動作します): {e}")),
-                    }
-                    let (rx, hook) = integration::start_tray_monitor();
+                    let (h, rx) = crate::tray::start();
+                    self.tray_handle = Some(h);
                     self.tray_rx = Some(rx);
-                    self.tray_hook = hook;
+                    self.notify("タスクトレイアイコンを有効にしました");
                 } else {
-                    let _ = integration::uninject_hook();
-                    let _ = integration::set_shell_menu(false, &exe);
-                    integration::stop_tray_monitor(self.tray_hook.take());
+                    if let Some(mut h) = self.tray_handle.take() {
+                        h.stop();
+                    }
                     self.tray_rx = None;
-                    self.tray_popup = None;
-                    self.notify("タスクバーメニューを無効にしました");
+                    let _ = integration::set_shell_menu(false, &exe);
+                    self.notify("タスクトレイアイコンを無効にしました");
                 }
-                self.taskbar_menu = taskbar;
+                self.tray_icon = tray_icon;
             }
         }
 
@@ -2926,47 +2929,6 @@ impl MiniTaskApp {
             }
         }
 
-        // ==================== タスクバー右クリックのポップアップ ====================
-        if let Some(click) = self.tray_popup {
-            let expired = self
-                .tray_popup_at
-                .map(|t| t.elapsed() > Duration::from_secs(4))
-                .unwrap_or(true);
-            if expired {
-                self.tray_popup = None;
-                self.tray_popup_at = None;
-            } else {
-                let id = egui::ViewportId::from_hash_of("minitask_tray_popup");
-                let mut close = false;
-                ctx.show_viewport_immediate(
-                    id,
-                    egui::ViewportBuilder::default()
-                        .with_inner_size([160.0, 42.0])
-                        .with_position(egui::pos2(click.x as f32, click.y as f32))
-                        .with_decorations(false)
-                        .with_resizable(false)
-                        .with_always_on_top(),
-                    |ui, class| {
-                        if class == egui::ViewportClass::Immediate {
-                            let resp = ui.add(
-                                egui::Button::new("MiniTask").min_size(Vec2::new(156.0, 38.0)),
-                            );
-                            if resp.clicked() {
-                                integration::focus_window();
-                                close = true;
-                            }
-                            if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
-                                close = true;
-                            }
-                        }
-                    },
-                );
-                if close {
-                    self.tray_popup = None;
-                    self.tray_popup_at = None;
-                }
-            }
-        }
     }
 }
 

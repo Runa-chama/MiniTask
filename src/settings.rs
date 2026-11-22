@@ -41,8 +41,10 @@ pub struct AppSettings {
     // --- システム統合 ---
     /// Ctrl+Shift+Esc でタスクマネージャーの代わりに MiniTask を起動
     pub replace_taskmgr: bool,
-    /// タスクバー右クリックに MiniTask を追加
-    pub taskbar_menu: bool,
+    /// タスクトレイにアイコンを常駐させる
+    pub tray_icon: bool,
+    /// 閉じるボタンで終了せずトレイに格納する
+    pub close_to_tray: bool,
 }
 
 impl Default for AppSettings {
@@ -76,7 +78,8 @@ impl Default for AppSettings {
             startup_tab_mode: 0,
             confirm_kill: true,
             replace_taskmgr: false,
-            taskbar_menu: false,
+            tray_icon: true,
+            close_to_tray: true,
         }
     }
 }
@@ -161,7 +164,8 @@ impl AppSettings {
         }
         s.confirm_kill = read_bool(&key, "ConfirmKill", true);
         s.replace_taskmgr = read_bool(&key, "ReplaceTaskmgr", false);
-        s.taskbar_menu = read_bool(&key, "TaskbarMenu", false);
+        s.tray_icon = read_bool(&key, "TrayIcon", true);
+        s.close_to_tray = read_bool(&key, "CloseToTray", true);
         s
     }
 
@@ -189,8 +193,13 @@ impl AppSettings {
         let _ = key.set_value("StartupTabMode", &(self.startup_tab_mode as u32));
         let _ = key.set_value("ConfirmKill", &(self.confirm_kill as u32));
         let _ = key.set_value("ReplaceTaskmgr", &(self.replace_taskmgr as u32));
-        let _ = key.set_value("TaskbarMenu", &(self.taskbar_menu as u32));
-        // 統合用: 自分のexeパスを書いておき、hook DLL が参照する
+        let _ = key.set_value("TrayIcon", &(self.tray_icon as u32));
+        let _ = key.set_value("CloseToTray", &(self.close_to_tray as u32));
+        // 旧設定・旧注入フックの残骸を掃除
+        let _ = key.delete_value("TaskbarMenu");
+        let _ = key.delete_value("HookInstalled");
+        let _ = key.delete_value("HookFired");
+        // 統合用: 自分のexeパスを書いておく
         if let Ok(exe) = std::env::current_exe() {
             let _ = key.set_value("ExePath", &exe.to_string_lossy().to_string());
         }
@@ -218,7 +227,8 @@ impl AppSettings {
             && self.startup_tab_mode == other.startup_tab_mode
             && self.confirm_kill == other.confirm_kill
             && self.replace_taskmgr == other.replace_taskmgr
-            && self.taskbar_menu == other.taskbar_menu
+            && self.tray_icon == other.tray_icon
+            && self.close_to_tray == other.close_to_tray
     }
 
     /// 現在のモードに対応するパレット。
