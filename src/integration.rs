@@ -11,9 +11,10 @@ use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ASFW_ANY, AllowSetForegroundWindow, EnumWindows, FLASHW_ALL, FLASHW_TIMERNOFG, FLASHWINFO,
     FindWindowW, FlashWindowEx, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IsIconic, IsWindowVisible,
-    PostMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_SHOWWINDOW,
+    GetWindowLongPtrW, GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IsIconic,
+    IsWindowVisible, LWA_ALPHA, PostMessageW, SetLayeredWindowAttributes, SetWindowLongPtrW,
+    SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+    GWL_EXSTYLE, WS_EX_LAYERED,
     SetForegroundWindow, SetWindowPos, ShowWindow, SwitchToThisWindow,
 };
 use winreg::RegKey;
@@ -354,6 +355,43 @@ pub fn focus_existing_instance() -> bool {
         notify_tray_show();
     }
     found
+}
+
+/// ウィンドウ全体の不透明度を維持する。スタイルが上書きされた場合は再適用する。
+/// 毎フレーム呼び出しても、WS_EX_LAYERED が付いていれば何もしない。
+pub fn ensure_window_opacity(percent: u8) {
+    if percent >= 100 {
+        return;
+    }
+    struct OpacityCtx {
+        alpha: u8,
+    }
+    unsafe extern "system" fn proc(hwnd: Handle, lparam: isize) -> i32 {
+        unsafe {
+            let alpha = (*(lparam as *const OpacityCtx)).alpha;
+            let len = GetWindowTextLengthW(hwnd);
+            if len > 0 {
+                let mut title = vec![0u16; (len + 1) as usize];
+                GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+                let text = String::from_utf16_lossy(&title);
+                if text.contains("MiniTask") && text.contains("軽量タスクマネージャー") {
+                    let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                    if ex & WS_EX_LAYERED as isize == 0 {
+                        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED as isize);
+                    }
+                    SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+                    return 0;
+                }
+            }
+            1
+        }
+    }
+    let ctx = OpacityCtx {
+        alpha: (percent as f32 * 2.55).round().min(255.0) as u8,
+    };
+    unsafe {
+        EnumWindows(Some(proc), &ctx as *const OpacityCtx as isize);
+    }
 }
 
 /// メインウィンドウが最小化されていたらトレイへ格納する。

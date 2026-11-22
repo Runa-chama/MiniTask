@@ -51,6 +51,16 @@ pub struct AppSettings {
     pub tray_usage_tip: bool,
     /// 温度の単位 (0=摂氏, 1=華氏)
     pub temp_unit: u8,
+    /// 使用するフォント (空=自動)
+    pub font_family: String,
+    /// フォントサイズ倍率 (%), 80〜140
+    pub font_scale: u16,
+    /// 背景画像のファイルパス (空=無効)
+    pub bg_image_path: String,
+    /// 背景画像の上に乗せる背景色の不透明度 (0〜100)
+    pub bg_overlay_alpha: u8,
+    /// ウィンドウ全体の不透明度 (0〜100)
+    pub window_opacity: u8,
     /// 最後に GitHub Releases をチェックした時刻 (Unix 秒)
     pub last_update_check: u64,
 }
@@ -91,6 +101,11 @@ impl Default for AppSettings {
             minimize_to_tray: false,
             tray_usage_tip: true,
             temp_unit: 0,
+            font_family: "Meiryo".to_owned(),
+            font_scale: 100,
+            bg_image_path: String::new(),
+            bg_overlay_alpha: 60,
+            window_opacity: 100,
             last_update_check: 0,
         }
     }
@@ -185,6 +200,21 @@ impl AppSettings {
                 s.temp_unit = v as u8;
             }
         }
+        s.font_family = key
+            .get_value::<String, _>("FontFamily")
+            .unwrap_or_else(|_| s.font_family);
+        if let Ok(v) = key.get_value::<u32, _>("FontScale") {
+            s.font_scale = v.clamp(80, 140) as u16;
+        }
+        s.bg_image_path = key
+            .get_value::<String, _>("BgImagePath")
+            .unwrap_or_else(|_| s.bg_image_path);
+        if let Ok(v) = key.get_value::<u32, _>("BgOverlayAlpha") {
+            s.bg_overlay_alpha = (v.min(100)) as u8;
+        }
+        if let Ok(v) = key.get_value::<u32, _>("WindowOpacity") {
+            s.window_opacity = (v.min(100)) as u8;
+        }
         if let Ok(v) = key.get_value::<u64, _>("LastUpdateCheck") {
             s.last_update_check = v;
         }
@@ -220,6 +250,11 @@ impl AppSettings {
         let _ = key.set_value("MinimizeToTray", &(self.minimize_to_tray as u32));
         let _ = key.set_value("TrayUsageTip", &(self.tray_usage_tip as u32));
         let _ = key.set_value("TempUnit", &(self.temp_unit as u32));
+        let _ = key.set_value("FontFamily", &self.font_family);
+        let _ = key.set_value("FontScale", &(self.font_scale as u32));
+        let _ = key.set_value("BgImagePath", &self.bg_image_path);
+        let _ = key.set_value("BgOverlayAlpha", &(self.bg_overlay_alpha as u32));
+        let _ = key.set_value("WindowOpacity", &(self.window_opacity as u32));
         let _ = key.set_value("LastUpdateCheck", &self.last_update_check);
         // 旧設定・旧注入フックの残骸を掃除
         let _ = key.delete_value("TaskbarMenu");
@@ -258,6 +293,11 @@ impl AppSettings {
             && self.minimize_to_tray == other.minimize_to_tray
             && self.tray_usage_tip == other.tray_usage_tip
             && self.temp_unit == other.temp_unit
+            && self.font_family == other.font_family
+            && self.font_scale == other.font_scale
+            && self.bg_image_path == other.bg_image_path
+            && self.bg_overlay_alpha == other.bg_overlay_alpha
+            && self.window_opacity == other.window_opacity
             && self.last_update_check == other.last_update_check
     }
 

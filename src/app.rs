@@ -321,6 +321,12 @@ pub struct MiniTaskApp {
 
     // --- 表示設定 / モード ---
     temp_unit: u8,
+    font_family: String,
+    font_scale: u16,
+    bg_image_path: String,
+    bg_overlay_alpha: u8,
+    bg_texture: Option<egui::TextureHandle>,
+    window_opacity: u8,
     graph_solo: bool,
     fullscreen: bool,
 
@@ -594,6 +600,16 @@ impl MiniTaskApp {
             update_msg: None,
             last_update_check: settings.last_update_check,
             temp_unit: settings.temp_unit,
+            font_family: settings.font_family.clone(),
+            font_scale: settings.font_scale,
+            bg_texture: if settings.bg_image_path.is_empty() {
+                None
+            } else {
+                util::load_background(ctx, &settings.bg_image_path)
+            },
+            bg_image_path: settings.bg_image_path,
+            bg_overlay_alpha: settings.bg_overlay_alpha,
+            window_opacity: settings.window_opacity,
             graph_solo: false,
             fullscreen: false,
             icon_cache: IconCache::default(),
@@ -926,7 +942,10 @@ impl MiniTaskApp {
 
 impl eframe::App for MiniTaskApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ウィンドウ透明度は winit がスタイルを初期化し直すことがあるため毎フレーム維持する
+        integration::ensure_window_opacity(self.window_opacity);
         if self.theme_dirty {
+            util::setup_fonts(ctx, &self.font_family, self.font_scale);
             util::setup_theme(ctx, self.dark_mode, &self.palette);
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
                 if self.always_on_top {
@@ -1064,6 +1083,28 @@ impl eframe::App for MiniTaskApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 背景画像を最背面に描画し、その上に半透明の背景色を重ねる
+        if let Some(tex) = &self.bg_texture {
+            let screen = ui.ctx().content_rect();
+            let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                egui::Order::Background,
+                egui::Id::unique("minitask_bg_image"),
+            ));
+            painter.image(
+                tex.id(),
+                screen,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            let fill = ui.visuals().panel_fill;
+            let alpha = (self.bg_overlay_alpha as f32 * 2.55).round().min(255.0) as u8;
+            painter.rect_filled(
+                screen,
+                egui::CornerRadius::ZERO,
+                egui::Color32::from_rgba_premultiplied(fill.r(), fill.g(), fill.b(), alpha),
+            );
+            ui.visuals_mut().panel_fill = egui::Color32::TRANSPARENT;
+        }
         // モーダル表示中は背面をグレー化して操作できないようにする
         let modal = self.any_modal();
         ui.scope(|ui| {
@@ -1167,6 +1208,11 @@ impl MiniTaskApp {
             minimize_to_tray: self.minimize_to_tray,
             tray_usage_tip: self.tray_usage_tip,
             temp_unit: self.temp_unit,
+            font_family: self.font_family.clone(),
+            font_scale: self.font_scale,
+            bg_image_path: self.bg_image_path.clone(),
+            bg_overlay_alpha: self.bg_overlay_alpha,
+            window_opacity: self.window_opacity,
             last_update_check: self.last_update_check,
         }
     }
@@ -2374,16 +2420,6 @@ impl MiniTaskApp {
                         Self::detail_row(ui, "コア数", cores.to_string());
                     }
                     Self::detail_row(ui, "論理プロセッサ数", d.logical_cores.to_string());
-                    if let Some(v) = d.cpu_virtualization {
-                        Self::detail_row(
-                            ui,
-                            "仮想化",
-                            if v { "有効" } else { "無効" }.to_owned(),
-                        );
-                    }
-                    for (label, bytes) in &d.cpu_caches {
-                        Self::detail_row(ui, label, util::fmt_bytes(*bytes));
-                    }
                 }
                 PerfSel::Ram => {
                     Self::detail_row(ui, "使用中", gb(d.mem_used));
@@ -2550,7 +2586,18 @@ impl MiniTaskApp {
                 }
             });
             r.vertical(|ui| match &self.perf_sel {
-                PerfSel::Cpu => {}
+                PerfSel::Cpu => {
+                    if let Some(v) = d.cpu_virtualization {
+                        Self::detail_row(
+                            ui,
+                            "仮想化",
+                            if v { "有効" } else { "無効" }.to_owned(),
+                        );
+                    }
+                    for (label, bytes) in &d.cpu_caches {
+                        Self::detail_row(ui, label, util::fmt_bytes(*bytes));
+                    }
+                }
                 PerfSel::Ram => {
                     Self::detail_row(ui, "合計 (物理)", gb(d.mem_total));
                     Self::detail_row(ui, "プロセス数", d.processes.to_string());
@@ -2972,6 +3019,11 @@ impl MiniTaskApp {
             let mut minimize_to_tray = self.minimize_to_tray;
             let mut tray_usage_tip = self.tray_usage_tip;
             let mut temp_unit = self.temp_unit;
+            let mut font_family = self.font_family.clone();
+            let mut font_scale = self.font_scale;
+            let mut bg_image_path = self.bg_image_path.clone();
+            let mut bg_overlay_alpha = self.bg_overlay_alpha;
+            let mut window_opacity = self.window_opacity;
             let mut interval = self.interval;
             let mut anim = self.graph_animation;
             let mut spline = self.graph_spline;
@@ -3038,6 +3090,55 @@ impl MiniTaskApp {
                                 dark_colors = Palette::dark_default();
                                 light_colors = Palette::light_default();
                             }
+                            ui.separator();
+                            ui.label(RichText::new("フォント").strong());
+                            egui::ComboBox::from_id_salt("settings_font")
+                                .selected_text(font_family.clone())
+                                .show_ui(ui, |ui| {
+                                    for name in [
+                                        "Meiryo",
+                                        "Yu Gothic",
+                                        "MS Gothic",
+                                        "BIZ UDGothic",
+                                        "Segoe UI",
+                                    ] {
+                                        ui.selectable_value(&mut font_family, name.to_owned(), name);
+                                    }
+                                });
+                            ui.add(
+                                egui::Slider::new(&mut font_scale, 80..=140).text("サイズ (%)"),
+                            );
+                            ui.separator();
+                            ui.label(RichText::new("背景画像").strong());
+                            ui.horizontal(|ui| {
+                                if ui.button("参照...").clicked() {
+                                    if let Some(path) = util::pick_image() {
+                                        bg_image_path = path;
+                                    }
+                                }
+                                if ui.button("解除").clicked() {
+                                    bg_image_path.clear();
+                                }
+                                ui.label(
+                                    if bg_image_path.is_empty() {
+                                        "未設定".to_owned()
+                                    } else {
+                                        std::path::Path::new(&bg_image_path)
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().to_string())
+                                            .unwrap_or_else(|| bg_image_path.clone())
+                                    },
+                                );
+                            });
+                            ui.add(
+                                egui::Slider::new(&mut bg_overlay_alpha, 0..=100)
+                                    .text("背景色の不透明度 (%)"),
+                            );
+                            ui.label(RichText::new("ウィンドウ").strong());
+                            ui.add(
+                                egui::Slider::new(&mut window_opacity, 10..=100)
+                                    .text("全体の不透明度 (%)"),
+                            );
                         }
                         1 => {
                             ui.label(RichText::new("更新の速度").strong());
@@ -3206,6 +3307,21 @@ impl MiniTaskApp {
             }
             self.tray_usage_tip = tray_usage_tip;
             self.temp_unit = temp_unit;
+            if font_family != self.font_family || font_scale != self.font_scale {
+                self.theme_dirty = true;
+            }
+            self.font_family = font_family;
+            self.font_scale = font_scale;
+            if bg_image_path != self.bg_image_path {
+                self.bg_image_path = bg_image_path.clone();
+                self.bg_texture = if bg_image_path.is_empty() {
+                    None
+                } else {
+                    util::load_background(ctx, &bg_image_path)
+                };
+            }
+            self.bg_overlay_alpha = bg_overlay_alpha;
+            self.window_opacity = window_opacity;
             if tray_icon != self.tray_icon {
                 let exe = std::env::current_exe()
                     .map(|e| e.to_string_lossy().to_string())

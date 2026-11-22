@@ -150,27 +150,119 @@ impl Palette {
 }
 
 
-/// 日本語フォントをシステムフォントから読み込む。
+/// ネイティブのファイル選択ダイアログで画像パスを取得する。
+pub fn pick_image() -> Option<String> {
+    use windows_sys::Win32::UI::Controls::Dialogs::{GetOpenFileNameW, OPENFILENAMEW};
+    unsafe {
+        let filter: Vec<u16> = "画像ファイル\0*.png;*.jpg;*.jpeg;*.bmp;*.webp\0すべてのファイル\0*.*\0\0"
+            .encode_utf16()
+            .collect();
+        let title: Vec<u16> = "背景画像を選択\0".encode_utf16().collect();
+        let mut file = vec![0u16; 2048];
+        let mut ofn: OPENFILENAMEW = std::mem::zeroed();
+        ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+        ofn.lpstrFilter = filter.as_ptr();
+        ofn.lpstrFile = file.as_mut_ptr();
+        ofn.nMaxFile = file.len() as u32;
+        ofn.lpstrTitle = title.as_ptr();
+        if GetOpenFileNameW(&mut ofn) == 0 {
+            return None;
+        }
+        let len = file.iter().position(|&c| c == 0).unwrap_or(file.len());
+        let path = String::from_utf16_lossy(&file[..len]);
+        if path.is_empty() {
+            None
+        } else {
+            Some(path)
+        }
+    }
+}
+
+/// 背景画像をテクスチャとして読み込む。
+pub fn load_background(ctx: &egui::Context, path: &str) -> Option<egui::TextureHandle> {
+    let bytes = std::fs::read(path).ok()?;
+    let decoded = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let (width, height) = decoded.dimensions();
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(ctx.load_texture(
+        "minitask_background",
+        egui::ColorImage::from_rgba_unmultiplied(
+            [width as usize, height as usize],
+            decoded.as_raw(),
+        ),
+        egui::TextureOptions::LINEAR,
+    ))
+}
+
+/// 指定フォントをシステムフォントから読み込む。
 /// egui 同梱フォントには日本語グリフが無いため必須。
-pub fn setup_fonts(ctx: &egui::Context) {
+pub fn setup_fonts(ctx: &egui::Context, family: &str, scale: u16) {
     let mut fonts = egui::FontDefinitions::default();
-    // TTC の index 0 を使用 (Meiryo Regular / Yu Gothic Regular / MS Gothic)
-    for file in ["meiryo.ttc", "YuGothR.ttc", "msgothic.ttc"] {
-        let path = format!("{}\\{}", std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into()), format!("Fonts\\{file}"));
-        if let Ok(bytes) = std::fs::read(&path) {
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_owned());
+    let mut candidates = vec![
+        family.to_owned(),
+        format!("{family} (TrueType)"),
+        format!("{family} Regular (TrueType)"),
+    ];
+    if family != "Meiryo" {
+        candidates.push("Meiryo (TrueType)".to_owned());
+    }
+    candidates.push("Yu Gothic Regular (TrueType)".to_owned());
+    candidates.push("MS Gothic (TrueType)".to_owned());
+
+    let mut loaded = false;
+    if let Ok(key) = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
+        .open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts")
+    {
+        for name in &candidates {
+            let Ok(file) = key.get_value::<String, _>(name) else {
+                continue;
+            };
+            let path = std::path::Path::new(&windir).join("Fonts").join(file);
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
             fonts
                 .font_data
-                .insert("jp".to_owned(), egui::FontData::from_owned(bytes).into());
-            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-                family.insert(0, "jp".to_owned());
+                .insert("user".to_owned(), egui::FontData::from_owned(bytes).into());
+            if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                f.insert(0, "user".to_owned());
             }
-            if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-                family.push("jp".to_owned());
+            if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                f.insert(0, "user".to_owned());
             }
+            loaded = true;
             break;
         }
     }
+    if !loaded {
+        for file in ["meiryo.ttc", "YuGothR.ttc", "msgothic.ttc"] {
+            let path = std::path::Path::new(&windir).join("Fonts").join(file);
+            if let Ok(bytes) = std::fs::read(&path) {
+                fonts
+                    .font_data
+                    .insert("user".to_owned(), egui::FontData::from_owned(bytes).into());
+                if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                    f.insert(0, "user".to_owned());
+                }
+                if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                    f.insert(0, "user".to_owned());
+                }
+                break;
+            }
+        }
+    }
     ctx.set_fonts(fonts);
+
+    // サイズ倍率を全テキストスタイルへ適用 (theme は visuals のみを上書きするため維持される)
+    let factor = (scale as f32 / 100.0).clamp(0.8, 1.4);
+    ctx.global_style_mut(|style| {
+        for font in style.text_styles.values_mut() {
+            font.size *= factor;
+        }
+    });
 }
 
 /// 摂氏の温度を設定された単位の表示文字列に変換する (0=°C, 1=°F)。
