@@ -899,27 +899,34 @@ impl eframe::App for MiniTaskApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::Panel::bottom("status_bar")
-            .exact_size(30.0)
-            .show(ui, |ui| {
-                ui.add_space(2.0);
-                self.status_bar(ui);
-            });
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.header(ui);
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Processes, "  プロセス  ");
-                ui.selectable_value(&mut self.tab, Tab::Performance, "  パフォーマンス  ");
-                ui.selectable_value(&mut self.tab, Tab::Startup, "  スタートアップ  ");
-            });
-            ui.separator();
-            match self.tab {
-                Tab::Processes => self.processes_tab(ui),
-                Tab::Performance => self.performance_tab(ui),
-                Tab::Startup => self.startup_tab(ui),
+        // モーダル表示中は背面をグレー化して操作できないようにする
+        let modal = self.settings_open || self.smart_dialog_disk.is_some();
+        ui.scope(|ui| {
+            if modal {
+                ui.disable();
             }
+            egui::Panel::bottom("status_bar")
+                .exact_size(30.0)
+                .show(ui, |ui| {
+                    ui.add_space(2.0);
+                    self.status_bar(ui);
+                });
+
+            egui::CentralPanel::default().show(ui, |ui| {
+                self.header(ui);
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.tab, Tab::Processes, "  プロセス  ");
+                    ui.selectable_value(&mut self.tab, Tab::Performance, "  パフォーマンス  ");
+                    ui.selectable_value(&mut self.tab, Tab::Startup, "  スタートアップ  ");
+                });
+                ui.separator();
+                match self.tab {
+                    Tab::Processes => self.processes_tab(ui),
+                    Tab::Performance => self.performance_tab(ui),
+                    Tab::Startup => self.startup_tab(ui),
+                }
+            });
         });
 
         self.dialogs(ui.ctx());
@@ -1326,6 +1333,23 @@ impl MiniTaskApp {
             ui.add_space((170.0 - resp.rect.width()).max(10.0));
             ui.label(RichText::new(value).size(13.0).monospace());
         });
+    }
+
+    /// モーダルダイアログ表示中用の背景オーバーレイ。
+    /// 画面全体をグレーに塗り、背面のウィジェットへのクリックを遮断する。
+    fn modal_backdrop(ctx: &egui::Context) {
+        let screen = ctx.content_rect();
+        egui::Area::new(egui::Id::unique("minitask_modal_backdrop"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let _ = ui.allocate_rect(screen, egui::Sense::click());
+                ui.painter().rect_filled(
+                    screen,
+                    egui::CornerRadius::ZERO,
+                    egui::Color32::from_black_alpha(100),
+                );
+            });
     }
 
     /// 色付きの値を持つ詳細行 (SMART の健康状態・温度など)。
@@ -2489,6 +2513,14 @@ impl MiniTaskApp {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        // 設定 / SMART 詳細はモーダル: 背景をグレーアウトし、Esc で閉じる
+        if self.settings_open || self.smart_dialog_disk.is_some() {
+            Self::modal_backdrop(ctx);
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.settings_open = false;
+                self.smart_dialog_disk = None;
+            }
+        }
         if let Some((pid, name)) = self.confirm_kill.clone() {
             egui::Window::new("タスクの終了")
                 .collapsible(false)
@@ -2615,6 +2647,7 @@ impl MiniTaskApp {
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(true)
+                .order(egui::Order::Foreground)
                 .default_width(620.0)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
@@ -2802,34 +2835,79 @@ impl MiniTaskApp {
 
         // ==================== SMART 詳細ダイアログ ====================
         if let Some(id) = self.smart_dialog_disk.clone() {
-            let smart = self
-                .load
-                .disks
+            let disks = self.load.disks.clone();
+            let smart = disks
                 .iter()
                 .find(|d| d.id == id)
                 .and_then(|d| d.smart.clone());
             let mut open = true;
-            let title = format!("SMART 詳細 — {}", self.load.disks.iter().find(|d| d.id == id).map(|d| d.label.as_str()).unwrap_or("ディスク"));
+            let mut selected = Some(id.clone());
+            let title = format!(
+                "SMART 詳細 — {}",
+                disks
+                    .iter()
+                    .find(|d| d.id == id)
+                    .map(|d| d.label.as_str())
+                    .unwrap_or("ディスク")
+            );
             egui::Window::new(title)
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(true)
+                .order(egui::Order::Foreground)
                 .default_size([640.0, 520.0])
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     // 項目が多い場合もはみ出さないようスクロール可能にする
                     egui::ScrollArea::vertical().show(ui, |ui| {
+                        // ダイアログ内で別ディスクへ切り替え
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("ディスク").strong());
+                            let current = selected
+                                .as_ref()
+                                .and_then(|id| disks.iter().find(|d| &d.id == id))
+                                .map(|d| d.label.clone())
+                                .unwrap_or_else(|| "—".to_owned());
+                            egui::ComboBox::from_id_salt("smart_disk_select")
+                                .selected_text(current)
+                                .show_ui(ui, |ui| {
+                                    for d in &disks {
+                                        ui.selectable_value(
+                                            &mut selected,
+                                            Some(d.id.clone()),
+                                            d.label.as_str(),
+                                        );
+                                    }
+                                });
+                        });
+                        ui.separator();
                     if let Some(smart) = &smart {
+                        // 健康状態・温度を大きく強調 (CrystalDiskInfo 風)
+                        let health_color = match smart.status {
+                            crate::smart::SmartStatus::Good => self.palette.mem,
+                            crate::smart::SmartStatus::Caution => self.palette.warn,
+                            crate::smart::SmartStatus::Bad => self.palette.danger,
+                            crate::smart::SmartStatus::Unknown => ui.visuals().weak_text_color(),
+                        };
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("健康状態").strong());
-                            let color = match smart.status {
-                                crate::smart::SmartStatus::Good => self.palette.mem,
-                                crate::smart::SmartStatus::Caution => self.palette.warn,
-                                crate::smart::SmartStatus::Bad => self.palette.danger,
-                                crate::smart::SmartStatus::Unknown => ui.visuals().weak_text_color(),
-                            };
-                            ui.label(RichText::new(smart.status_text()).strong().color(color));
+                            ui.label(RichText::new(smart.status_text()).size(22.0).strong().color(health_color));
+                            ui.add_space(24.0);
+                            ui.label(RichText::new("温度").strong());
+                            if let Some(t) = smart.temperature_c {
+                                let temp_color = if t >= 70 {
+                                    self.palette.danger
+                                } else if t >= 60 {
+                                    self.palette.warn
+                                } else {
+                                    self.palette.cpu
+                                };
+                                ui.label(RichText::new(format!("{t} °C")).size(22.0).strong().color(temp_color));
+                            } else {
+                                ui.label(RichText::new("—").size(22.0).strong());
+                            }
                         });
+                        ui.separator();
                         for (label, value) in [
                             ("モデル", smart.model.as_str()),
                             ("シリアル番号", smart.serial.as_str()),
@@ -2860,17 +2938,7 @@ impl MiniTaskApp {
                                     .unwrap_or("—"),
                             ),
                         ] {
-                            egui_extras::StripBuilder::new(ui)
-                                .size(egui_extras::Size::exact(150.0))
-                                .size(egui_extras::Size::remainder())
-                                .horizontal(|mut strip| {
-                                    strip.cell(|ui| {
-                                        ui.label(RichText::new(label).color(ui.visuals().weak_text_color()));
-                                    });
-                                    strip.cell(|ui| {
-                                        ui.label(value.to_owned());
-                                    });
-                                });
+                            Self::detail_row(ui, label, value.to_owned());
                         }
                         if !smart.extra.is_empty() {
                             ui.add_space(8.0);
@@ -2933,9 +3001,12 @@ impl MiniTaskApp {
                     }
                     });
                 });
-            if !open {
-                self.smart_dialog_disk = None;
-            }
+            // ディスクが切断された場合もダイアログを閉じる
+            let valid = selected
+                .as_ref()
+                .map(|id| disks.iter().any(|d| &d.id == id))
+                .unwrap_or(false);
+            self.smart_dialog_disk = if open && valid { selected } else { None };
         }
 
     }
