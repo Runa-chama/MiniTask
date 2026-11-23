@@ -617,7 +617,7 @@ impl MiniTaskApp {
             font_families: util::installed_font_families(),
             font_picker_open: false,
             font_picker_search: String::new(),
-            font_picker_preview: "MiniTask 0123 あいう漢字 — 軽量タスクマネージャー".to_owned(),
+            font_picker_preview: "MiniTask 0123 あいう漢字".to_owned(),
             font_picker_original: String::new(),
             bg_texture,
             bg_image_path: settings.bg_image_path,
@@ -1062,7 +1062,7 @@ impl eframe::App for MiniTaskApp {
                         self.load.cpu, mem_pct
                     )
                 } else {
-                    "MiniTask — 軽量タスクマネージャー".to_owned()
+                    "MiniTask".to_owned()
                 };
                 if tip != self.last_tray_tip {
                     crate::tray::set_tip(handle.hwnd(), &tip);
@@ -1249,17 +1249,6 @@ impl MiniTaskApp {
 
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("MiniTask")
-                    .size(20.0)
-                    .strong()
-                    .color(self.palette.primary),
-            );
-            ui.label(
-                RichText::new("軽量タスクマネージャー")
-                    .size(12.0)
-                    .color(ui.visuals().weak_text_color()),
-            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(info) = &self.update_info {
                     let label = format!("更新あり ({})", info.version);
@@ -3161,31 +3150,39 @@ impl MiniTaskApp {
                             } else {
                                 Palette::light_default()
                             };
-                            for i in 0..12 {
-                                let mut color = if dark {
-                                    dark_colors.as_array()[i]
-                                } else {
-                                    light_colors.as_array()[i]
-                                };
-                                ui.horizontal(|ui| {
-                                    if ui.color_edit_button_srgba(&mut color).changed() {
-                                        if dark {
-                                            dark_colors.set(i, color);
+                            egui::Grid::new("palette_grid")
+                                .num_columns(3)
+                                .spacing([16.0, 4.0])
+                                .show(ui, |ui| {
+                                    for i in 0..12 {
+                                        let mut color = if dark {
+                                            dark_colors.as_array()[i]
                                         } else {
-                                            light_colors.set(i, color);
-                                        }
-                                    }
-                                    ui.label(Palette::names()[i]);
-                                    if ui.small_button("既定").clicked() {
-                                        let c = defaults.as_array()[i];
-                                        if dark {
-                                            dark_colors.set(i, c);
-                                        } else {
-                                            light_colors.set(i, c);
+                                            light_colors.as_array()[i]
+                                        };
+                                        ui.horizontal(|ui| {
+                                            if ui.color_edit_button_srgba(&mut color).changed() {
+                                                if dark {
+                                                    dark_colors.set(i, color);
+                                                } else {
+                                                    light_colors.set(i, color);
+                                                }
+                                            }
+                                            ui.label(Palette::names()[i]);
+                                            if ui.small_button("既定").clicked() {
+                                                let c = defaults.as_array()[i];
+                                                if dark {
+                                                    dark_colors.set(i, c);
+                                                } else {
+                                                    light_colors.set(i, c);
+                                                }
+                                            }
+                                        });
+                                        if (i + 1) % 3 == 0 {
+                                            ui.end_row();
                                         }
                                     }
                                 });
-                            }
                             if ui.button("すべて既定に戻す").clicked() {
                                 dark_colors = Palette::dark_default();
                                 light_colors = Palette::light_default();

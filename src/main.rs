@@ -68,7 +68,7 @@ fn main() -> eframe::Result {
         .with_inner_size(initial_size)
         .with_min_inner_size([760.0, 440.0])
         .with_maximized(std::env::var("MINITASK_MAXIMIZE").is_ok())
-        .with_title("MiniTask — 軽量タスクマネージャー");
+        .with_title("MiniTask");
     if let Some(data) = icon::window_icon() {
         viewport = viewport.with_icon(std::sync::Arc::new(data));
     }

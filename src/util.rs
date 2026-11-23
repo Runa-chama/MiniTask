@@ -746,6 +746,7 @@ pub fn paint_mini_graph(
 }
 
 /// 温度の推移を既存グラフに重ねて表示する (右端が現在)。
+/// スケールは 0〜100℃ 固定 (50℃ が上下中央)。
 pub fn paint_temp_overlay(
     ui: &egui::Ui,
     rect: egui::Rect,
@@ -757,7 +758,7 @@ pub fn paint_temp_overlay(
     if values.is_empty() {
         return;
     }
-    let max = values.iter().copied().fold(20.0, f32::max).ceil().max(20.0);
+    let max = 100.0_f32;
     let painter = ui.painter();
     paint_curve(painter, rect, values, max, color, 1.5, style);
     painter.text(

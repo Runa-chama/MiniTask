@@ -88,7 +88,7 @@ fn add_icon(hwnd: HWND, icon: HICON) {
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = WM_TRAYICON;
         nid.hIcon = icon;
-        let tip = to_wide("MiniTask — 軽量タスクマネージャー");
+        let tip = to_wide("MiniTask");
         let n = tip.len().min(nid.szTip.len());
         nid.szTip[..n].copy_from_slice(&tip[..n]);
         let _ = Shell_NotifyIconW(NIM_ADD, &nid);

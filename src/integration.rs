@@ -228,7 +228,7 @@ unsafe extern "system" fn enum_focus_proc(hwnd: Handle, _lparam: isize) -> i32 {
             let mut title = vec![0u16; (len + 1) as usize];
             GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
             let text = String::from_utf16_lossy(&title);
-            if text.contains("MiniTask") && text.contains("軽量タスクマネージャー") {
+            if text.trim_end_matches('\0') == "MiniTask" {
                 bring_to_front(hwnd);
                 return 0;
             }
@@ -339,7 +339,7 @@ pub fn focus_existing_instance() -> bool {
             let mut title = vec![0u16; (len + 1) as usize];
             GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
             let text = String::from_utf16_lossy(&title);
-            if text.contains("MiniTask") && text.contains("軽量タスクマネージャー") {
+            if text.trim_end_matches('\0') == "MiniTask" {
                 bring_to_front(hwnd);
                 *(found as *mut bool) = true;
                 return 0;
@@ -374,7 +374,7 @@ pub fn ensure_window_opacity(percent: u8) {
                 let mut title = vec![0u16; (len + 1) as usize];
                 GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
                 let text = String::from_utf16_lossy(&title);
-                if text.contains("MiniTask") && text.contains("軽量タスクマネージャー") {
+                if text.trim_end_matches('\0') == "MiniTask" {
                     let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
                     if ex & WS_EX_LAYERED as isize == 0 {
                         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED as isize);
@@ -404,7 +404,7 @@ pub fn try_hide_minimized_window() {
                 let mut title = vec![0u16; (len + 1) as usize];
                 GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
                 let text = String::from_utf16_lossy(&title);
-                if text.contains("MiniTask") && text.contains("軽量タスクマネージャー") {
+                if text.trim_end_matches('\0') == "MiniTask" {
                     if IsIconic(hwnd) != 0 && IsWindowVisible(hwnd) != 0 {
                         ShowWindow(hwnd, SW_HIDE);
                     }
