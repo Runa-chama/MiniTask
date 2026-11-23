@@ -213,7 +213,10 @@ unsafe extern "system" fn wnd_proc(
         if msg == WM_COMMAND {
             // 念のため（TPM_RETURNCMD を使っているので通常ここは来ない）
             match wparam & 0xffff {
-                v if v == ID_OPEN => integration::focus_window(),
+                v if v == ID_OPEN => {
+                    let _ = state.tx.send(TrayMsg::Open);
+                    integration::focus_window();
+                }
                 v if v == ID_EXIT => {
                     let _ = state.tx.send(TrayMsg::Exit);
                 }

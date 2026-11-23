@@ -166,9 +166,10 @@ unsafe fn http_read(url: &str, mut sink: Option<&mut dyn Write>) -> Result<Vec<u
             }
             let chunk = &buf[..read as usize];
             if let Some(w) = sink.as_mut() {
-                let _ = w.write_all(chunk);
+                w.write_all(chunk).map_err(|e| e.to_string())?;
+            } else {
+                result.extend_from_slice(chunk);
             }
-            result.extend_from_slice(chunk);
         }
         let _ = InternetCloseHandle(uh);
         let _ = InternetCloseHandle(h);
@@ -208,9 +209,10 @@ pub fn download(info: &UpdateInfo) -> Result<std::path::PathBuf, String> {
         filename
     ));
     let mut file = std::fs::File::create(&dest).map_err(|e| e.to_string())?;
-    let bytes = unsafe { http_read(&info.url, Some(&mut file))? };
+    unsafe { http_read(&info.url, Some(&mut file))? };
     drop(file);
-    log(&format!("downloaded {} bytes -> {}", bytes.len(), dest.display()));
+    let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+    log(&format!("downloaded {} bytes -> {}", size, dest.display()));
     Ok(dest)
 }
 

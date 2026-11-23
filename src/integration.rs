@@ -346,7 +346,11 @@ pub fn focus_existing_instance() -> bool {
             GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
             let text = String::from_utf16_lossy(&title);
             if text.trim_end_matches('\0') == "MiniTask" {
-                bring_to_front(hwnd);
+                // トレイ格納中は生Win32で表示すると winit 状態不整合/白フラッシュになる。
+                // その場合は notify_tray_show() 経由でアプリ側の復帰処理に任せる。
+                if IsWindowVisible(hwnd) != 0 {
+                    bring_to_front(hwnd);
+                }
                 *(found as *mut bool) = true;
                 return 0;
             }
@@ -509,6 +513,30 @@ pub fn show_main_window() {
     unsafe {
         EnumWindows(Some(proc), 0);
     }
+}
+
+/// メインウィンドウが OS 上で可視かどうか (トレイ格納/SW_HIDE なら false)。
+pub fn is_main_window_visible() -> bool {
+    unsafe extern "system" fn proc(hwnd: Handle, visible: isize) -> i32 {
+        unsafe {
+            let len = GetWindowTextLengthW(hwnd);
+            if len > 0 {
+                let mut title = vec![0u16; (len + 1) as usize];
+                GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+                let text = String::from_utf16_lossy(&title);
+                if text.trim_end_matches('\0') == "MiniTask" {
+                    *(visible as *mut bool) = IsWindowVisible(hwnd) != 0;
+                    return 0;
+                }
+            }
+            1
+        }
+    }
+    let mut visible = false;
+    unsafe {
+        EnumWindows(Some(proc), &mut visible as *mut bool as isize);
+    }
+    visible
 }
 
 /// ワーキングセットを縮小する。ページはスタンバイへ移るだけで、

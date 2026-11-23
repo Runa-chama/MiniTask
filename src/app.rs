@@ -1048,13 +1048,21 @@ impl eframe::App for MiniTaskApp {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
                     crate::tray::TrayMsg::Open => {
-                        // 白フラッシュ防止: クロークしたまま表示→描画→次フレームでクローク解除
-                        integration::cloak_main_window(true);
-                        integration::show_main_window();
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                        ctx.request_repaint();
-                        self.pending_uncloak = true;
+                        if integration::is_main_window_visible() {
+                            // 既に可視ならクローク復帰を行わず前面化だけ行う (1フレームちらつき防止)
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                            integration::focus_window();
+                            ctx.request_repaint();
+                        } else {
+                            // 白フラッシュ防止: クロークしたまま表示→描画→次フレームでクローク解除
+                            integration::cloak_main_window(true);
+                            integration::show_main_window();
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                            ctx.request_repaint();
+                            self.pending_uncloak = true;
+                        }
                     }
                     crate::tray::TrayMsg::Exit => {
                         // トレイ格納中でも確実に終了させる
