@@ -323,8 +323,11 @@ pub struct MiniTaskApp {
     temp_unit: u8,
     font_family: String,
     bg_image_path: String,
+    bg_fit: u8,
     bg_overlay_alpha: u8,
     bg_texture: Option<egui::TextureHandle>,
+    /// 読み込んだ背景画像の元サイズ (縦横比とタイル計算に使う)
+    bg_image_size: Vec2,
     window_opacity: u8,
     graph_solo: bool,
     fullscreen: bool,
@@ -479,6 +482,7 @@ impl MiniTaskApp {
         } else {
             util::load_background(ctx, &settings.bg_image_path)
         };
+        let bg_image_size = bg_texture.as_ref().map(|t| t.size_vec2()).unwrap_or(Vec2::ZERO);
         let mut app = Self {
             collector,
             rows: Vec::new(),
@@ -607,7 +611,9 @@ impl MiniTaskApp {
             font_family: settings.font_family.clone(),
             bg_texture,
             bg_image_path: settings.bg_image_path,
+            bg_fit: settings.bg_fit,
             bg_overlay_alpha: settings.bg_overlay_alpha,
+            bg_image_size,
             window_opacity: settings.window_opacity,
             graph_solo: false,
             fullscreen: false,
@@ -1090,7 +1096,8 @@ impl eframe::App for MiniTaskApp {
         // テクスチャは最初の描画フレームで読み込む (レンダラー初期化後)
         if self.bg_texture.is_none() && !self.bg_image_path.is_empty() {
             self.bg_texture = util::load_background(ui.ctx(), &self.bg_image_path);
-            if self.bg_texture.is_some() {
+            if let Some(tex) = &self.bg_texture {
+                self.bg_image_size = tex.size_vec2();
                 // パネルを半透明にするテーマを適用し直す
                 self.theme_dirty = true;
             }
@@ -1099,18 +1106,15 @@ impl eframe::App for MiniTaskApp {
         if let Some(tex) = &self.bg_texture {
             let rect = ui.max_rect();
             let painter = ui.painter();
-            painter.image(
-                tex.id(),
-                rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
-            // 画像の上にテーマ色を重ねて文字を読みやすくする
             let base = if self.dark_mode {
                 egui::Color32::from_rgb(20, 22, 27)
             } else {
                 egui::Color32::from_rgb(246, 246, 246)
             };
+            // 画像が届かない余白 (全体を収める / タイル) を背景色で埋める
+            painter.rect_filled(rect, egui::CornerRadius::ZERO, base);
+            Self::paint_background_image(&painter, tex, rect, self.bg_fit, self.bg_image_size);
+            // 画像の上にテーマ色を重ねて文字を読みやすくする
             let alpha = (self.bg_overlay_alpha as f32 * 2.55)
                 .round()
                 .clamp(0.0, 255.0) as u8;
@@ -1226,6 +1230,7 @@ impl MiniTaskApp {
             temp_unit: self.temp_unit,
             font_family: self.font_family.clone(),
             bg_image_path: self.bg_image_path.clone(),
+            bg_fit: self.bg_fit,
             bg_overlay_alpha: self.bg_overlay_alpha,
             window_opacity: self.window_opacity,
             last_update_check: self.last_update_check,
@@ -2758,6 +2763,63 @@ impl MiniTaskApp {
         }
     }
 
+    /// 背景画像を指定の表示方法で描画する。
+    /// 0=引き伸ばす, 1=縦横比を保って切り抜く, 2=縦横比を保って収める, 3=タイル
+    fn paint_background_image(
+        painter: &egui::Painter,
+        tex: &egui::TextureHandle,
+        rect: egui::Rect,
+        fit: u8,
+        image_size: Vec2,
+    ) {
+        if image_size.x <= 0.0 || image_size.y <= 0.0 || rect.width() <= 0.0 || rect.height() <= 0.0
+        {
+            return;
+        }
+        let uv_full =
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        match fit {
+            1 => {
+                // 画面を覆うように拡大し、はみ出した部分を切り抜く
+                let ar_screen = rect.width() / rect.height();
+                let ar_image = image_size.x / image_size.y;
+                let uv = if ar_image > ar_screen {
+                    let frac = ar_screen / ar_image;
+                    let x = (1.0 - frac) * 0.5;
+                    egui::Rect::from_min_max(egui::pos2(x, 0.0), egui::pos2(1.0 - x, 1.0))
+                } else {
+                    let frac = ar_image / ar_screen;
+                    let y = (1.0 - frac) * 0.5;
+                    egui::Rect::from_min_max(egui::pos2(0.0, y), egui::pos2(1.0, 1.0 - y))
+                };
+                painter.image(tex.id(), rect, uv, Color32::WHITE);
+            }
+            2 => {
+                // 縦横比を保ったまま全体を収める (余白は背景色)
+                let scale = (rect.width() / image_size.x).min(rect.height() / image_size.y);
+                let target = egui::Rect::from_center_size(rect.center(), image_size * scale);
+                painter.image(tex.id(), target, uv_full, Color32::WHITE);
+            }
+            3 => {
+                // 元サイズでタイル状に繰り返す
+                let mut y = rect.top();
+                while y < rect.bottom() {
+                    let mut x = rect.left();
+                    while x < rect.right() {
+                        let tile = egui::Rect::from_min_size(egui::pos2(x, y), image_size);
+                        painter.image(tex.id(), tile, uv_full, Color32::WHITE);
+                        x += image_size.x;
+                    }
+                    y += image_size.y;
+                }
+            }
+            _ => {
+                // 全体に引き伸ばす
+                painter.image(tex.id(), rect, uv_full, Color32::WHITE);
+            }
+        }
+    }
+
     fn startup_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("ログイン時に自動起動するアプリ:");
@@ -2766,7 +2828,7 @@ impl MiniTaskApp {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    RichText::new("右クリックで削除 / 状態ボタンで有効・無効切替")
+                    RichText::new("右クリックで削除 / スイッチで有効・無効切替")
                         .size(12.0)
                         .color(ui.visuals().weak_text_color()),
                 );
@@ -2792,7 +2854,7 @@ impl MiniTaskApp {
             .sense(egui::Sense::click())
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::auto().at_least(180.0).clip(true)) // 名前
-            .column(Column::initial(80.0)) // 状態
+            .column(Column::initial(104.0)) // 状態
             .column(Column::initial(170.0).clip(true)) // 種類
             .column(Column::auto().at_least(320.0).clip(true)) // コマンド
             .header(24.0, |mut header| {
@@ -2819,21 +2881,30 @@ impl MiniTaskApp {
                             ui.label(&entry.name);
                         });
                         row.col(|ui| {
-                            let label = if entry.enabled { "有効" } else { "無効" };
-                            let color = if entry.enabled { self.palette.mem } else { ui.visuals().weak_text_color() };
-                            if ui.button(RichText::new(label).color(color)).clicked() {
-                                match startup::set_enabled(&entry, !entry.enabled) {
-                                    Ok(()) => {
-                                        self.startup_entries = startup::list();
-                                        self.notify(format!(
-                                            "「{}」を{}にしました",
-                                            entry.name,
-                                            if entry.enabled { "無効" } else { "有効" }
-                                        ));
+                            let mut on = entry.enabled;
+                            ui.horizontal(|ui| {
+                                let response = toggle_switch(ui, &mut on, self.palette.secondary);
+                                if response.changed() {
+                                    match startup::set_enabled(&entry, on) {
+                                        Ok(()) => {
+                                            self.startup_entries = startup::list();
+                                            self.notify(format!(
+                                                "「{}」を{}にしました",
+                                                entry.name,
+                                                if on { "有効" } else { "無効" }
+                                            ));
+                                        }
+                                        Err(e) => self.notify(format!("切替失敗: {e}")),
                                     }
-                                    Err(e) => self.notify(format!("切替失敗: {e}")),
                                 }
-                            }
+                                ui.label(
+                                    RichText::new(if on { "有効" } else { "無効" }).color(if on {
+                                        self.palette.secondary
+                                    } else {
+                                        ui.visuals().weak_text_color()
+                                    }),
+                                );
+                            });
                         });
                         row.col(|ui| {
                             ui.label(entry.kind.label());
@@ -3036,6 +3107,7 @@ impl MiniTaskApp {
             let mut temp_unit = self.temp_unit;
             let mut font_family = self.font_family.clone();
             let mut bg_image_path = self.bg_image_path.clone();
+            let mut bg_fit = self.bg_fit;
             let mut bg_overlay_alpha = self.bg_overlay_alpha;
             let mut window_opacity = self.window_opacity;
             let mut interval = self.interval;
@@ -3140,6 +3212,22 @@ impl MiniTaskApp {
                                             .unwrap_or_else(|| bg_image_path.clone())
                                     },
                                 );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("表示方法:");
+                                let labels = [
+                                    "引き伸ばす",
+                                    "切り抜く (はみ出しをカット)",
+                                    "全体を収める",
+                                    "タイル",
+                                ];
+                                egui::ComboBox::from_id_salt("settings_bg_fit")
+                                    .selected_text(labels[bg_fit.min(3) as usize])
+                                    .show_ui(ui, |ui| {
+                                        for (i, label) in labels.iter().enumerate() {
+                                            ui.selectable_value(&mut bg_fit, i as u8, *label);
+                                        }
+                                    });
                             });
                             ui.add(
                                 egui::Slider::new(&mut bg_overlay_alpha, 0..=100)
@@ -3331,7 +3419,13 @@ impl MiniTaskApp {
                 };
                 // 背景画像の有無でパネルの透過を切り替える
                 self.theme_dirty = true;
+                self.bg_image_size = self
+                    .bg_texture
+                    .as_ref()
+                    .map(|t| t.size_vec2())
+                    .unwrap_or(Vec2::ZERO);
             }
+            self.bg_fit = bg_fit;
             self.bg_overlay_alpha = bg_overlay_alpha;
             self.window_opacity = window_opacity;
             if tray_icon != self.tray_icon {
@@ -3548,4 +3642,51 @@ fn open_location(exe: &str) {
     let _ = std::process::Command::new("explorer.exe")
         .raw_arg(format!("/select,\"{exe}\""))
         .spawn();
+}
+
+/// ON のときに指定色で塗るトグルスイッチ。
+fn toggle_switch(ui: &mut egui::Ui, on: &mut bool, on_color: Color32) -> egui::Response {
+    let (rect, mut response) =
+        ui.allocate_exact_size(egui::vec2(38.0, 20.0), egui::Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if ui.is_rect_visible(rect) {
+        let t = ui.ctx().animate_bool_responsive(response.id, *on);
+        let radius = rect.height() * 0.5;
+        let corner = egui::CornerRadius::same(radius as u8);
+        let off = ui.visuals().widgets.inactive.bg_fill;
+        // OFF 色から ON 色へ補間する
+        let lerp_u8 = |a: u8, b: u8| -> u8 {
+            (a as f32 + (b as f32 - a as f32) * t).round().clamp(0.0, 255.0) as u8
+        };
+        let mut track = Color32::from_rgba_unmultiplied(
+            lerp_u8(off.r(), on_color.r()),
+            lerp_u8(off.g(), on_color.g()),
+            lerp_u8(off.b(), on_color.b()),
+            lerp_u8(off.a(), on_color.a()),
+        );
+        if response.hovered() {
+            track = track.gamma_multiply(1.08);
+        }
+        let painter = ui.painter();
+        painter.rect_filled(rect, corner, track);
+        painter.rect_stroke(
+            rect,
+            corner,
+            egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
+            egui::StrokeKind::Inside,
+        );
+        // つまみ
+        let knob_radius = radius - 3.0;
+        let center_x = egui::lerp(rect.left() + radius..=rect.right() - radius, t);
+        painter.circle_filled(
+            egui::pos2(center_x, rect.center().y),
+            knob_radius,
+            Color32::WHITE,
+        );
+    }
+    response
 }

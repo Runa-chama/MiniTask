@@ -55,6 +55,8 @@ pub struct AppSettings {
     pub font_family: String,
     /// 背景画像のファイルパス (空=無効)
     pub bg_image_path: String,
+    /// 背景画像の表示方法 (0=引き伸ばす, 1=切り抜く, 2=全体を収める, 3=タイル)
+    pub bg_fit: u8,
     /// 背景画像の上に乗せる背景色の不透明度 (0〜100)
     pub bg_overlay_alpha: u8,
     /// ウィンドウ全体の不透明度 (0〜100)
@@ -101,6 +103,7 @@ impl Default for AppSettings {
             temp_unit: 0,
             font_family: "Meiryo".to_owned(),
             bg_image_path: String::new(),
+            bg_fit: 0,
             bg_overlay_alpha: 25,
             window_opacity: 100,
             last_update_check: 0,
@@ -203,6 +206,11 @@ impl AppSettings {
         s.bg_image_path = key
             .get_value::<String, _>("BgImagePath")
             .unwrap_or_else(|_| s.bg_image_path);
+        if let Ok(v) = key.get_value::<u32, _>("BgImageFit") {
+            if v <= 3 {
+                s.bg_fit = v as u8;
+            }
+        }
         if let Ok(v) = key.get_value::<u32, _>("BgOverlayAlpha") {
             s.bg_overlay_alpha = (v.min(100)) as u8;
         }
@@ -246,6 +254,7 @@ impl AppSettings {
         let _ = key.set_value("TempUnit", &(self.temp_unit as u32));
         let _ = key.set_value("FontFamily", &self.font_family);
         let _ = key.set_value("BgImagePath", &self.bg_image_path);
+        let _ = key.set_value("BgImageFit", &(self.bg_fit as u32));
         let _ = key.set_value("BgOverlayAlpha", &(self.bg_overlay_alpha as u32));
         let _ = key.set_value("WindowOpacity", &(self.window_opacity as u32));
         let _ = key.set_value("LastUpdateCheck", &self.last_update_check);
@@ -288,6 +297,7 @@ impl AppSettings {
             && self.temp_unit == other.temp_unit
             && self.font_family == other.font_family
             && self.bg_image_path == other.bg_image_path
+            && self.bg_fit == other.bg_fit
             && self.bg_overlay_alpha == other.bg_overlay_alpha
             && self.window_opacity == other.window_opacity
             && self.last_update_check == other.last_update_check
