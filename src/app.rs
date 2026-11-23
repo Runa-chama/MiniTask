@@ -309,6 +309,8 @@ pub struct MiniTaskApp {
     autostart: bool,
     start_in_tray: bool,
     start_in_tray_pending: bool,
+    /// トレイメニュー「終了」など明示的な終了要求
+    exit_requested: bool,
     last_tray_tip: String,
     last_tray_check: Instant,
     tray_handle: Option<crate::tray::TrayHandle>,
@@ -629,6 +631,7 @@ impl MiniTaskApp {
             autostart: settings.autostart,
             start_in_tray: settings.start_in_tray,
             start_in_tray_pending: settings.start_in_tray && settings.tray_icon,
+            exit_requested: false,
             last_tray_tip: String::new(),
             last_tray_check: Instant::now() - Duration::from_secs(1),
             tray_handle,
@@ -1043,7 +1046,9 @@ impl eframe::App for MiniTaskApp {
                     }
                     crate::tray::TrayMsg::Exit => {
                         // トレイ格納中でも確実に終了させる
+                        self.exit_requested = true;
                         self.close_to_tray = false;
+                        self.start_in_tray_pending = false;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
@@ -1099,11 +1104,24 @@ impl eframe::App for MiniTaskApp {
             self.start_in_tray_pending = false;
             integration::trim_working_set();
         }
-        // 閉じるボタンでトレイに格納
-        if self.tray_icon && self.close_to_tray && ctx.input(|i| i.viewport().close_requested()) {
+        // 閉じるボタンでトレイに格納 (明示的な終了要求時は通す)
+        if self.tray_icon
+            && self.close_to_tray
+            && !self.exit_requested
+            && ctx.input(|i| i.viewport().close_requested())
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             integration::trim_working_set();
+        }
+        if self.exit_requested && ctx.input(|i| i.viewport().close_requested()) {
+            // 終了要求時は確実に閉じる
+            self.close_to_tray = false;
+        }
+        if self.exit_requested {
+            // 非表示中の Close が無視されるケースに備えて再送する
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         // トレイのツールチップ更新と、最小化→トレイ格納 (0.5 秒ごとに判定)
         if self.tray_icon && self.last_tray_check.elapsed() >= Duration::from_millis(500) {
