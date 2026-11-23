@@ -266,8 +266,14 @@ pub fn format_temp(celsius: f32, unit: u8) -> String {
     }
 }
 
+/// 色の不透明度だけを差し替える (RGB はそのまま)。
+fn with_alpha(c: Color32, a: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+}
+
 /// テーマを適用する (ダーク / ホワイト + ユーザー配色)。
-pub fn setup_theme(ctx: &egui::Context, dark: bool, pal: &Palette) {
+/// `bg_active` が true のときは背景画像が透けるようパネル・行・グラフ・選択色を半透明にする。
+pub fn setup_theme(ctx: &egui::Context, dark: bool, pal: &Palette, bg_active: bool) {
     ctx.set_theme(if dark {
         egui::ThemePreference::Dark
     } else {
@@ -331,6 +337,19 @@ pub fn setup_theme(ctx: &egui::Context, dark: bool, pal: &Palette) {
     } else {
         pal.primary.gamma_multiply(0.35)
     };
+    if bg_active {
+        // 背景画像を透かすため、パネルは完全透明、行・グラフ・選択色は半透明にする。
+        // ダイアログ (window_fill) は文字の可読性を優先してほぼ不透明のまま残す。
+        v.panel_fill = Color32::TRANSPARENT;
+        v.window_fill = with_alpha(v.window_fill, 248);
+        v.extreme_bg_color = with_alpha(v.extreme_bg_color, 150);
+        v.faint_bg_color = with_alpha(v.faint_bg_color, if dark { 120 } else { 125 });
+        v.selection.bg_fill = with_alpha(v.selection.bg_fill, if dark { 120 } else { 110 });
+        v.widgets.noninteractive.bg_fill = with_alpha(v.widgets.noninteractive.bg_fill, 130);
+        v.widgets.inactive.bg_fill = with_alpha(v.widgets.inactive.bg_fill, 185);
+        v.widgets.hovered.bg_fill = with_alpha(v.widgets.hovered.bg_fill, 210);
+        v.widgets.active.bg_fill = with_alpha(v.widgets.active.bg_fill, 215);
+    }
     style.spacing.item_spacing = Vec2::new(8.0, 6.0);
     style.spacing.button_padding = Vec2::new(10.0, 5.0);
     ctx.set_global_style(style);

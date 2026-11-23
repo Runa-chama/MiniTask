@@ -945,7 +945,12 @@ impl eframe::App for MiniTaskApp {
         integration::ensure_window_opacity(self.window_opacity);
         if self.theme_dirty {
             util::setup_fonts(ctx, &self.font_family);
-            util::setup_theme(ctx, self.dark_mode, &self.palette);
+            util::setup_theme(
+                ctx,
+                self.dark_mode,
+                &self.palette,
+                self.bg_texture.is_some(),
+            );
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
                 if self.always_on_top {
                     egui::WindowLevel::AlwaysOnTop
@@ -1085,6 +1090,35 @@ impl eframe::App for MiniTaskApp {
         // テクスチャは最初の描画フレームで読み込む (レンダラー初期化後)
         if self.bg_texture.is_none() && !self.bg_image_path.is_empty() {
             self.bg_texture = util::load_background(ui.ctx(), &self.bg_image_path);
+            if self.bg_texture.is_some() {
+                // パネルを半透明にするテーマを適用し直す
+                self.theme_dirty = true;
+            }
+        }
+        // 背景画像はルート Ui の最背面へ描画し、全パネルの背後に回す
+        if let Some(tex) = &self.bg_texture {
+            let rect = ui.max_rect();
+            let painter = ui.painter();
+            painter.image(
+                tex.id(),
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            // 画像の上にテーマ色を重ねて文字を読みやすくする
+            let base = if self.dark_mode {
+                egui::Color32::from_rgb(20, 22, 27)
+            } else {
+                egui::Color32::from_rgb(246, 246, 246)
+            };
+            let alpha = (self.bg_overlay_alpha as f32 * 2.55)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            painter.rect_filled(
+                rect,
+                egui::CornerRadius::ZERO,
+                egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), alpha),
+            );
         }
         // モーダル表示中は背面をグレー化して操作できないようにする
         let modal = self.any_modal();
@@ -1099,31 +1133,8 @@ impl eframe::App for MiniTaskApp {
                     self.status_bar(ui);
                 });
 
-            // 背景画像があるときは枠も背景色も持たないパネルを使う
-            let central = if self.bg_texture.is_some() {
-                egui::CentralPanel::no_frame()
-            } else {
-                egui::CentralPanel::default()
-            };
-            central.show(ui, |ui| {
-                if let Some(tex) = &self.bg_texture {
-                    // 画像 → 半透明の背景色の順に同じレイヤーへ描画する
-                    let rect = ui.max_rect();
-                    let painter = ui.painter();
-                    painter.image(
-                        tex.id(),
-                        rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        egui::Color32::WHITE,
-                    );
-                    let fill = ui.visuals().panel_fill;
-                    let alpha = (self.bg_overlay_alpha as f32 * 2.55).round().min(255.0) as u8;
-                    painter.rect_filled(
-                        rect,
-                        egui::CornerRadius::ZERO,
-                        egui::Color32::from_rgba_premultiplied(fill.r(), fill.g(), fill.b(), alpha),
-                    );
-                }
+            // 背景画像があるときはテーマ側でパネルが透明になるため既定のパネルでよい
+            egui::CentralPanel::default().show(ui, |ui| {
                 self.header(ui);
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
@@ -3318,6 +3329,8 @@ impl MiniTaskApp {
                 } else {
                     util::load_background(ctx, &bg_image_path)
                 };
+                // 背景画像の有無でパネルの透過を切り替える
+                self.theme_dirty = true;
             }
             self.bg_overlay_alpha = bg_overlay_alpha;
             self.window_opacity = window_opacity;

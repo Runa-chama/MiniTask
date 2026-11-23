@@ -101,7 +101,7 @@ impl Default for AppSettings {
             temp_unit: 0,
             font_family: "Meiryo".to_owned(),
             bg_image_path: String::new(),
-            bg_overlay_alpha: 40,
+            bg_overlay_alpha: 25,
             window_opacity: 100,
             last_update_check: 0,
         }
