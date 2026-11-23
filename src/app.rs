@@ -1047,7 +1047,6 @@ impl eframe::App for MiniTaskApp {
                     crate::tray::TrayMsg::Exit => {
                         // トレイ格納中でも確実に終了させる
                         self.exit_requested = true;
-                        self.close_to_tray = false;
                         self.start_in_tray_pending = false;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1086,7 +1085,7 @@ impl eframe::App for MiniTaskApp {
                     if crate::update::apply_update(&path).is_ok() {
                         // デタッチしたヘルパーがインストール→再起動を行う。
                         // アプリは設定を保存してから正常終了する。
-                        self.close_to_tray = false;
+                        self.exit_requested = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     } else {
                         self.update_msg = Some("更新の適用に失敗しました".to_owned());
@@ -1112,11 +1111,10 @@ impl eframe::App for MiniTaskApp {
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            // winit の内部可視状態と OS 実状態がズレると Visible(false) が no-op になる。
+            // 生Win32 でも隠して確実にトレイ格納する。
+            integration::hide_main_window();
             integration::trim_working_set();
-        }
-        if self.exit_requested && ctx.input(|i| i.viewport().close_requested()) {
-            // 終了要求時は確実に閉じる
-            self.close_to_tray = false;
         }
         if self.exit_requested {
             // 非表示中の Close が無視されるケースに備えて再送する

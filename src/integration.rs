@@ -230,7 +230,11 @@ unsafe extern "system" fn enum_focus_proc(hwnd: Handle, _lparam: isize) -> i32 {
             GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
             let text = String::from_utf16_lossy(&title);
             if text.trim_end_matches('\0') == "MiniTask" {
-                bring_to_front(hwnd);
+                // トレイ格納 (Visible(false)) 中のウィンドウは前面化しない。
+                // 生Win32 で強制表示すると winit の可視状態と不整合が起きるため。
+                if IsWindowVisible(hwnd) != 0 {
+                    bring_to_front(hwnd);
+                }
                 return 0;
             }
         }
@@ -395,6 +399,27 @@ pub fn ensure_window_opacity(percent: u8) {
     }
 }
 
+unsafe extern "system" fn enum_hide_proc(hwnd: Handle, hidden: isize) -> i32 {
+    unsafe {
+        let len = GetWindowTextLengthW(hwnd);
+        if len > 0 {
+            let mut title = vec![0u16; (len + 1) as usize];
+            GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+            let text = String::from_utf16_lossy(&title);
+            if text.trim_end_matches('\0') == "MiniTask" {
+                if IsWindowVisible(hwnd) != 0 {
+                    ShowWindow(hwnd, SW_HIDE);
+                    if hidden != 0 {
+                        *(hidden as *mut bool) = true;
+                    }
+                }
+                return 0;
+            }
+        }
+        1
+    }
+}
+
 /// メインウィンドウが最小化されていたらトレイへ格納する。
 /// 最小化中は egui の update が呼ばれないため、常駐スレッドから直接実行する。
 /// 実際に格納した場合は true を返す。
@@ -422,6 +447,14 @@ pub fn try_hide_minimized_window() -> bool {
         EnumWindows(Some(proc), &mut hidden as *mut bool as isize);
     }
     hidden
+}
+
+/// メインウィンドウをトレイへ格納する (最小化状態に依らない)。
+/// winit の Visible(false) が内部状態不整合で no-op になるケースのフォールバック。
+pub fn hide_main_window() {
+    unsafe {
+        EnumWindows(Some(enum_hide_proc), std::ptr::null_mut::<bool>() as isize);
+    }
 }
 
 /// ワーキングセットを縮小する。ページはスタンバイへ移るだけで、
