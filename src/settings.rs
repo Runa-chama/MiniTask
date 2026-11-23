@@ -49,6 +49,10 @@ pub struct AppSettings {
     pub minimize_to_tray: bool,
     /// トレイアイコンのツールチップに CPU / メモリ使用率を表示する
     pub tray_usage_tip: bool,
+    /// Windows サインイン時に MiniTask を自動起動する
+    pub autostart: bool,
+    /// 起動時にタスクトレイへ格納する
+    pub start_in_tray: bool,
     /// 温度の単位 (0=摂氏, 1=華氏)
     pub temp_unit: u8,
     /// 使用するフォント (空=自動)
@@ -100,6 +104,8 @@ impl Default for AppSettings {
             close_to_tray: true,
             minimize_to_tray: false,
             tray_usage_tip: true,
+            autostart: false,
+            start_in_tray: false,
             temp_unit: 0,
             font_family: "Meiryo".to_owned(),
             bg_image_path: String::new(),
@@ -195,6 +201,8 @@ impl AppSettings {
         s.close_to_tray = read_bool(&key, "CloseToTray", true);
         s.minimize_to_tray = read_bool(&key, "MinimizeToTray", false);
         s.tray_usage_tip = read_bool(&key, "TrayUsageTip", true);
+        s.autostart = read_bool(&key, "Autostart", false);
+        s.start_in_tray = read_bool(&key, "StartInTray", false);
         if let Ok(v) = key.get_value::<u32, _>("TempUnit") {
             if v <= 1 {
                 s.temp_unit = v as u8;
@@ -251,6 +259,8 @@ impl AppSettings {
         let _ = key.set_value("CloseToTray", &(self.close_to_tray as u32));
         let _ = key.set_value("MinimizeToTray", &(self.minimize_to_tray as u32));
         let _ = key.set_value("TrayUsageTip", &(self.tray_usage_tip as u32));
+        let _ = key.set_value("Autostart", &(self.autostart as u32));
+        let _ = key.set_value("StartInTray", &(self.start_in_tray as u32));
         let _ = key.set_value("TempUnit", &(self.temp_unit as u32));
         let _ = key.set_value("FontFamily", &self.font_family);
         let _ = key.set_value("BgImagePath", &self.bg_image_path);
@@ -294,6 +304,8 @@ impl AppSettings {
             && self.close_to_tray == other.close_to_tray
             && self.minimize_to_tray == other.minimize_to_tray
             && self.tray_usage_tip == other.tray_usage_tip
+            && self.autostart == other.autostart
+            && self.start_in_tray == other.start_in_tray
             && self.temp_unit == other.temp_unit
             && self.font_family == other.font_family
             && self.bg_image_path == other.bg_image_path

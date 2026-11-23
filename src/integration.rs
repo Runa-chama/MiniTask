@@ -419,6 +419,44 @@ pub fn try_hide_minimized_window() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Windows サインイン時の自動起動 (HKCU\...\Run)
+// ---------------------------------------------------------------------------
+
+const AUTOSTART_RUN_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const AUTOSTART_VALUE_NAME: &str = "MiniTask";
+
+pub fn set_autostart(enable: bool, exe_path: &str) -> Result<(), String> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if enable {
+        let (key, _) = hkcu
+            .create_subkey_with_flags(AUTOSTART_RUN_PATH, KEY_SET_VALUE | KEY_WOW64_64KEY)
+            .map_err(|e| format!("自動起動キーを開けません: {e}"))?;
+        key.set_value(AUTOSTART_VALUE_NAME, &format!("\"{exe_path}\""))
+            .map_err(|e| format!("自動起動値を設定できません: {e}"))?;
+    } else {
+        let key = hkcu
+            .open_subkey_with_flags(AUTOSTART_RUN_PATH, KEY_SET_VALUE | KEY_WOW64_64KEY)
+            .map_err(|e| format!("自動起動キーを開けません: {e}"))?;
+        // 値が無い場合は成功扱い
+        match key.delete_value(AUTOSTART_VALUE_NAME) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("自動起動値を削除できません: {e}")),
+        }
+    }
+    Ok(())
+}
+
+pub fn is_autostart_active() -> bool {
+    let Ok(key) = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(AUTOSTART_RUN_PATH, KEY_READ | KEY_WOW64_64KEY)
+    else {
+        return false;
+    };
+    key.get_value::<String, _>(AUTOSTART_VALUE_NAME).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

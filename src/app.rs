@@ -304,6 +304,9 @@ pub struct MiniTaskApp {
     minimize_to_tray: bool,
     minimize_flag: Arc<AtomicBool>,
     tray_usage_tip: bool,
+    autostart: bool,
+    start_in_tray: bool,
+    start_in_tray_pending: bool,
     last_tray_tip: String,
     last_tray_check: Instant,
     tray_handle: Option<crate::tray::TrayHandle>,
@@ -473,6 +476,7 @@ impl MiniTaskApp {
             if settings.tray_icon {
                 let _ = integration::set_shell_menu(true, &exe);
             }
+            let _ = integration::set_autostart(settings.autostart, &exe);
         }
         let (tray_handle, tray_rx) = if settings.tray_icon {
             let (h, rx) = crate::tray::start();
@@ -618,6 +622,9 @@ impl MiniTaskApp {
             minimize_to_tray: settings.minimize_to_tray,
             minimize_flag,
             tray_usage_tip: settings.tray_usage_tip,
+            autostart: settings.autostart,
+            start_in_tray: settings.start_in_tray,
+            start_in_tray_pending: settings.start_in_tray && settings.tray_icon,
             last_tray_tip: String::new(),
             last_tray_check: Instant::now() - Duration::from_secs(1),
             tray_handle,
@@ -1077,6 +1084,11 @@ impl eframe::App for MiniTaskApp {
                 }
             }
         }
+        // 起動時にトレイへ格納 (一度だけ)
+        if self.start_in_tray_pending && self.tray_icon && self.tray_handle.is_some() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.start_in_tray_pending = false;
+        }
         // 閉じるボタンでトレイに格納
         if self.tray_icon && self.close_to_tray && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1310,6 +1322,8 @@ impl MiniTaskApp {
             close_to_tray: self.close_to_tray,
             minimize_to_tray: self.minimize_to_tray,
             tray_usage_tip: self.tray_usage_tip,
+            autostart: self.autostart,
+            start_in_tray: self.start_in_tray,
             temp_unit: self.temp_unit,
             font_family: self.font_family.clone(),
             bg_image_path: self.bg_image_path.clone(),
@@ -3132,6 +3146,8 @@ impl MiniTaskApp {
             let mut close_to_tray = self.close_to_tray;
             let mut minimize_to_tray = self.minimize_to_tray;
             let mut tray_usage_tip = self.tray_usage_tip;
+            let mut autostart = self.autostart;
+            let mut start_in_tray = self.start_in_tray;
             let mut temp_unit = self.temp_unit;
             let mut font_family = self.font_family.clone();
             let mut bg_image_path = self.bg_image_path.clone();
@@ -3328,6 +3344,18 @@ impl MiniTaskApp {
                                 .small()
                                 .color(ui.visuals().weak_text_color()),
                             );
+
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.label(RichText::new("起動").strong());
+                            ui.checkbox(&mut autostart, "Windows サインイン時に MiniTask を起動する");
+                            ui.add_enabled_ui(tray_icon, |ui| {
+                                ui.checkbox(&mut start_in_tray, "タスクトレイに入った状態で起動する")
+                                    .on_disabled_hover_text("タスクトレイアイコンを有効にしてください");
+                            });
+                            if !tray_icon {
+                                start_in_tray = false;
+                            }
 
                             ui.add_space(8.0);
                             ui.separator();
@@ -3547,6 +3575,24 @@ impl MiniTaskApp {
                 self.last_tray_tip.clear();
             }
             self.tray_usage_tip = tray_usage_tip;
+            if autostart != self.autostart {
+                match std::env::current_exe() {
+                    Ok(exe) => match integration::set_autostart(autostart, &exe.to_string_lossy()) {
+                        Ok(()) => {
+                            self.autostart = autostart;
+                        }
+                        Err(e) => {
+                            self.notify(format!("自動起動の設定に失敗: {e}"));
+                        }
+                    },
+                    Err(e) => self.notify(e.to_string()),
+                }
+            }
+            if !tray_icon {
+                self.start_in_tray = false;
+            } else {
+                self.start_in_tray = start_in_tray;
+            }
             self.temp_unit = temp_unit;
             if font_family != self.font_family {
                 self.theme_dirty = true;
