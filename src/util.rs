@@ -578,14 +578,15 @@ fn paint_curve(
         None
     };
     let inner_h = rect.height() - 4.0;
-    let slot = (rect.width() - 4.0) / HISTORY_LEN.max(n) as f32;
+    // スロット幅は HISTORY_LEN 基準で固定。履歴は HISTORY_LEN+2 まで保持し、
+    // 左端のクリップ外で自然に消えるようにして端点のガクつきを防ぐ。
+    let slot = (rect.width() - 4.0) / HISTORY_LEN as f32;
     let right_x = rect.right() - 2.0;
     let to_y = |v: f32| rect.bottom() - 2.0 - (v / max).clamp(0.0, 1.0) * inner_h;
 
     // 右端基準の配置: サンプル i は (n-1-i) + 1 + 位相 スロットだけ左にある。
-    // 1 スロット余分にずらすことで、最古サンプルが左端を完全に通過した
-    // タイミングで破棄され、次のサンプルが同じ座標に来るため、
-    // 左端での消滅も 1 サンプルも飛ばず連続に見える。
+    // 最古サンプルは左端のクリップ外に残してから破棄するため、左端でも
+    // 線分・スプライン制御点が連続する。
     let mut pts: Vec<Pos2> = Vec::with_capacity(n + 1);
     for (i, v) in values.iter().enumerate() {
         let val = if i + 1 == n {

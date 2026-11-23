@@ -69,7 +69,7 @@ fn push_device_hist(
     };
     let smoothed = smooth_value(hist.back().copied(), value, alpha);
     hist.push_back(smoothed);
-    while hist.len() > HISTORY_LEN {
+    while hist.len() > HISTORY_LEN + 2 {
         hist.pop_front();
     }
 }
@@ -715,7 +715,7 @@ impl MiniTaskApp {
         } else if let Some(&last) = self.cpu_temp_hist.back() {
             self.cpu_temp_hist.push_back(last);
         }
-        while self.cpu_temp_hist.len() > HISTORY_LEN {
+        while self.cpu_temp_hist.len() > HISTORY_LEN + 2 {
             self.cpu_temp_hist.pop_front();
         }
         let gpu_temp_map: HashMap<&str, f32> = s
@@ -729,7 +729,7 @@ impl MiniTaskApp {
             } else if let Some((_, hist)) = self.gpu_temp_hist.iter_mut().find(|(hid, _)| hid == id) {
                 if let Some(&last) = hist.back() {
                     hist.push_back(last);
-                    while hist.len() > HISTORY_LEN {
+                    while hist.len() > HISTORY_LEN + 2 {
                         hist.pop_front();
                     }
                 }
@@ -762,7 +762,7 @@ impl MiniTaskApp {
             alpha,
         );
         self.gpu_mem_hist.push_back(v);
-        while self.gpu_mem_hist.len() > HISTORY_LEN {
+        while self.gpu_mem_hist.len() > HISTORY_LEN + 2 {
             self.gpu_mem_hist.pop_front();
         }
         let v = smooth_value(
@@ -771,7 +771,7 @@ impl MiniTaskApp {
             alpha,
         );
         self.npu_mem_hist.push_back(v);
-        while self.npu_mem_hist.len() > HISTORY_LEN {
+        while self.npu_mem_hist.len() > HISTORY_LEN + 2 {
             self.npu_mem_hist.pop_front();
         }
         // 切断されたデバイスの履歴を破棄 (再接続時は新しい履歴から開始)
@@ -825,12 +825,12 @@ impl MiniTaskApp {
         for (hist, val) in self.core_hist.iter_mut().zip(s.core_usage.iter()) {
             let smoothed = smooth_value(hist.back().copied(), *val, alpha);
             hist.push_back(smoothed);
-            while hist.len() > HISTORY_LEN {
+            while hist.len() > HISTORY_LEN + 2 {
                 hist.pop_front();
             }
         }
         for hist in [&mut self.cpu_hist, &mut self.mem_hist] {
-            while hist.len() > HISTORY_LEN {
+            while hist.len() > HISTORY_LEN + 2 {
                 hist.pop_front();
             }
         }
