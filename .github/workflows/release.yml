@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+      - 'latest'
 
 permissions:
   contents: write
@@ -26,6 +27,7 @@ jobs:
         run: powershell -ExecutionPolicy Bypass -File installer\build.ps1
 
       - name: Create GitHub Release
+        if: startsWith(github.ref_name, 'v')
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -33,3 +35,16 @@ jobs:
           $tag = '${{ github.ref_name }}'
           if (gh release view $tag 2>$null) { gh release delete $tag --yes }
           gh release create $tag dist\MiniTask-*-setup.exe --generate-notes --title "MiniTask $tag"
+
+      - name: Maintain latest release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $fixed = "dist\MiniTask-setup.exe"
+          Copy-Item dist\MiniTask-*-setup.exe $fixed -Force
+          if (gh release view latest 2>$null) { gh release delete latest --yes --cleanup-tag }
+          gh release create latest $fixed --target ${{ github.sha }} --title "最新ビルド (latest)" --notes "このリリースは常に最新ビルドを指します。`n`n直リンク: https://github.com/${{ github.repository }}/releases/download/latest/MiniTask-setup.exe"
+          # アプリ内更新は releases/latest API (バージョン付き) を参照するため、バージョン付きリリースの Latest フラグを再固定する
+          $newest = gh api "repos/${{ github.repository }}/releases?per_page=100" --jq '[.[] | select(.prerelease == false and .draft == false and (.tag_name | startswith("v")))][0].tag_name'
+          if ($newest) { gh release edit $newest --latest }
