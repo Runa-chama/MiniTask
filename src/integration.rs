@@ -1,6 +1,7 @@
 //! OS 連携: 起動置換 (IFEO) / シェルメニュー / ウィンドウ操作。
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+use windows_sys::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
 use windows_sys::Win32::Security::{
     GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
 };
@@ -454,6 +455,59 @@ pub fn try_hide_minimized_window() -> bool {
 pub fn hide_main_window() {
     unsafe {
         EnumWindows(Some(enum_hide_proc), std::ptr::null_mut::<bool>() as isize);
+    }
+}
+
+/// メインウィンドウをクロークする。DWM の合成は続くが画面には表示されない。
+/// トレイ復帰時に「白フラッシュ」を防ぐため、表示→描画→クローク解除の順に使う。
+pub fn cloak_main_window(cloak: bool) {
+    unsafe extern "system" fn proc(hwnd: Handle, lparam: isize) -> i32 {
+        unsafe {
+            let len = GetWindowTextLengthW(hwnd);
+            if len > 0 {
+                let mut title = vec![0u16; (len + 1) as usize];
+                GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+                let text = String::from_utf16_lossy(&title);
+                if text.trim_end_matches('\0') == "MiniTask" {
+                    let cloak_val: i32 = if lparam != 0 { 1 } else { 0 };
+                    let _ = DwmSetWindowAttribute(
+                        hwnd as HWND,
+                        DWMWA_CLOAK as u32,
+                        &cloak_val as *const i32 as *const _,
+                        std::mem::size_of::<i32>() as u32,
+                    );
+                    return 0;
+                }
+            }
+            1
+        }
+    }
+    unsafe {
+        EnumWindows(Some(proc), if cloak { 1 } else { 0 });
+    }
+}
+
+/// メインウィンドウを表示する (トレイ格納/最小化どちらからも復帰)。
+pub fn show_main_window() {
+    unsafe extern "system" fn proc(hwnd: Handle, _lparam: isize) -> i32 {
+        unsafe {
+            let len = GetWindowTextLengthW(hwnd);
+            if len > 0 {
+                let mut title = vec![0u16; (len + 1) as usize];
+                GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+                let text = String::from_utf16_lossy(&title);
+                if text.trim_end_matches('\0') == "MiniTask" {
+                    let cmd = if IsIconic(hwnd) != 0 { SW_RESTORE } else { SW_SHOW };
+                    ShowWindow(hwnd, cmd);
+                    bring_to_front(hwnd);
+                    return 0;
+                }
+            }
+            1
+        }
+    }
+    unsafe {
+        EnumWindows(Some(proc), 0);
     }
 }
 

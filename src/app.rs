@@ -311,6 +311,8 @@ pub struct MiniTaskApp {
     start_in_tray_pending: bool,
     /// トレイメニュー「終了」など明示的な終了要求
     exit_requested: bool,
+    /// トレイ復帰直後、1フレーム描画してから DWM クロークを解除する
+    pending_uncloak: bool,
     last_tray_tip: String,
     last_tray_check: Instant,
     tray_handle: Option<crate::tray::TrayHandle>,
@@ -632,6 +634,7 @@ impl MiniTaskApp {
             start_in_tray: settings.start_in_tray,
             start_in_tray_pending: settings.start_in_tray && settings.tray_icon,
             exit_requested: false,
+            pending_uncloak: false,
             last_tray_tip: String::new(),
             last_tray_check: Instant::now() - Duration::from_secs(1),
             tray_handle,
@@ -1030,6 +1033,11 @@ impl eframe::App for MiniTaskApp {
             integration::trim_working_set();
             self.trim_at = None;
         }
+        // トレイ復帰: 1フレーム描画したらクローク解除して画面に出す
+        if self.pending_uncloak {
+            integration::cloak_main_window(false);
+            self.pending_uncloak = false;
+        }
         // F11 でフルスクリーン切替
         if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
             self.fullscreen = !self.fullscreen;
@@ -1040,9 +1048,13 @@ impl eframe::App for MiniTaskApp {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
                     crate::tray::TrayMsg::Open => {
+                        // 白フラッシュ防止: クロークしたまま表示→描画→次フレームでクローク解除
+                        integration::cloak_main_window(true);
+                        integration::show_main_window();
                         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                        integration::focus_window();
+                        ctx.request_repaint();
+                        self.pending_uncloak = true;
                     }
                     crate::tray::TrayMsg::Exit => {
                         // トレイ格納中でも確実に終了させる
