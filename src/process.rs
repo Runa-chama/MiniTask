@@ -215,6 +215,10 @@ pub struct FastMetrics {
     pub adapters: Vec<(String, f64, f64)>,
     pub gpu_dedicated: u64,
     pub npu_dedicated: u64,
+    /// CPU 温度 (摂氏)
+    pub cpu_temp_c: Option<f32>,
+    /// (GPU ID, 温度摂氏)
+    pub gpu_temps: Vec<(String, f32)>,
 }
 
 impl ProcCollector {
@@ -304,6 +308,19 @@ impl ProcCollector {
             })
             .collect();
         let gpu_mem = self.gpu_memory_meter.read(&snapshot.gpu_luids);
+        let cpu_temp_c = self.cpu_temp_probe.read();
+        let gpu_temp_values = crate::temperature::gpu_temps();
+        let gpu_temps: Vec<(String, f32)> = gpus
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (id, _))| {
+                gpu_temp_values
+                    .get(index)
+                    .copied()
+                    .flatten()
+                    .map(|t| (id.clone(), t))
+            })
+            .collect();
 
         FastMetrics {
             cpu,
@@ -317,6 +334,8 @@ impl ProcCollector {
             adapters,
             gpu_dedicated: gpu_mem.gpu_dedicated,
             npu_dedicated: gpu_mem.npu_dedicated,
+            cpu_temp_c,
+            gpu_temps,
         }
     }
 

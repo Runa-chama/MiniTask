@@ -357,6 +357,9 @@ struct PerfSample {
     adapters: Vec<(String, f64, f64)>,
     gpu_dedicated: u64,
     npu_dedicated: u64,
+    cpu_temp_c: Option<f32>,
+    /// (GPU ID, 温度摂氏)
+    gpu_temps: Vec<(String, f32)>,
 }
 
 impl PerfSample {
@@ -396,6 +399,19 @@ impl PerfSample {
                 .collect(),
             gpu_dedicated: load.gpu_dedicated,
             npu_dedicated: load.npu_dedicated,
+            cpu_temp_c: load.cpu_temp_c,
+            gpu_temps: load
+                .gpus
+                .iter()
+                .enumerate()
+                .filter_map(|(index, g)| {
+                    load.gpu_temps
+                        .get(index)
+                        .copied()
+                        .flatten()
+                        .map(|t| (g.id.clone(), t))
+                })
+                .collect(),
         }
     }
 
@@ -412,6 +428,8 @@ impl PerfSample {
             adapters: m.adapters.clone(),
             gpu_dedicated: m.gpu_dedicated,
             npu_dedicated: m.npu_dedicated,
+            cpu_temp_c: m.cpu_temp_c,
+            gpu_temps: m.gpu_temps.clone(),
         }
     }
 }
@@ -657,18 +675,6 @@ impl MiniTaskApp {
             }
 
             self.load = load;
-            // 温度の推移を記録 (摂氏で保持し、表示時に単位を変換する)
-            if let Some(t) = self.load.cpu_temp_c {
-                self.cpu_temp_hist.push_back(t);
-                while self.cpu_temp_hist.len() > HISTORY_LEN {
-                    self.cpu_temp_hist.pop_front();
-                }
-            }
-            for (index, temp) in self.load.gpu_temps.iter().enumerate() {
-                if let (Some(t), Some(g)) = (temp, self.load.gpus.get(index)) {
-                    push_device_hist(&mut self.gpu_temp_hist, &g.id, *t, 1.0);
-                }
-            }
             self.normalize_selection();
             if let Some(pid) = self.selected {
                 if !self.rows.iter().any(|r| r.pid == pid) {
@@ -703,6 +709,35 @@ impl MiniTaskApp {
             .push_back(smooth_value(self.cpu_hist.back().copied(), s.cpu, alpha));
         self.mem_hist
             .push_back(smooth_value(self.mem_hist.back().copied(), s.mem_pct, alpha));
+        if let Some(t) = s.cpu_temp_c {
+            let v = smooth_value(self.cpu_temp_hist.back().copied(), t, alpha);
+            self.cpu_temp_hist.push_back(v);
+        } else if let Some(&last) = self.cpu_temp_hist.back() {
+            self.cpu_temp_hist.push_back(last);
+        }
+        while self.cpu_temp_hist.len() > HISTORY_LEN {
+            self.cpu_temp_hist.pop_front();
+        }
+        let gpu_temp_map: HashMap<&str, f32> = s
+            .gpu_temps
+            .iter()
+            .map(|(id, t)| (id.as_str(), *t))
+            .collect();
+        for (id, _) in &s.gpus {
+            if let Some(t) = gpu_temp_map.get(id.as_str()) {
+                push_device_hist(&mut self.gpu_temp_hist, id, *t, alpha);
+            } else if let Some((_, hist)) = self.gpu_temp_hist.iter_mut().find(|(hid, _)| hid == id) {
+                if let Some(&last) = hist.back() {
+                    hist.push_back(last);
+                    while hist.len() > HISTORY_LEN {
+                        hist.pop_front();
+                    }
+                }
+            }
+        }
+        let gpu_ids: HashSet<&str> = s.gpus.iter().map(|(id, _)| id.as_str()).collect();
+        self.gpu_temp_hist
+            .retain(|(id, _)| gpu_ids.contains(id.as_str()));
 
         // 接続中のデバイスごとに履歴を更新
         for (id, active, read, write) in &s.disks {
