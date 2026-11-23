@@ -3,7 +3,7 @@
 
 #define MyAppName "MiniTask"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.3.3"
+  #define MyAppVersion "0.3.4"
 #endif
 #define MyAppExeName "minitask.exe"
 #define MyIFEOKey "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe"

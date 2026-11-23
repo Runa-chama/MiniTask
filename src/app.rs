@@ -3123,17 +3123,21 @@ impl MiniTaskApp {
                 .collapsible(false)
                 .resizable(true)
                 .order(egui::Order::Foreground)
-                .default_width(620.0)
+                .default_size([620.0, 560.0])
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut page, 0, "外観");
-                        ui.selectable_value(&mut page, 1, "グラフと更新");
+                        ui.selectable_value(&mut page, 1, "グラフと更新間隔");
                         ui.selectable_value(&mut page, 2, "動作");
                         ui.selectable_value(&mut page, 3, "システム統合");
                     });
                     ui.separator();
-                    egui::ScrollArea::vertical().max_height(480.0).show(ui, |ui| match page {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .min_scrolled_height(440.0)
+                        .max_height(440.0)
+                        .show(ui, |ui| match page {
                         0 => {
                             ui.label(RichText::new("テーマ").strong());
                             ui.horizontal(|ui| {
@@ -3255,14 +3259,14 @@ impl MiniTaskApp {
                         }
                         2 => {
                             ui.checkbox(&mut top, "常に手前に表示");
+                            ui.add_space(8.0);
                             ui.label(RichText::new("起動時に開くタブ").strong());
                             ui.radio_value(&mut tab_mode, 0, "前回のタブを復元");
                             ui.radio_value(&mut tab_mode, 1, "常にプロセス");
                             ui.radio_value(&mut tab_mode, 2, "常にパフォーマンス");
                             ui.add_space(8.0);
                             ui.checkbox(&mut confirm, "タスク終了時に確認ダイアログを表示");
-                            ui.checkbox(&mut minimize_to_tray, "最小化ボタンでもトレイに格納する")
-                                .on_hover_text("タスクトレイアイコンが有効な場合に限ります");
+                            ui.add_space(8.0);
                             ui.label(RichText::new("温度の単位").strong());
                             ui.horizontal(|ui| {
                                 ui.radio_value(&mut temp_unit, 0, "摂氏 (°C)");
@@ -3270,22 +3274,14 @@ impl MiniTaskApp {
                             });
                         }
                         _ => {
-                            ui.checkbox(&mut replace, "タスクマネージャーの代わりにMiniTaskを起動")
-                                .on_hover_text(
-                                    "Ctrl+Shift+Esc やタスクバーからタスクマネージャーを開くと MiniTask が起動します",
-                                );
-                            ui.label(
-                                RichText::new(format!(
-                                    "現在の状態: {}",
-                                    if ifeo_active { "有効" } else { "無効" }
-                                ))
-                                .small()
-                                .color(ui.visuals().weak_text_color()),
-                            );
-                            ui.add_space(8.0);
+                            ui.label(RichText::new("タスクトレイ").strong());
                             ui.checkbox(&mut tray_icon, "タスクトレイにアイコンを常駐する");
                             ui.checkbox(&mut close_to_tray, "閉じるボタンでトレイに格納する")
-                                .on_hover_text("有効時、×ボタンは終了せずトレイへ格納します。完全終了はトレイアイコンの右クリックメニューから行います。");
+                                .on_hover_text(
+                                    "有効時、×ボタンは終了せずトレイへ格納します。完全終了はトレイアイコンの右クリックメニューから行います。",
+                                );
+                            ui.checkbox(&mut minimize_to_tray, "最小化ボタンでもトレイに格納する")
+                                .on_hover_text("タスクトレイアイコンが有効な場合に限ります");
                             ui.checkbox(
                                 &mut tray_usage_tip,
                                 "トレイアイコンのツールチップに CPU/メモリ使用率を表示",
@@ -3298,14 +3294,30 @@ impl MiniTaskApp {
                                 .small()
                                 .color(ui.visuals().weak_text_color()),
                             );
-                            ui.add_space(6.0);
+
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.label(RichText::new("タスクマネージャー置換").strong());
+                            ui.checkbox(&mut replace, "タスクマネージャーの代わりにMiniTaskを起動")
+                                .on_hover_text(
+                                    "Ctrl+Shift+Esc やタスクバーからタスクマネージャーを開くと MiniTask が起動します",
+                                );
                             ui.label(
-                                RichText::new(
-                                    "システム統合の切替には管理者権限が必要です。",
-                                )
+                                RichText::new(format!(
+                                    "現在の状態: {}",
+                                    if ifeo_active { "有効" } else { "無効" }
+                                ))
                                 .small()
-                                .color(self.palette.warn),
+                                .color(ui.visuals().weak_text_color()),
                             );
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new("システム統合の切替には管理者権限が必要です。")
+                                    .small()
+                                    .color(self.palette.warn),
+                            );
+
+                            ui.add_space(8.0);
                             ui.separator();
                             ui.label(RichText::new("アップデート").strong());
                             ui.label(
