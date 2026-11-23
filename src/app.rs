@@ -322,6 +322,11 @@ pub struct MiniTaskApp {
     // --- 表示設定 / モード ---
     temp_unit: u8,
     font_family: String,
+    font_families: Vec<String>,
+    font_picker_open: bool,
+    font_picker_search: String,
+    font_picker_preview: String,
+    font_picker_original: String,
     bg_image_path: String,
     bg_fit: u8,
     bg_overlay_alpha: u8,
@@ -609,6 +614,11 @@ impl MiniTaskApp {
             last_update_check: settings.last_update_check,
             temp_unit: settings.temp_unit,
             font_family: settings.font_family.clone(),
+            font_families: util::installed_font_families(),
+            font_picker_open: false,
+            font_picker_search: String::new(),
+            font_picker_preview: "MiniTask 0123 あいう漢字 — 軽量タスクマネージャー".to_owned(),
+            font_picker_original: String::new(),
             bg_texture,
             bg_image_path: settings.bg_image_path,
             bg_fit: settings.bg_fit,
@@ -3182,19 +3192,14 @@ impl MiniTaskApp {
                             }
                             ui.separator();
                             ui.label(RichText::new("フォント").strong());
-                            egui::ComboBox::from_id_salt("settings_font")
-                                .selected_text(font_family.clone())
-                                .show_ui(ui, |ui| {
-                                    for name in [
-                                        "Meiryo",
-                                        "Yu Gothic",
-                                        "MS Gothic",
-                                        "BIZ UDGothic",
-                                        "Segoe UI",
-                                    ] {
-                                        ui.selectable_value(&mut font_family, name.to_owned(), name);
-                                    }
-                                });
+                            ui.horizontal(|ui| {
+                                ui.label(&font_family);
+                                if ui.button("選択...").clicked() {
+                                    self.font_picker_open = true;
+                                    self.font_picker_original = font_family.clone();
+                                    self.font_picker_search.clear();
+                                }
+                            });
                             ui.separator();
                             ui.label(RichText::new("背景画像").strong());
                             ui.horizontal(|ui| {
@@ -3361,6 +3366,102 @@ impl MiniTaskApp {
                         }
                     });
                 });
+
+            // フォント選択ダイアログ
+            if self.font_picker_open {
+                let mut picker_open = true;
+                let mut confirmed = false;
+                let mut canceled = false;
+                egui::Window::new("フォントの選択")
+                    .open(&mut picker_open)
+                    .collapsible(false)
+                    .resizable(true)
+                    .default_size([520.0, 420.0])
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        ui.label("フォント名で検索");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.font_picker_search)
+                                .hint_text("例: Meiryo, Segoe ...")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.add_space(4.0);
+                        ui.label("プレビュー文字列");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.font_picker_preview)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.add_space(4.0);
+                        ui.group(|ui| {
+                            ui.label(
+                                RichText::new(&self.font_picker_preview)
+                                    .size(18.0),
+                            );
+                        });
+                        ui.add_space(6.0);
+                        ui.separator();
+                        let query = self.font_picker_search.to_lowercase();
+                        let families = if self.font_families.is_empty() {
+                            vec![
+                                "Meiryo".to_owned(),
+                                "Yu Gothic".to_owned(),
+                                "MS Gothic".to_owned(),
+                                "BIZ UDGothic".to_owned(),
+                                "Segoe UI".to_owned(),
+                            ]
+                        } else {
+                            self.font_families.clone()
+                        };
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                for name in families {
+                                    if !query.is_empty()
+                                        && !name.to_lowercase().contains(&query)
+                                    {
+                                        continue;
+                                    }
+                                    let selected = font_family == name;
+                                    if ui.selectable_label(selected, &name).clicked() {
+                                        if font_family != name {
+                                            font_family = name.clone();
+                                            self.theme_dirty = true;
+                                        }
+                                    }
+                                }
+                            });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("OK").clicked() {
+                                confirmed = true;
+                            }
+                            if ui.button("キャンセル").clicked() {
+                                canceled = true;
+                            }
+                        });
+                    });
+                if confirmed || !picker_open || canceled {
+                    if canceled || (!confirmed && !picker_open) {
+                        // × 閉じ / キャンセルは元のフォントへ戻す
+                        if font_family != self.font_picker_original {
+                            font_family = self.font_picker_original.clone();
+                            self.theme_dirty = true;
+                        }
+                    }
+                    self.font_picker_open = false;
+                }
+            }
+
+            // 設定ウィンドウを閉じるときはフォント選択もキャンセル扱いにする
+            if !open && self.font_picker_open {
+                if font_family != self.font_picker_original {
+                    font_family = self.font_picker_original.clone();
+                    self.theme_dirty = true;
+                }
+                self.font_picker_open = false;
+            }
 
             self.settings_open = open;
             self.settings_page = page;

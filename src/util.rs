@@ -196,65 +196,195 @@ pub fn load_background(ctx: &egui::Context, path: &str) -> Option<egui::TextureH
     ))
 }
 
-/// 指定フォントをシステムフォントから読み込む。
-/// egui 同梱フォントには日本語グリフが無いため必須。
-pub fn setup_fonts(ctx: &egui::Context, family: &str) {
-    let mut fonts = egui::FontDefinitions::default();
+const FONTS_REG_PATH: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts";
+
+/// Windows の Fonts レジストリからフォントファイルを解決する。
+fn resolve_font_file(family: &str) -> Option<std::path::PathBuf> {
     let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_owned());
-    let mut candidates = vec![
+    let fonts_dir = std::path::Path::new(&windir).join("Fonts");
+    let candidates = [
         family.to_owned(),
         format!("{family} (TrueType)"),
         format!("{family} Regular (TrueType)"),
+        format!("{family} (OpenType)"),
+        format!("{family} Regular (OpenType)"),
     ];
-    if family != "Meiryo" {
-        candidates.push("Meiryo (TrueType)".to_owned());
-    }
-    candidates.push("Yu Gothic Regular (TrueType)".to_owned());
-    candidates.push("MS Gothic (TrueType)".to_owned());
+    let to_path = |file: String| -> Option<std::path::PathBuf> {
+        let path = fonts_dir.join(&file);
+        if path.is_file() {
+            return Some(path);
+        }
+        let abs = std::path::PathBuf::from(&file);
+        if abs.is_file() { Some(abs) } else { None }
+    };
+    let family_lower = family.to_lowercase();
 
-    let mut loaded = false;
-    if let Ok(key) = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
-        .open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts")
-    {
+    for hive in [
+        winreg::enums::HKEY_LOCAL_MACHINE,
+        winreg::enums::HKEY_CURRENT_USER,
+    ] {
+        let Ok(key) = winreg::RegKey::predef(hive).open_subkey(FONTS_REG_PATH) else {
+            continue;
+        };
         for name in &candidates {
-            let Ok(file) = key.get_value::<String, _>(name) else {
-                continue;
-            };
-            let path = std::path::Path::new(&windir).join("Fonts").join(file);
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            fonts
-                .font_data
-                .insert("user".to_owned(), egui::FontData::from_owned(bytes).into());
-            if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-                f.insert(0, "user".to_owned());
+            if let Ok(file) = key.get_value::<String, _>(name) {
+                if let Some(p) = to_path(file) {
+                    return Some(p);
+                }
             }
-            if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-                f.insert(0, "user".to_owned());
+        }
+        // 正規化名での完全一致/先頭一致 (例: "BIZ UDGothic" -> "BIZ UDGothic & BIZ UDPGothic")
+        for (name, _) in key.enum_values().flatten() {
+            let clean = name
+                .replace(" (TrueType)", "")
+                .replace(" (OpenType)", "")
+                .trim()
+                .to_owned();
+            let head = clean.split('&').next().unwrap_or(&clean).trim().to_lowercase();
+            if head == family_lower || clean.to_lowercase() == family_lower {
+                if let Ok(file) = key.get_value::<String, _>(&name) {
+                    if let Some(p) = to_path(file) {
+                        return Some(p);
+                    }
+                }
             }
-            loaded = true;
-            break;
         }
     }
-    if !loaded {
+    None
+}
+
+/// フォントファミリー名からフォントデータを読み込む。
+fn load_font_data(family: &str) -> Option<(Vec<u8>, std::path::PathBuf)> {
+    let path = resolve_font_file(family)?;
+    let bytes = std::fs::read(&path).ok()?;
+    Some((bytes, path))
+}
+
+/// 指定フォントをシステムフォントから読み込む。
+/// egui 同梱フォントには日本語グリフが無いため、日本語フォールバックを常に積む。
+pub fn setup_fonts(ctx: &egui::Context, family: &str) {
+    let mut fonts = egui::FontDefinitions::default();
+    let mut inserted: Vec<String> = Vec::new();
+
+    // 主フォント
+    let mut primary_path: Option<std::path::PathBuf> = None;
+    if let Some((bytes, path)) = load_font_data(family) {
+        primary_path = Some(path);
+        fonts
+            .font_data
+            .insert("primary".to_owned(), egui::FontData::from_owned(bytes).into());
+        inserted.push("primary".to_owned());
+    }
+
+    // CJK フォールバック (主フォントが日本語を含まない場合の文字化け防止)
+    for fallback in ["Meiryo", "Yu Gothic UI", "Yu Gothic", "MS Gothic", "BIZ UDGothic"] {
+        let Some((bytes, path)) = load_font_data(fallback) else {
+            continue;
+        };
+        if primary_path.as_ref().is_some_and(|p| p == &path) {
+            continue;
+        }
+        fonts.font_data.insert(
+            "cjk_fallback".to_owned(),
+            egui::FontData::from_owned(bytes).into(),
+        );
+        inserted.push("cjk_fallback".to_owned());
+        break;
+    }
+
+    // 何も読めなかった場合の最終フォールバック (ファイル直接指定)
+    if inserted.is_empty() {
+        let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_owned());
         for file in ["meiryo.ttc", "YuGothR.ttc", "msgothic.ttc"] {
             let path = std::path::Path::new(&windir).join("Fonts").join(file);
             if let Ok(bytes) = std::fs::read(&path) {
-                fonts
-                    .font_data
-                    .insert("user".to_owned(), egui::FontData::from_owned(bytes).into());
-                if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-                    f.insert(0, "user".to_owned());
-                }
-                if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-                    f.insert(0, "user".to_owned());
-                }
+                fonts.font_data.insert(
+                    "cjk_fallback".to_owned(),
+                    egui::FontData::from_owned(bytes).into(),
+                );
+                inserted.push("cjk_fallback".to_owned());
                 break;
             }
         }
     }
+
+    for family_key in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        if let Some(f) = fonts.families.get_mut(&family_key) {
+            for (i, name) in inserted.iter().enumerate() {
+                f.insert(i, name.clone());
+            }
+        }
+    }
     ctx.set_fonts(fonts);
+}
+
+/// PC にインストールされているフォントファミリー名を列挙する。
+pub fn installed_font_families() -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    let style_suffixes = [
+        " Bold Italic",
+        " Bold Oblique",
+        " Bold",
+        " Italic",
+        " Oblique",
+        " Light Italic",
+        " Light",
+        " Semibold Italic",
+        " Semibold",
+        " Semilight Italic",
+        " Semilight",
+        " Medium Italic",
+        " Medium",
+        " Thin Italic",
+        " Thin",
+        " Black Italic",
+        " Black",
+        " ExtraBold Italic",
+        " ExtraBold",
+        " Heavy Italic",
+        " Heavy",
+        " Condensed",
+        " Narrow",
+        " Regular",
+    ];
+    for hive in [
+        winreg::enums::HKEY_LOCAL_MACHINE,
+        winreg::enums::HKEY_CURRENT_USER,
+    ] {
+        let Ok(key) = winreg::RegKey::predef(hive).open_subkey(FONTS_REG_PATH) else {
+            continue;
+        };
+        for (name, _) in key.enum_values().flatten() {
+            let mut n = name
+                .replace(" (TrueType)", "")
+                .replace(" (OpenType)", "")
+                .trim()
+                .to_owned();
+            if n.is_empty() || n.starts_with('@') {
+                continue;
+            }
+            // "Arial & Arial Black" のような複合エントリは先頭名を代表にする
+            if let Some((head, _)) = n.split_once('&') {
+                let head = head.trim();
+                if !head.is_empty() {
+                    n = head.to_owned();
+                }
+            }
+            for suffix in style_suffixes {
+                if n.len() > suffix.len() && n.ends_with(suffix) {
+                    n = n[..n.len() - suffix.len()].trim().to_owned();
+                    break;
+                }
+            }
+            if !n.is_empty() {
+                set.insert(n);
+            }
+        }
+    }
+    let mut v: Vec<String> = set.into_iter().collect();
+    v.sort_by_key(|s| s.to_lowercase());
+    v
 }
 
 /// 摂氏の温度を設定された単位の表示文字列に変換する (0=°C, 1=°F)。
