@@ -53,8 +53,6 @@ pub struct AppSettings {
     pub temp_unit: u8,
     /// 使用するフォント (空=自動)
     pub font_family: String,
-    /// フォントサイズ倍率 (%), 80〜140
-    pub font_scale: u16,
     /// 背景画像のファイルパス (空=無効)
     pub bg_image_path: String,
     /// 背景画像の上に乗せる背景色の不透明度 (0〜100)
@@ -102,9 +100,8 @@ impl Default for AppSettings {
             tray_usage_tip: true,
             temp_unit: 0,
             font_family: "Meiryo".to_owned(),
-            font_scale: 100,
             bg_image_path: String::new(),
-            bg_overlay_alpha: 60,
+            bg_overlay_alpha: 40,
             window_opacity: 100,
             last_update_check: 0,
         }
@@ -203,9 +200,6 @@ impl AppSettings {
         s.font_family = key
             .get_value::<String, _>("FontFamily")
             .unwrap_or_else(|_| s.font_family);
-        if let Ok(v) = key.get_value::<u32, _>("FontScale") {
-            s.font_scale = v.clamp(80, 140) as u16;
-        }
         s.bg_image_path = key
             .get_value::<String, _>("BgImagePath")
             .unwrap_or_else(|_| s.bg_image_path);
@@ -251,7 +245,6 @@ impl AppSettings {
         let _ = key.set_value("TrayUsageTip", &(self.tray_usage_tip as u32));
         let _ = key.set_value("TempUnit", &(self.temp_unit as u32));
         let _ = key.set_value("FontFamily", &self.font_family);
-        let _ = key.set_value("FontScale", &(self.font_scale as u32));
         let _ = key.set_value("BgImagePath", &self.bg_image_path);
         let _ = key.set_value("BgOverlayAlpha", &(self.bg_overlay_alpha as u32));
         let _ = key.set_value("WindowOpacity", &(self.window_opacity as u32));
@@ -294,7 +287,6 @@ impl AppSettings {
             && self.tray_usage_tip == other.tray_usage_tip
             && self.temp_unit == other.temp_unit
             && self.font_family == other.font_family
-            && self.font_scale == other.font_scale
             && self.bg_image_path == other.bg_image_path
             && self.bg_overlay_alpha == other.bg_overlay_alpha
             && self.window_opacity == other.window_opacity

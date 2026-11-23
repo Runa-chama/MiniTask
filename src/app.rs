@@ -322,7 +322,6 @@ pub struct MiniTaskApp {
     // --- 表示設定 / モード ---
     temp_unit: u8,
     font_family: String,
-    font_scale: u16,
     bg_image_path: String,
     bg_overlay_alpha: u8,
     bg_texture: Option<egui::TextureHandle>,
@@ -475,6 +474,11 @@ impl MiniTaskApp {
                 Err(e) => (None, Some(e)),
             }
         };
+        let bg_texture = if settings.bg_image_path.is_empty() {
+            None
+        } else {
+            util::load_background(ctx, &settings.bg_image_path)
+        };
         let mut app = Self {
             collector,
             rows: Vec::new(),
@@ -601,12 +605,7 @@ impl MiniTaskApp {
             last_update_check: settings.last_update_check,
             temp_unit: settings.temp_unit,
             font_family: settings.font_family.clone(),
-            font_scale: settings.font_scale,
-            bg_texture: if settings.bg_image_path.is_empty() {
-                None
-            } else {
-                util::load_background(ctx, &settings.bg_image_path)
-            },
+            bg_texture,
             bg_image_path: settings.bg_image_path,
             bg_overlay_alpha: settings.bg_overlay_alpha,
             window_opacity: settings.window_opacity,
@@ -945,7 +944,7 @@ impl eframe::App for MiniTaskApp {
         // ウィンドウ透明度は winit がスタイルを初期化し直すことがあるため毎フレーム維持する
         integration::ensure_window_opacity(self.window_opacity);
         if self.theme_dirty {
-            util::setup_fonts(ctx, &self.font_family, self.font_scale);
+            util::setup_fonts(ctx, &self.font_family);
             util::setup_theme(ctx, self.dark_mode, &self.palette);
             ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
                 if self.always_on_top {
@@ -1083,27 +1082,9 @@ impl eframe::App for MiniTaskApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // 背景画像を最背面に描画し、その上に半透明の背景色を重ねる
-        if let Some(tex) = &self.bg_texture {
-            let screen = ui.ctx().content_rect();
-            let painter = ui.ctx().layer_painter(egui::LayerId::new(
-                egui::Order::Background,
-                egui::Id::unique("minitask_bg_image"),
-            ));
-            painter.image(
-                tex.id(),
-                screen,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
-            let fill = ui.visuals().panel_fill;
-            let alpha = (self.bg_overlay_alpha as f32 * 2.55).round().min(255.0) as u8;
-            painter.rect_filled(
-                screen,
-                egui::CornerRadius::ZERO,
-                egui::Color32::from_rgba_premultiplied(fill.r(), fill.g(), fill.b(), alpha),
-            );
-            ui.visuals_mut().panel_fill = egui::Color32::TRANSPARENT;
+        // テクスチャは最初の描画フレームで読み込む (レンダラー初期化後)
+        if self.bg_texture.is_none() && !self.bg_image_path.is_empty() {
+            self.bg_texture = util::load_background(ui.ctx(), &self.bg_image_path);
         }
         // モーダル表示中は背面をグレー化して操作できないようにする
         let modal = self.any_modal();
@@ -1118,7 +1099,31 @@ impl eframe::App for MiniTaskApp {
                     self.status_bar(ui);
                 });
 
-            egui::CentralPanel::default().show(ui, |ui| {
+            // 背景画像があるときは枠も背景色も持たないパネルを使う
+            let central = if self.bg_texture.is_some() {
+                egui::CentralPanel::no_frame()
+            } else {
+                egui::CentralPanel::default()
+            };
+            central.show(ui, |ui| {
+                if let Some(tex) = &self.bg_texture {
+                    // 画像 → 半透明の背景色の順に同じレイヤーへ描画する
+                    let rect = ui.max_rect();
+                    let painter = ui.painter();
+                    painter.image(
+                        tex.id(),
+                        rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                    let fill = ui.visuals().panel_fill;
+                    let alpha = (self.bg_overlay_alpha as f32 * 2.55).round().min(255.0) as u8;
+                    painter.rect_filled(
+                        rect,
+                        egui::CornerRadius::ZERO,
+                        egui::Color32::from_rgba_premultiplied(fill.r(), fill.g(), fill.b(), alpha),
+                    );
+                }
                 self.header(ui);
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
@@ -1209,7 +1214,6 @@ impl MiniTaskApp {
             tray_usage_tip: self.tray_usage_tip,
             temp_unit: self.temp_unit,
             font_family: self.font_family.clone(),
-            font_scale: self.font_scale,
             bg_image_path: self.bg_image_path.clone(),
             bg_overlay_alpha: self.bg_overlay_alpha,
             window_opacity: self.window_opacity,
@@ -3020,7 +3024,6 @@ impl MiniTaskApp {
             let mut tray_usage_tip = self.tray_usage_tip;
             let mut temp_unit = self.temp_unit;
             let mut font_family = self.font_family.clone();
-            let mut font_scale = self.font_scale;
             let mut bg_image_path = self.bg_image_path.clone();
             let mut bg_overlay_alpha = self.bg_overlay_alpha;
             let mut window_opacity = self.window_opacity;
@@ -3105,9 +3108,6 @@ impl MiniTaskApp {
                                         ui.selectable_value(&mut font_family, name.to_owned(), name);
                                     }
                                 });
-                            ui.add(
-                                egui::Slider::new(&mut font_scale, 80..=140).text("サイズ (%)"),
-                            );
                             ui.separator();
                             ui.label(RichText::new("背景画像").strong());
                             ui.horizontal(|ui| {
@@ -3307,11 +3307,10 @@ impl MiniTaskApp {
             }
             self.tray_usage_tip = tray_usage_tip;
             self.temp_unit = temp_unit;
-            if font_family != self.font_family || font_scale != self.font_scale {
+            if font_family != self.font_family {
                 self.theme_dirty = true;
             }
             self.font_family = font_family;
-            self.font_scale = font_scale;
             if bg_image_path != self.bg_image_path {
                 self.bg_image_path = bg_image_path.clone();
                 self.bg_texture = if bg_image_path.is_empty() {

@@ -198,7 +198,7 @@ pub fn load_background(ctx: &egui::Context, path: &str) -> Option<egui::TextureH
 
 /// 指定フォントをシステムフォントから読み込む。
 /// egui 同梱フォントには日本語グリフが無いため必須。
-pub fn setup_fonts(ctx: &egui::Context, family: &str, scale: u16) {
+pub fn setup_fonts(ctx: &egui::Context, family: &str) {
     let mut fonts = egui::FontDefinitions::default();
     let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_owned());
     let mut candidates = vec![
@@ -255,14 +255,6 @@ pub fn setup_fonts(ctx: &egui::Context, family: &str, scale: u16) {
         }
     }
     ctx.set_fonts(fonts);
-
-    // サイズ倍率を全テキストスタイルへ適用 (theme は visuals のみを上書きするため維持される)
-    let factor = (scale as f32 / 100.0).clamp(0.8, 1.4);
-    ctx.global_style_mut(|style| {
-        for font in style.text_styles.values_mut() {
-            font.size *= factor;
-        }
-    });
 }
 
 /// 摂氏の温度を設定された単位の表示文字列に変換する (0=°C, 1=°F)。

@@ -90,7 +90,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             let settings = crate::settings::AppSettings::load();
-            util::setup_fonts(&cc.egui_ctx, &settings.font_family, settings.font_scale);
+            util::setup_fonts(&cc.egui_ctx, &settings.font_family);
             Ok(Box::new(app::MiniTaskApp::new(&cc.egui_ctx)))
         }),
     )
