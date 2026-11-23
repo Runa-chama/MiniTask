@@ -1184,12 +1184,50 @@ impl eframe::App for MiniTaskApp {
 
             // 背景画像があるときはテーマ側でパネルが透明になるため既定のパネルでよい
             egui::CentralPanel::default().show(ui, |ui| {
-                self.header(ui);
-                ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.tab, Tab::Processes, "  プロセス  ");
                     ui.selectable_value(&mut self.tab, Tab::Performance, "  パフォーマンス  ");
                     ui.selectable_value(&mut self.tab, Tab::Startup, "  スタートアップ  ");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(info) = &self.update_info {
+                            let label = format!("更新あり ({})", info.version);
+                            if ui
+                                .button(RichText::new(label).color(self.palette.warn))
+                                .on_hover_text("クリックして設定から更新できます")
+                                .clicked()
+                            {
+                                self.settings_open = true;
+                                self.settings_page = 3;
+                            }
+                        }
+                        if ui.button("設定").clicked() {
+                            self.settings_open = true;
+                        }
+                        if self.replace_taskmgr {
+                            let button = if let Some(tex) = &self.taskmgr_icon {
+                                egui::Button::image(
+                                    egui::Image::from_texture(tex)
+                                        .fit_to_exact_size(Vec2::splat(18.0)),
+                                )
+                            } else {
+                                egui::Button::new("TM")
+                            };
+                            if ui
+                                .add(button)
+                                .on_hover_text("タスクマネージャーを開く")
+                                .clicked()
+                            {
+                                match integration::pause_ifeo_for_taskmgr() {
+                                    Ok(old) => {
+                                        if let Some(v) = old {
+                                            self.ifeo_restore = Some((v, Instant::now()));
+                                        }
+                                    }
+                                    Err(e) => self.notify(e),
+                                }
+                            }
+                        }
+                    });
                 });
                 ui.separator();
                 match self.tab {
@@ -1280,50 +1318,6 @@ impl MiniTaskApp {
             window_opacity: self.window_opacity,
             last_update_check: self.last_update_check,
         }
-    }
-
-    fn header(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if let Some(info) = &self.update_info {
-                    let label = format!("更新あり ({})", info.version);
-                    if ui
-                        .button(RichText::new(label).color(self.palette.warn))
-                        .on_hover_text("クリックして設定から更新できます")
-                        .clicked()
-                    {
-                        self.settings_open = true;
-                        self.settings_page = 3;
-                    }
-                }
-                if ui.button("設定").clicked() {
-                    self.settings_open = true;
-                }
-                if self.replace_taskmgr {
-                    let button = if let Some(tex) = &self.taskmgr_icon {
-                        egui::Button::image(
-                            egui::Image::from_texture(tex).fit_to_exact_size(Vec2::splat(18.0)),
-                        )
-                    } else {
-                        egui::Button::new("TM")
-                    };
-                    if ui
-                        .add(button)
-                        .on_hover_text("タスクマネージャーを開く")
-                        .clicked()
-                    {
-                        match integration::pause_ifeo_for_taskmgr() {
-                            Ok(old) => {
-                                if let Some(v) = old {
-                                    self.ifeo_restore = Some((v, Instant::now()));
-                                }
-                            }
-                            Err(e) => self.notify(e),
-                        }
-                    }
-                }
-            });
-        });
     }
 
     /// プロセスタブの右クリックメニュー: 表示する列を選ぶ。
