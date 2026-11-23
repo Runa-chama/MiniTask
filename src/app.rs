@@ -3197,7 +3197,10 @@ impl MiniTaskApp {
                                                     light_colors.set(i, color);
                                                 }
                                             }
-                                            ui.label(Palette::names()[i]);
+                                            ui.add_sized(
+                                                [128.0, ui.spacing().interact_size.y],
+                                                egui::Label::new(Palette::names()[i]).truncate(),
+                                            );
                                             if ui.small_button("既定").clicked() {
                                                 let c = defaults.as_array()[i];
                                                 if dark {
