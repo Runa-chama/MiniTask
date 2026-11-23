@@ -4,6 +4,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows_sys::Win32::Security::{
     GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
 };
+use windows_sys::Win32::System::ProcessStatus::EmptyWorkingSet;
 use windows_sys::Win32::System::Threading::{
     AttachThreadInput, GetCurrentProcess, GetCurrentThreadId, OpenProcessToken,
 };
@@ -396,8 +397,9 @@ pub fn ensure_window_opacity(percent: u8) {
 
 /// メインウィンドウが最小化されていたらトレイへ格納する。
 /// 最小化中は egui の update が呼ばれないため、常駐スレッドから直接実行する。
-pub fn try_hide_minimized_window() {
-    unsafe extern "system" fn proc(hwnd: Handle, _lparam: isize) -> i32 {
+/// 実際に格納した場合は true を返す。
+pub fn try_hide_minimized_window() -> bool {
+    unsafe extern "system" fn proc(hwnd: Handle, hidden: isize) -> i32 {
         unsafe {
             let len = GetWindowTextLengthW(hwnd);
             if len > 0 {
@@ -407,6 +409,7 @@ pub fn try_hide_minimized_window() {
                 if text.trim_end_matches('\0') == "MiniTask" {
                     if IsIconic(hwnd) != 0 && IsWindowVisible(hwnd) != 0 {
                         ShowWindow(hwnd, SW_HIDE);
+                        *(hidden as *mut bool) = true;
                     }
                     return 0;
                 }
@@ -414,8 +417,18 @@ pub fn try_hide_minimized_window() {
             1
         }
     }
+    let mut hidden = false;
     unsafe {
-        EnumWindows(Some(proc), 0);
+        EnumWindows(Some(proc), &mut hidden as *mut bool as isize);
+    }
+    hidden
+}
+
+/// ワーキングセットを縮小する。ページはスタンバイへ移るだけで、
+/// 必要になれば自動的に戻るため動作への影響はない。
+pub fn trim_working_set() {
+    unsafe {
+        let _ = EmptyWorkingSet(GetCurrentProcess());
     }
 }
 

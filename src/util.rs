@@ -181,11 +181,20 @@ pub fn pick_image() -> Option<String> {
 /// 背景画像をテクスチャとして読み込む。
 pub fn load_background(ctx: &egui::Context, path: &str) -> Option<egui::TextureHandle> {
     let bytes = std::fs::read(path).ok()?;
-    let decoded = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let mut decoded = image::load_from_memory(&bytes).ok()?.to_rgba8();
     let (width, height) = decoded.dimensions();
     if width == 0 || height == 0 {
         return None;
     }
+    // 大きな写真は長辺 2560px に縮小してからテクスチャ化する (GPU/CPU メモリ節約)
+    const MAX_DIM: u32 = 2560;
+    if width.max(height) > MAX_DIM {
+        let scale = MAX_DIM as f32 / width.max(height) as f32;
+        let nw = ((width as f32 * scale).round() as u32).max(1);
+        let nh = ((height as f32 * scale).round() as u32).max(1);
+        decoded = image::imageops::resize(&decoded, nw, nh, image::imageops::FilterType::Triangle);
+    }
+    let (width, height) = decoded.dimensions();
     Some(ctx.load_texture(
         "minitask_background",
         egui::ColorImage::from_rgba_unmultiplied(
@@ -260,15 +269,125 @@ fn load_font_data(family: &str) -> Option<(Vec<u8>, std::path::PathBuf)> {
     Some((bytes, path))
 }
 
+/// sfnt (TTF/OTF/TTC) の cmap を読み、指定文字のグリフがあるか判定する。
+/// 日本語フォールバックの二重ロードを避けるためだけに使う軽量パーサ。
+fn font_has_glyph(bytes: &[u8], ch: char) -> bool {
+    fn u16_at(b: &[u8], off: usize) -> Option<u16> {
+        Some(u16::from_be_bytes([*b.get(off)?, *b.get(off + 1)?]))
+    }
+    fn u32_at(b: &[u8], off: usize) -> Option<u32> {
+        Some(u32::from_be_bytes([
+            *b.get(off)?,
+            *b.get(off + 1)?,
+            *b.get(off + 2)?,
+            *b.get(off + 3)?,
+        ]))
+    }
+    fn i16_at(b: &[u8], off: usize) -> Option<i16> {
+        Some(i16::from_be_bytes([*b.get(off)?, *b.get(off + 1)?]))
+    }
+    let cp = ch as u32;
+    // TTC は先頭フェース (ab_glyph が使用するもの) を対象にする
+    let base = if bytes.get(0..4) == Some(b"ttcf") {
+        match u32_at(bytes, 12) {
+            Some(v) => v as usize,
+            None => return false,
+        }
+    } else {
+        0
+    };
+    let Some(num_tables) = u16_at(bytes, base + 4) else {
+        return false;
+    };
+    let mut cmap = None;
+    for i in 0..num_tables as usize {
+        let rec = base + 12 + i * 16;
+        if bytes.get(rec..rec + 4) == Some(b"cmap") {
+            cmap = u32_at(bytes, rec + 8);
+            break;
+        }
+    }
+    let Some(cmap) = cmap.map(|v| v as usize) else {
+        return false;
+    };
+    let Some(num_enc) = u16_at(bytes, cmap + 2) else {
+        return false;
+    };
+    let mut fmt12 = None;
+    let mut fmt4 = None;
+    for i in 0..num_enc as usize {
+        let rec = cmap + 4 + i * 8;
+        let Some(off) = u32_at(bytes, rec + 4) else {
+            break;
+        };
+        let sub = cmap + off as usize;
+        match u16_at(bytes, sub) {
+            Some(12) => fmt12 = Some(sub),
+            Some(4) => fmt4 = Some(sub),
+            _ => {}
+        }
+    }
+    if let Some(sub) = fmt12 {
+        let groups = u32_at(bytes, sub + 12).unwrap_or(0) as usize;
+        for i in 0..groups {
+            let g = sub + 16 + i * 12;
+            let (Some(start), Some(end), Some(start_glyph)) =
+                (u32_at(bytes, g), u32_at(bytes, g + 4), u32_at(bytes, g + 8))
+            else {
+                break;
+            };
+            if cp >= start && cp <= end {
+                return start_glyph != 0 || cp > start;
+            }
+        }
+    }
+    if let Some(sub) = fmt4 {
+        let seg2 = u16_at(bytes, sub + 6).unwrap_or(0) as usize;
+        let seg = seg2 / 2;
+        let ends = sub + 14;
+        let starts = ends + seg2 + 2;
+        let deltas = starts + seg2;
+        let range_offsets = deltas + seg2;
+        for i in 0..seg {
+            let (Some(end), Some(start)) =
+                (u16_at(bytes, ends + i * 2), u16_at(bytes, starts + i * 2))
+            else {
+                break;
+            };
+            if cp > 0xFFFF || cp < start as u32 || cp > end as u32 {
+                continue;
+            }
+            let ro_pos = range_offsets + i * 2;
+            let Some(ro) = u16_at(bytes, ro_pos) else {
+                return false;
+            };
+            let delta = i16_at(bytes, deltas + i * 2).unwrap_or(0) as i32;
+            let glyph = if ro == 0 {
+                (cp as i32 + delta) & 0xFFFF
+            } else {
+                let idx = ro_pos + ro as usize + 2 * (cp as usize - start as usize);
+                match u16_at(bytes, idx) {
+                    Some(0) | None => 0,
+                    Some(g) => (g as i32 + delta) & 0xFFFF,
+                }
+            };
+            return glyph != 0;
+        }
+    }
+    false
+}
+
 /// 指定フォントをシステムフォントから読み込む。
-/// egui 同梱フォントには日本語グリフが無いため、日本語フォールバックを常に積む。
+/// egui 同梱フォントには日本語グリフが無いため、日本語フォールバックを積む。
 pub fn setup_fonts(ctx: &egui::Context, family: &str) {
     let mut fonts = egui::FontDefinitions::default();
     let mut inserted: Vec<String> = Vec::new();
 
     // 主フォント
+    let mut primary_covers_cjk = false;
     let mut primary_path: Option<std::path::PathBuf> = None;
     if let Some((bytes, path)) = load_font_data(family) {
+        primary_covers_cjk = font_has_glyph(&bytes, 'あ');
         primary_path = Some(path);
         fonts
             .font_data
@@ -277,19 +396,22 @@ pub fn setup_fonts(ctx: &egui::Context, family: &str) {
     }
 
     // CJK フォールバック (主フォントが日本語を含まない場合の文字化け防止)
-    for fallback in ["Meiryo", "Yu Gothic UI", "Yu Gothic", "MS Gothic", "BIZ UDGothic"] {
-        let Some((bytes, path)) = load_font_data(fallback) else {
-            continue;
-        };
-        if primary_path.as_ref().is_some_and(|p| p == &path) {
-            continue;
+    // 主フォントが既に日本語グリフを持つなら読み込まない (メモリ節約)
+    if !primary_covers_cjk {
+        for fallback in ["Meiryo", "Yu Gothic UI", "Yu Gothic", "MS Gothic", "BIZ UDGothic"] {
+            let Some((bytes, path)) = load_font_data(fallback) else {
+                continue;
+            };
+            if primary_path.as_ref().is_some_and(|p| p == &path) {
+                continue;
+            }
+            fonts.font_data.insert(
+                "cjk_fallback".to_owned(),
+                egui::FontData::from_owned(bytes).into(),
+            );
+            inserted.push("cjk_fallback".to_owned());
+            break;
         }
-        fonts.font_data.insert(
-            "cjk_fallback".to_owned(),
-            egui::FontData::from_owned(bytes).into(),
-        );
-        inserted.push("cjk_fallback".to_owned());
-        break;
     }
 
     // 何も読めなかった場合の最終フォールバック (ファイル直接指定)
@@ -312,6 +434,17 @@ pub fn setup_fonts(ctx: &egui::Context, family: &str) {
         if let Some(f) = fonts.families.get_mut(&family_key) {
             for (i, name) in inserted.iter().enumerate() {
                 f.insert(i, name.clone());
+            }
+        }
+    }
+
+    // システムフォントを積めた場合、egui 同梱の未使用フォントを解放する
+    // (egui-icons と絵文字フォントはフォールバックとして残す)
+    if !inserted.is_empty() {
+        for name in ["Hack", "Ubuntu-Light"] {
+            fonts.font_data.remove(name);
+            for list in fonts.families.values_mut() {
+                list.retain(|n| n != name);
             }
         }
     }
@@ -843,5 +976,20 @@ pub fn cpu_color(pct: f32, palette: &Palette) -> Option<Color32> {
         Some(palette.warn)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cmap_detects_glyph_coverage() {
+        // egui 同梱の Hack はラテン文字のみ (日本語グリフは持たない)
+        let fonts = egui::FontDefinitions::default();
+        let hack = fonts.font_data.get("Hack").expect("Hack font");
+        let bytes: &[u8] = (*hack.font).as_ref();
+        assert!(font_has_glyph(bytes, 'A'));
+        assert!(!font_has_glyph(bytes, 'あ'));
     }
 }

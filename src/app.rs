@@ -291,6 +291,8 @@ pub struct MiniTaskApp {
     palette: Palette,
     dark_mode: bool,
     theme_dirty: bool,
+    /// ワーキングセットを縮小する予定時刻 (起動直後 / フォント変更後)
+    trim_at: Option<Instant>,
     always_on_top: bool,
     startup_tab_mode: u8,
     confirm_kill_setting: bool,
@@ -449,8 +451,9 @@ impl MiniTaskApp {
             let flag = Arc::clone(&minimize_flag);
             std::thread::spawn(move || loop {
                 std::thread::sleep(Duration::from_millis(250));
-                if flag.load(Ordering::Relaxed) {
-                    integration::try_hide_minimized_window();
+                if flag.load(Ordering::Relaxed) && integration::try_hide_minimized_window() {
+                    // トレイ格納中はワーキングセットを縮小しておく
+                    integration::trim_working_set();
                 }
             });
         }
@@ -611,6 +614,7 @@ impl MiniTaskApp {
             palette: settings.active_palette(),
             dark_mode: settings.dark_mode,
             theme_dirty: true,
+            trim_at: Some(Instant::now() + Duration::from_secs(20)),
             always_on_top: settings.always_on_top,
             startup_tab_mode: settings.startup_tab_mode,
             confirm_kill_setting: settings.confirm_kill,
@@ -1018,6 +1022,11 @@ impl eframe::App for MiniTaskApp {
             ));
             self.theme_dirty = false;
         }
+        // 起動直後 / フォント変更後はワーキングセットを縮小する
+        if self.trim_at.is_some_and(|at| Instant::now() >= at) {
+            integration::trim_working_set();
+            self.trim_at = None;
+        }
         // F11 でフルスクリーン切替
         if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
             self.fullscreen = !self.fullscreen;
@@ -1088,11 +1097,13 @@ impl eframe::App for MiniTaskApp {
         if self.start_in_tray_pending && self.tray_icon && self.tray_handle.is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.start_in_tray_pending = false;
+            integration::trim_working_set();
         }
         // 閉じるボタンでトレイに格納
         if self.tray_icon && self.close_to_tray && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            integration::trim_working_set();
         }
         // トレイのツールチップ更新と、最小化→トレイ格納 (0.5 秒ごとに判定)
         if self.tray_icon && self.last_tray_check.elapsed() >= Duration::from_millis(500) {
@@ -1130,14 +1141,17 @@ impl eframe::App for MiniTaskApp {
         if elapsed >= interval && !self.paused {
             self.refresh();
         }
-        if self.graph_animation && !self.paused {
+        // グラフのアニメーションはパフォーマンスタブ表示中のみ行い、
+        // 他タブでは通常の更新間隔での再描画に抑える (再描画コスト削減)。
+        let animating = self.graph_animation && !self.paused && self.tab == Tab::Performance;
+        if animating {
             // グラフは更新間隔と無関係に 250ms ごとに連続サンプリングし、
             // 線がシームレスに伸びていくようにする
             const FAST_TICK: Duration = Duration::from_millis(250);
             if self.last_hist_tick.elapsed() >= FAST_TICK {
                 self.fast_tick();
             }
-            ctx.request_repaint_after(Duration::from_millis(16));
+            ctx.request_repaint_after(Duration::from_millis(33));
         } else {
             ctx.request_repaint_after(interval.saturating_sub(elapsed));
         }
@@ -3596,6 +3610,8 @@ impl MiniTaskApp {
             self.temp_unit = temp_unit;
             if font_family != self.font_family {
                 self.theme_dirty = true;
+                // 旧フォントの解放後に縮小する
+                self.trim_at = Some(Instant::now() + Duration::from_millis(800));
             }
             self.font_family = font_family;
             if bg_image_path != self.bg_image_path {
