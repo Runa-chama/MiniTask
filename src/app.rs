@@ -223,8 +223,161 @@ impl ColumnKind {
     }
 }
 
+enum CollectorCmd {
+    SetInterval(f32),
+    SetPaused(bool),
+    SetAnimating(bool),
+    RefreshNow,
+    RefreshSmart(String),
+}
+
+enum CollectorMsg {
+    Refresh { rows: Vec<ProcRow>, load: SysLoad },
+    Fast(FastMetrics),
+    Smart {
+        id: String,
+        info: Arc<crate::smart::SmartInfo>,
+    },
+}
+
+fn spawn_collector_worker(
+    ctx: egui::Context,
+    interval: f32,
+    paused: bool,
+    animating: bool,
+) -> (Sender<CollectorCmd>, Receiver<CollectorMsg>) {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<CollectorCmd>();
+    let (msg_tx, msg_rx) = mpsc::channel::<CollectorMsg>();
+    std::thread::Builder::new()
+        .name("minitask-collector".to_owned())
+        .spawn(move || collector_worker_loop(ctx, cmd_rx, msg_tx, interval, paused, animating))
+        .expect("collector thread");
+    (cmd_tx, msg_rx)
+}
+
+fn collector_worker_loop(
+    ctx: egui::Context,
+    cmd_rx: Receiver<CollectorCmd>,
+    msg_tx: Sender<CollectorMsg>,
+    mut interval: f32,
+    mut paused: bool,
+    mut animating: bool,
+) {
+    let mut collector = match ProcCollector::new() {
+        Ok(c) => c,
+        Err(_) => {
+            while cmd_rx.recv().is_ok() {}
+            return;
+        }
+    };
+
+    let (rows, load) = collector.refresh();
+    if msg_tx
+        .send(CollectorMsg::Refresh { rows, load })
+        .is_err()
+    {
+        return;
+    }
+    ctx.request_repaint();
+
+    let mut last_refresh = Instant::now();
+    let mut last_hist_tick = Instant::now();
+
+    loop {
+        let timeout = if paused {
+            Duration::from_secs(3600)
+        } else {
+            let refresh_due = Duration::from_secs_f32(interval.max(0.2))
+                .saturating_sub(last_refresh.elapsed());
+            if animating {
+                let fast_due =
+                    Duration::from_millis(250).saturating_sub(last_hist_tick.elapsed());
+                refresh_due.min(fast_due)
+            } else {
+                refresh_due
+            }
+        };
+
+        match cmd_rx.recv_timeout(timeout) {
+            Ok(cmd) => {
+                let mut pending = vec![cmd];
+                while let Ok(c) = cmd_rx.try_recv() {
+                    pending.push(c);
+                }
+                let mut do_refresh = false;
+                for c in pending {
+                    match c {
+                        CollectorCmd::SetInterval(v) => interval = v.max(0.2),
+                        CollectorCmd::SetPaused(p) => paused = p,
+                        CollectorCmd::SetAnimating(a) => {
+                            if a && !animating {
+                                last_hist_tick = Instant::now();
+                            }
+                            animating = a;
+                        }
+                        CollectorCmd::RefreshNow => do_refresh = true,
+                        CollectorCmd::RefreshSmart(id) => {
+                            if let Some(info) = collector.refresh_smart(&id) {
+                                if msg_tx
+                                    .send(CollectorMsg::Smart { id, info })
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                ctx.request_repaint();
+                            }
+                        }
+                    }
+                }
+                if do_refresh {
+                    let (rows, load) = collector.refresh();
+                    last_refresh = Instant::now();
+                    if msg_tx
+                        .send(CollectorMsg::Refresh { rows, load })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    ctx.request_repaint();
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        if paused {
+            continue;
+        }
+
+        let interval_dur = Duration::from_secs_f32(interval.max(0.2));
+        if last_refresh.elapsed() >= interval_dur {
+            let (rows, load) = collector.refresh();
+            last_refresh = Instant::now();
+            if msg_tx
+                .send(CollectorMsg::Refresh { rows, load })
+                .is_err()
+            {
+                return;
+            }
+            ctx.request_repaint();
+        }
+        if animating && last_hist_tick.elapsed() >= Duration::from_millis(250) {
+            let metrics = collector.refresh_fast();
+            last_hist_tick = Instant::now();
+            if msg_tx.send(CollectorMsg::Fast(metrics)).is_err() {
+                return;
+            }
+            ctx.request_repaint();
+        }
+    }
+}
+
 pub struct MiniTaskApp {
-    collector: Option<ProcCollector>,
+    collector_cmd_tx: Sender<CollectorCmd>,
+    collector_msg_rx: Receiver<CollectorMsg>,
+    collector_sent_interval: f32,
+    collector_sent_paused: bool,
+    collector_sent_animating: bool,
     rows: Vec<ProcRow>,
     load: SysLoad,
     cpu_hist: VecDeque<f32>,
@@ -472,7 +625,23 @@ impl MiniTaskApp {
             });
         }
         let env_tab = std::env::var("MINITASK_TAB").ok();
-        let collector = ProcCollector::new().ok();
+        let initial_interval = settings.interval_ms as f32 / 1000.0;
+        let initial_graph_animation = if std::env::var("MINITASK_ANIMATION").is_ok() {
+            true
+        } else {
+            settings.graph_animation
+        };
+        let initial_tab_is_perf = match env_tab.as_deref() {
+            Some("processes") => false,
+            Some(_) => true,
+            None => settings.initial_tab() == 1,
+        };
+        let (collector_cmd_tx, collector_msg_rx) = spawn_collector_worker(
+            ctx.clone(),
+            initial_interval,
+            false,
+            initial_graph_animation && initial_tab_is_perf,
+        );
 
         // システム統合の適用 (権限不足で失敗しても起動は続ける)
         if let Ok(exe) = std::env::current_exe() {
@@ -518,7 +687,11 @@ impl MiniTaskApp {
         };
         let bg_image_size = bg_texture.as_ref().map(|t| t.size_vec2()).unwrap_or(Vec2::ZERO);
         let mut app = Self {
-            collector,
+            collector_cmd_tx,
+            collector_msg_rx,
+            collector_sent_interval: initial_interval,
+            collector_sent_paused: false,
+            collector_sent_animating: initial_graph_animation && initial_tab_is_perf,
             rows: Vec::new(),
             load: SysLoad::default(),
             cpu_hist: VecDeque::new(),
@@ -665,38 +838,35 @@ impl MiniTaskApp {
             icon_cache: IconCache::default(),
             smart_dialog_disk: None,
         };
-        app.refresh();
         app
     }
 
     /// 指定ディスクの SMART をキャッシュ無視で再取得し、表示データに反映する。
     fn refresh_smart(&mut self, id: &str) {
-        let Some(info) = self.collector.as_mut().and_then(|c| c.refresh_smart(id)) else {
-            return;
-        };
-        if let Some(disk) = self.load.disks.iter_mut().find(|d| d.id == id) {
-            disk.smart = Some(info);
-        }
+        let _ = self
+            .collector_cmd_tx
+            .send(CollectorCmd::RefreshSmart(id.to_owned()));
     }
 
     fn refresh(&mut self) {
-        self.last_refresh = Instant::now();
-        if let Some(collector) = &mut self.collector {
-            let (rows, load) = collector.refresh();
-            self.rows = rows;
-            // アニメーションOFF時のみここで履歴へ反映。
-            // ON時は fast_tick() が 250ms ごとにシームレスに反映する。
-            if !self.graph_animation {
-                let sample = PerfSample::from_load(&load);
-                self.push_history_samples(&sample, 1.0);
-            }
+        let _ = self.collector_cmd_tx.send(CollectorCmd::RefreshNow);
+    }
 
-            self.load = load;
-            self.normalize_selection();
-            if let Some(pid) = self.selected {
-                if !self.rows.iter().any(|r| r.pid == pid) {
-                    self.selected = None;
-                }
+    fn apply_refresh(&mut self, rows: Vec<ProcRow>, load: SysLoad) {
+        self.last_refresh = Instant::now();
+        self.rows = rows;
+        // アニメーションOFF時のみここで履歴へ反映。
+        // ON時は fast_tick() が 250ms ごとにシームレスに反映する。
+        if !self.graph_animation {
+            let sample = PerfSample::from_load(&load);
+            self.push_history_samples(&sample, 1.0);
+        }
+
+        self.load = load;
+        self.normalize_selection();
+        if let Some(pid) = self.selected {
+            if !self.rows.iter().any(|r| r.pid == pid) {
+                self.selected = None;
             }
         }
         if let Some((_, t)) = &self.toast {
@@ -706,14 +876,8 @@ impl MiniTaskApp {
         }
     }
 
-    /// アニメーション補間ON時の高速サンプリング (250ms ごと)。
-    /// 更新間隔と無関係に履歴サンプルが流れ込み、線がシームレスに伸びる。
-    fn fast_tick(&mut self) {
+    fn apply_fast(&mut self, metrics: FastMetrics) {
         self.last_hist_tick = Instant::now();
-        let Some(collector) = &mut self.collector else {
-            return;
-        };
-        let metrics = collector.refresh_fast();
         let sample = PerfSample::from_fast(&metrics);
         // 時定数 2.5 秒、サンプリング間隔 250ms の EMA 平滑化
         let alpha = (1.0 - (-0.25_f32 / 2.5).exp()).clamp(0.01, 1.0);
@@ -1172,23 +1336,42 @@ impl eframe::App for MiniTaskApp {
                 }
             }
         }
-        let interval = Duration::from_secs_f32(self.interval);
-        let elapsed = self.last_refresh.elapsed();
-        if elapsed >= interval && !self.paused {
-            self.refresh();
-        }
-        // グラフのアニメーションはパフォーマンスタブ表示中のみ行い、
-        // 他タブでは通常の更新間隔での再描画に抑える (再描画コスト削減)。
-        let animating = self.graph_animation && !self.paused && self.tab == Tab::Performance;
-        if animating {
-            // グラフは更新間隔と無関係に 250ms ごとに連続サンプリングし、
-            // 線がシームレスに伸びていくようにする
-            const FAST_TICK: Duration = Duration::from_millis(250);
-            if self.last_hist_tick.elapsed() >= FAST_TICK {
-                self.fast_tick();
+        // バックグラウンド収集スレッドからの結果を反映
+        while let Ok(msg) = self.collector_msg_rx.try_recv() {
+            match msg {
+                CollectorMsg::Refresh { rows, load } => self.apply_refresh(rows, load),
+                CollectorMsg::Fast(metrics) => self.apply_fast(metrics),
+                CollectorMsg::Smart { id, info } => {
+                    if let Some(disk) = self.load.disks.iter_mut().find(|d| d.id == id) {
+                        disk.smart = Some(info);
+                    }
+                }
             }
+        }
+        let animating = self.graph_animation && !self.paused && self.tab == Tab::Performance;
+        if (self.collector_sent_interval - self.interval).abs() > f32::EPSILON {
+            self.collector_sent_interval = self.interval;
+            let _ = self
+                .collector_cmd_tx
+                .send(CollectorCmd::SetInterval(self.interval));
+        }
+        if self.collector_sent_paused != self.paused {
+            self.collector_sent_paused = self.paused;
+            let _ = self
+                .collector_cmd_tx
+                .send(CollectorCmd::SetPaused(self.paused));
+        }
+        if self.collector_sent_animating != animating {
+            self.collector_sent_animating = animating;
+            let _ = self
+                .collector_cmd_tx
+                .send(CollectorCmd::SetAnimating(animating));
+        }
+        if animating {
             ctx.request_repaint_after(Duration::from_millis(33));
         } else {
+            let interval = Duration::from_secs_f32(self.interval.max(0.2));
+            let elapsed = self.last_refresh.elapsed();
             ctx.request_repaint_after(interval.saturating_sub(elapsed));
         }
         // 設定が変わっていれば保存 (差分検出なので各操作側の変更は不要)

@@ -1499,7 +1499,7 @@ dependencies = [
 
 [[package]]
 name = "minitask"
-version = "0.3.15"
+version = "0.3.17"
 dependencies = [
  "eframe",
  "egui",
