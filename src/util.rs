@@ -182,12 +182,14 @@ pub fn pick_image() -> Option<String> {
 pub fn load_background(ctx: &egui::Context, path: &str) -> Option<egui::TextureHandle> {
     let bytes = std::fs::read(path).ok()?;
     let mut decoded = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    // compressed bytes と decode 後画像を同時に保持しない。
+    drop(bytes);
     let (width, height) = decoded.dimensions();
     if width == 0 || height == 0 {
         return None;
     }
-    // 大きな写真は長辺 2560px に縮小してからテクスチャ化する (GPU/CPU メモリ節約)
-    const MAX_DIM: u32 = 2560;
+    // 背景はオーバーレイで薄く使うため、長辺 1920px に制限して VRAM/ピークメモリを削減する。
+    const MAX_DIM: u32 = 1920;
     if width.max(height) > MAX_DIM {
         let scale = MAX_DIM as f32 / width.max(height) as f32;
         let nw = ((width as f32 * scale).round() as u32).max(1);
@@ -195,12 +197,15 @@ pub fn load_background(ctx: &egui::Context, path: &str) -> Option<egui::TextureH
         decoded = image::imageops::resize(&decoded, nw, nh, image::imageops::FilterType::Triangle);
     }
     let (width, height) = decoded.dimensions();
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+        [width as usize, height as usize],
+        decoded.as_raw(),
+    );
+    // GPU アップロード前の二重 RGBA 保持を避ける。
+    drop(decoded);
     Some(ctx.load_texture(
         "minitask_background",
-        egui::ColorImage::from_rgba_unmultiplied(
-            [width as usize, height as usize],
-            decoded.as_raw(),
-        ),
+        color_image,
         egui::TextureOptions::LINEAR,
     ))
 }

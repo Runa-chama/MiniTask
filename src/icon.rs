@@ -1,6 +1,6 @@
 //! Windows の実行ファイルアイコンを取得して egui のテクスチャに変換する。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 
 use egui::{ColorImage, TextureHandle, Vec2};
@@ -198,8 +198,12 @@ pub fn exe_path_from_command(command: &str) -> String {
         .to_owned()
 }
 
+const MAX_ICON_CACHE: usize = 512;
+
 pub struct IconCache {
     cache: HashMap<String, Option<TextureHandle>>,
+    /// 参照順 (古い順)。LRU eviction に使う。
+    order: VecDeque<String>,
     pub per_frame_limit: usize,
 }
 
@@ -207,15 +211,33 @@ impl Default for IconCache {
     fn default() -> Self {
         Self {
             cache: HashMap::new(),
+            order: VecDeque::new(),
             per_frame_limit: 8,
         }
     }
 }
 
 impl IconCache {
+    fn touch(&mut self, key: &str) {
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(key.to_owned());
+    }
+
+    fn evict_old(&mut self) {
+        while self.order.len() > MAX_ICON_CACHE {
+            if let Some(old) = self.order.pop_front() {
+                self.cache.remove(&old);
+            }
+        }
+    }
+
     pub fn get(&mut self, ctx: &egui::Context, key: &str, path: &str) -> Option<TextureHandle> {
         if let Some(tex) = self.cache.get(key) {
-            return tex.clone();
+            let tex = tex.clone();
+            self.touch(key);
+            return tex;
         }
         if self.per_frame_limit == 0 {
             return None;
@@ -230,6 +252,8 @@ impl IconCache {
             )
         });
         self.cache.insert(key.to_owned(), tex.clone());
+        self.touch(key);
+        self.evict_old();
         tex
     }
 
@@ -261,5 +285,24 @@ mod tests {
         assert_eq!(exe_path_from_command(r#""C:\Program Files\App\a.exe" --flag"#), r"C:\Program Files\App\a.exe");
         assert_eq!(exe_path_from_command(r"C:\Windows\System32\foo.exe -x"), r"C:\Windows\System32\foo.exe");
         assert_eq!(exe_path_from_command("  "), "");
+    }
+
+    #[test]
+    fn lru_cache_evicts_least_recently_used() {
+        let mut cache = IconCache::default();
+        for i in 0..MAX_ICON_CACHE {
+            let key = format!("key-{i}");
+            cache.cache.insert(key.clone(), None);
+            cache.order.push_back(key);
+        }
+        cache.touch("key-0");
+        cache.cache.insert("new".to_owned(), None);
+        cache.order.push_back("new".to_owned());
+        cache.evict_old();
+
+        assert_eq!(cache.cache.len(), MAX_ICON_CACHE);
+        assert!(cache.cache.contains_key("key-0"));
+        assert!(!cache.cache.contains_key("key-1"));
+        assert!(cache.cache.contains_key("new"));
     }
 }

@@ -273,7 +273,10 @@ pub fn start() -> (TrayHandle, Receiver<TrayMsg>) {
     let (tx, rx) = mpsc::channel::<TrayMsg>();
     let (ready_tx, ready_rx) = mpsc::channel::<isize>();
 
-    let thread = std::thread::spawn(move || {
+    let thread = std::thread::Builder::new()
+        .name("minitask-tray".to_owned())
+        .stack_size(512 * 1024)
+        .spawn(move || {
         unsafe {
             let hinst = GetModuleHandleW(std::ptr::null());
             let class_name = to_wide_nul(CLASS_NAME);
@@ -345,7 +348,8 @@ pub fn start() -> (TrayHandle, Receiver<TrayMsg>) {
             }
             drop(Box::from_raw(state_ptr));
         }
-    });
+        })
+        .expect("tray thread");
 
     let hwnd = ready_rx.recv().unwrap_or(0);
     (

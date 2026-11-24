@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{
     mpsc::{self, Receiver, Sender},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::{Duration, Instant};
 
@@ -234,10 +234,27 @@ enum CollectorCmd {
 enum CollectorMsg {
     Refresh { rows: Vec<ProcRow>, load: SysLoad },
     Fast(FastMetrics),
-    Smart {
-        id: String,
-        info: Arc<crate::smart::SmartInfo>,
-    },
+}
+
+struct CollectorSmartMsg {
+    id: String,
+    info: Arc<crate::smart::SmartInfo>,
+}
+
+struct CollectorWorker {
+    cmd_tx: Sender<CollectorCmd>,
+    /// 最新1件だけを保持する単一スロット。UI の消費が遅れても古い結果は積み重ならない。
+    snapshot: Arc<Mutex<Option<CollectorMsg>>>,
+    smart_rx: Receiver<CollectorSmartMsg>,
+}
+
+fn publish_snapshot(slot: &Mutex<Option<CollectorMsg>>, msg: CollectorMsg) {
+    let old = {
+        let mut current = slot.lock().unwrap();
+        current.replace(msg)
+    };
+    // 古い大型スナップショットの破棄はロックを解放した後で行う。
+    drop(old);
 }
 
 fn spawn_collector_worker(
@@ -245,20 +262,38 @@ fn spawn_collector_worker(
     interval: f32,
     paused: bool,
     animating: bool,
-) -> (Sender<CollectorCmd>, Receiver<CollectorMsg>) {
+) -> CollectorWorker {
     let (cmd_tx, cmd_rx) = mpsc::channel::<CollectorCmd>();
-    let (msg_tx, msg_rx) = mpsc::channel::<CollectorMsg>();
+    let snapshot = Arc::new(Mutex::new(None::<CollectorMsg>));
+    let worker_snapshot = Arc::clone(&snapshot);
+    let (smart_tx, smart_rx) = mpsc::channel::<CollectorSmartMsg>();
     std::thread::Builder::new()
         .name("minitask-collector".to_owned())
-        .spawn(move || collector_worker_loop(ctx, cmd_rx, msg_tx, interval, paused, animating))
+        .stack_size(1024 * 1024)
+        .spawn(move || {
+            collector_worker_loop(
+                ctx,
+                cmd_rx,
+                worker_snapshot,
+                smart_tx,
+                interval,
+                paused,
+                animating,
+            )
+        })
         .expect("collector thread");
-    (cmd_tx, msg_rx)
+    CollectorWorker {
+        cmd_tx,
+        snapshot,
+        smart_rx,
+    }
 }
 
 fn collector_worker_loop(
     ctx: egui::Context,
     cmd_rx: Receiver<CollectorCmd>,
-    msg_tx: Sender<CollectorMsg>,
+    snapshot: Arc<Mutex<Option<CollectorMsg>>>,
+    smart_tx: Sender<CollectorSmartMsg>,
     mut interval: f32,
     mut paused: bool,
     mut animating: bool,
@@ -272,12 +307,7 @@ fn collector_worker_loop(
     };
 
     let (rows, load) = collector.refresh();
-    if msg_tx
-        .send(CollectorMsg::Refresh { rows, load })
-        .is_err()
-    {
-        return;
-    }
+    publish_snapshot(&snapshot, CollectorMsg::Refresh { rows, load });
     ctx.request_repaint();
 
     let mut last_refresh = Instant::now();
@@ -318,8 +348,8 @@ fn collector_worker_loop(
                         CollectorCmd::RefreshNow => do_refresh = true,
                         CollectorCmd::RefreshSmart(id) => {
                             if let Some(info) = collector.refresh_smart(&id) {
-                                if msg_tx
-                                    .send(CollectorMsg::Smart { id, info })
+                                if smart_tx
+                                    .send(CollectorSmartMsg { id, info })
                                     .is_err()
                                 {
                                     return;
@@ -332,12 +362,7 @@ fn collector_worker_loop(
                 if do_refresh {
                     let (rows, load) = collector.refresh();
                     last_refresh = Instant::now();
-                    if msg_tx
-                        .send(CollectorMsg::Refresh { rows, load })
-                        .is_err()
-                    {
-                        return;
-                    }
+                    publish_snapshot(&snapshot, CollectorMsg::Refresh { rows, load });
                     ctx.request_repaint();
                 }
             }
@@ -353,28 +378,20 @@ fn collector_worker_loop(
         if last_refresh.elapsed() >= interval_dur {
             let (rows, load) = collector.refresh();
             last_refresh = Instant::now();
-            if msg_tx
-                .send(CollectorMsg::Refresh { rows, load })
-                .is_err()
-            {
-                return;
-            }
+            publish_snapshot(&snapshot, CollectorMsg::Refresh { rows, load });
             ctx.request_repaint();
         }
         if animating && last_hist_tick.elapsed() >= Duration::from_millis(250) {
             let metrics = collector.refresh_fast();
             last_hist_tick = Instant::now();
-            if msg_tx.send(CollectorMsg::Fast(metrics)).is_err() {
-                return;
-            }
+            publish_snapshot(&snapshot, CollectorMsg::Fast(metrics));
             ctx.request_repaint();
         }
     }
 }
 
 pub struct MiniTaskApp {
-    collector_cmd_tx: Sender<CollectorCmd>,
-    collector_msg_rx: Receiver<CollectorMsg>,
+    collector: CollectorWorker,
     collector_sent_interval: f32,
     collector_sent_paused: bool,
     collector_sent_animating: bool,
@@ -606,13 +623,17 @@ impl MiniTaskApp {
         ));
         {
             let flag = Arc::clone(&minimize_flag);
-            std::thread::spawn(move || loop {
-                std::thread::sleep(Duration::from_millis(250));
-                if flag.load(Ordering::Relaxed) && integration::try_hide_minimized_window() {
-                    // トレイ格納中はワーキングセットを縮小しておく
-                    integration::trim_working_set();
-                }
-            });
+            std::thread::Builder::new()
+                .name("minitask-minimize-watch".to_owned())
+                .stack_size(512 * 1024)
+                .spawn(move || loop {
+                    std::thread::sleep(Duration::from_millis(250));
+                    if flag.load(Ordering::Relaxed) && integration::try_hide_minimized_window() {
+                        // トレイ格納中はワーキングセットを縮小しておく
+                        integration::trim_working_set();
+                    }
+                })
+                .expect("minimize watch thread");
         }
         // GitHub Releases を 1 日 1 回チェック (結果はチャネルで受け取る)
         let (update_tx, update_rx) = mpsc::channel::<UpdateMsg>();
@@ -620,9 +641,13 @@ impl MiniTaskApp {
             >= crate::update::CHECK_INTERVAL_SECS
         {
             let tx = update_tx.clone();
-            std::thread::spawn(move || {
-                let _ = tx.send(UpdateMsg::Check(crate::update::check_latest()));
-            });
+            std::thread::Builder::new()
+                .name("minitask-update-check".to_owned())
+                .stack_size(512 * 1024)
+                .spawn(move || {
+                    let _ = tx.send(UpdateMsg::Check(crate::update::check_latest()));
+                })
+                .expect("update check thread");
         }
         let env_tab = std::env::var("MINITASK_TAB").ok();
         let initial_interval = settings.interval_ms as f32 / 1000.0;
@@ -636,7 +661,7 @@ impl MiniTaskApp {
             Some(_) => true,
             None => settings.initial_tab() == 1,
         };
-        let (collector_cmd_tx, collector_msg_rx) = spawn_collector_worker(
+        let collector = spawn_collector_worker(
             ctx.clone(),
             initial_interval,
             false,
@@ -686,9 +711,8 @@ impl MiniTaskApp {
             util::load_background(ctx, &settings.bg_image_path)
         };
         let bg_image_size = bg_texture.as_ref().map(|t| t.size_vec2()).unwrap_or(Vec2::ZERO);
-        let mut app = Self {
-            collector_cmd_tx,
-            collector_msg_rx,
+        let app = Self {
+            collector,
             collector_sent_interval: initial_interval,
             collector_sent_paused: false,
             collector_sent_animating: initial_graph_animation && initial_tab_is_perf,
@@ -844,12 +868,13 @@ impl MiniTaskApp {
     /// 指定ディスクの SMART をキャッシュ無視で再取得し、表示データに反映する。
     fn refresh_smart(&mut self, id: &str) {
         let _ = self
-            .collector_cmd_tx
+            .collector
+            .cmd_tx
             .send(CollectorCmd::RefreshSmart(id.to_owned()));
     }
 
     fn refresh(&mut self) {
-        let _ = self.collector_cmd_tx.send(CollectorCmd::RefreshNow);
+        let _ = self.collector.cmd_tx.send(CollectorCmd::RefreshNow);
     }
 
     fn apply_refresh(&mut self, rows: Vec<ProcRow>, load: SysLoad) {
@@ -1336,35 +1361,39 @@ impl eframe::App for MiniTaskApp {
                 }
             }
         }
-        // バックグラウンド収集スレッドからの結果を反映
-        while let Ok(msg) = self.collector_msg_rx.try_recv() {
+        // バックグラウンド収集スレッドからの最新結果を反映 (古い結果は上書き破棄)
+        let snapshot = self.collector.snapshot.lock().unwrap().take();
+        if let Some(msg) = snapshot {
             match msg {
                 CollectorMsg::Refresh { rows, load } => self.apply_refresh(rows, load),
                 CollectorMsg::Fast(metrics) => self.apply_fast(metrics),
-                CollectorMsg::Smart { id, info } => {
-                    if let Some(disk) = self.load.disks.iter_mut().find(|d| d.id == id) {
-                        disk.smart = Some(info);
-                    }
-                }
+            }
+        }
+        while let Ok(msg) = self.collector.smart_rx.try_recv() {
+            if let Some(disk) = self.load.disks.iter_mut().find(|d| d.id == msg.id) {
+                disk.smart = Some(msg.info);
             }
         }
         let animating = self.graph_animation && !self.paused && self.tab == Tab::Performance;
         if (self.collector_sent_interval - self.interval).abs() > f32::EPSILON {
             self.collector_sent_interval = self.interval;
             let _ = self
-                .collector_cmd_tx
+                .collector
+                .cmd_tx
                 .send(CollectorCmd::SetInterval(self.interval));
         }
         if self.collector_sent_paused != self.paused {
             self.collector_sent_paused = self.paused;
             let _ = self
-                .collector_cmd_tx
+                .collector
+                .cmd_tx
                 .send(CollectorCmd::SetPaused(self.paused));
         }
         if self.collector_sent_animating != animating {
             self.collector_sent_animating = animating;
             let _ = self
-                .collector_cmd_tx
+                .collector
+                .cmd_tx
                 .send(CollectorCmd::SetAnimating(animating));
         }
         if animating {
@@ -3633,18 +3662,26 @@ impl MiniTaskApp {
                                 if ui.button("更新してインストール").clicked() {
                                     self.update_busy = true;
                                     let tx = self.update_tx.clone();
-                                    std::thread::spawn(move || {
-                                        let _ = tx.send(UpdateMsg::Download(
-                                            crate::update::download(&info),
-                                        ));
-                                    });
+                                    std::thread::Builder::new()
+                                        .name("minitask-update-download".to_owned())
+                                        .stack_size(512 * 1024)
+                                        .spawn(move || {
+                                            let _ = tx.send(UpdateMsg::Download(
+                                                crate::update::download(&info),
+                                            ));
+                                        })
+                                        .expect("update download thread");
                                 }
                             } else if ui.button("今すぐ更新を確認").clicked() {
                                 self.update_busy = true;
                                 let tx = self.update_tx.clone();
-                                std::thread::spawn(move || {
-                                    let _ = tx.send(UpdateMsg::Check(crate::update::check_latest()));
-                                });
+                                std::thread::Builder::new()
+                                    .name("minitask-update-check".to_owned())
+                                    .stack_size(512 * 1024)
+                                    .spawn(move || {
+                                        let _ = tx.send(UpdateMsg::Check(crate::update::check_latest()));
+                                    })
+                                    .expect("update check thread");
                             }
                             if let Some(msg) = &self.update_msg {
                                 ui.label(

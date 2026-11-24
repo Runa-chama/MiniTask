@@ -191,18 +191,22 @@ unsafe fn bring_to_front(hwnd: HWND) {
         );
         if top != 0 {
             let hwnd_val = hwnd as isize;
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(3));
-                let _ = SetWindowPos(
-                    hwnd_val as HWND,
-                    HWND_NOTOPMOST,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE,
-                );
-            });
+            std::thread::Builder::new()
+                .name("minitask-topmost-reset".to_owned())
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    let _ = SetWindowPos(
+                        hwnd_val as HWND,
+                        HWND_NOTOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE,
+                    );
+                })
+                .expect("topmost reset thread");
         }
         // タスクバーボタンを点滅させて気付かせる
         let fwi = FLASHWINFO {

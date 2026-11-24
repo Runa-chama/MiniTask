@@ -80,10 +80,14 @@ fn main() -> eframe::Result {
     // 起動直後にウィンドウを前面に出す。IFEO (Ctrl+Shift+Esc) 起動では
     // 昇格の関係で自動フォーカスが効かない場合があるため、最前面表示と
     // タスクバー点滅で気付けるようにする。
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-        integration::focus_window();
-    });
+    std::thread::Builder::new()
+        .name("minitask-startup-focus".to_owned())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            integration::focus_window();
+        })
+        .expect("startup focus thread");
 
     eframe::run_native(
         "MiniTask",

@@ -172,6 +172,7 @@ impl NetSession {
             let alive2 = alive.clone();
             let thread = match std::thread::Builder::new()
                 .name("minitask-etw".to_owned())
+                .stack_size(512 * 1024)
                 .spawn(move || {
                     // セッションが停止されるまでブロックする
                     let _ = ProcessTrace(&trace_handle, 1, std::ptr::null(), std::ptr::null());
